@@ -49,14 +49,6 @@ class StructuredIntelItem:
     action_deadline: Optional[str] = None
     source_url: Optional[str] = None
 
-@dataclass
-class TenantFilter:
-    tenant_id: str
-    allowed_counties: List[str]
-    subscribed_trade_tags: List[str]
-    min_financial_value_ron: float = 0.0
-    min_opportunity_score: int = 6
-
 def is_postgres() -> bool:
     return bool(DATABASE_URL and DATABASE_URL.startswith("postgres"))
 
@@ -129,6 +121,22 @@ def init_db():
                 min_financial_value_ron REAL DEFAULT 0,
                 min_opportunity_score INTEGER DEFAULT 6,
                 FOREIGN KEY (tenant_id) REFERENCES tenants(id) ON DELETE CASCADE
+            )
+        """)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS user_profiles (
+                id TEXT PRIMARY KEY,
+                email TEXT UNIQUE NOT NULL,
+                phone TEXT,
+                full_name TEXT NOT NULL,
+                avatar_url TEXT,
+                auth_provider TEXT DEFAULT 'email',
+                tenant_id TEXT,
+                role TEXT DEFAULT 'owner',
+                custom_ui_settings TEXT DEFAULT '{"advanced_mode": false, "theme": "dark", "instant_notifications": true}',
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                last_login DATETIME DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (tenant_id) REFERENCES tenants(id) ON DELETE SET NULL
             )
         """)
         cursor.execute("""
