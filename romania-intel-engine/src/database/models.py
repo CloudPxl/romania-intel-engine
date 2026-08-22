@@ -49,6 +49,14 @@ class StructuredIntelItem:
     action_deadline: Optional[str] = None
     source_url: Optional[str] = None
 
+@dataclass
+class TenantFilter:
+    tenant_id: str
+    allowed_counties: List[str]
+    subscribed_trade_tags: List[str]
+    min_financial_value_ron: float = 0.0
+    min_opportunity_score: int = 6
+
 def is_postgres() -> bool:
     return bool(DATABASE_URL and DATABASE_URL.startswith("postgres"))
 
