@@ -1,0 +1,15 @@
+services:
+  - type: web
+    name: ro-intel-engine
+    env: python
+    region: frankfurt
+    plan: free
+    buildCommand: "pip install -r requirements.txt && playwright install chromium --with-deps"
+    startCommand: "python server.py"
+    envVars:
+      - key: PORT
+        value: 8080
+      - key: DATABASE_URL
+        sync: false
+      - key: GROK_API_KEY
+        sync: false

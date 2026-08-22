@@ -1,0 +1,21 @@
+# Virtual Environment
+venv/
+env/
+.env
+
+# Python Cache & Bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyc
+
+# Database & Local Storage
+data/intel_local.db*
+data/raw_pdfs/*
+!data/raw_pdfs/.gitkeep
+
+# System & IDE Artifacts
+.DS_Store
+.vscode/
+.idea/
+*.log
