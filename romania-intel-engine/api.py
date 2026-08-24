@@ -4,19 +4,20 @@ import io
 import asyncio
 import logging
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, HTTPException, Depends, Request, Response
+from fastapi import FastAPI, HTTPException, Depends, Request, Response, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, HTMLResponse
 from pydantic import BaseModel, EmailStr, Field
 from typing import List, Optional
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 from matching_engine import TenantMatchingEngine, TENANT_ORGANIZATIONS
 from workflow_engine import ConcurrentWorkflowEngine
-from billing import StripeBillingEngine, SUBSCRIPTION_PLANS, ACTIVE_COVERAGE
+from billing import StripeBillingEngine, SUBSCRIPTION_PLANS
 from scrapers.orchestrator import OpportunityOrchestrator
 from cache_engine import global_cache
 from security import SecurityGuard
+from freemium_shield import FreemiumGatekeeper
 
 from addons.caiet_analyzer import CaietDeSarciniAnalyzer
 from addons.win_probability import WinProbabilityEngine
@@ -31,26 +32,26 @@ scheduler = AsyncIOScheduler()
 copilot_engine = ProcurementAICopilot()
 
 async def background_scraping_job():
-    logger.info("⏰ [24/7 DAEMON] Running automated market crawling & AI qualification...")
+    logger.info("⏰ [24/7 DAEMON] Ingesting & qualifying pre-SEAP signals...")
     try:
         orchestrator = OpportunityOrchestrator()
         await orchestrator.run_pipeline()
         global_cache.invalidate()
-        logger.info("✅ [24/7 DAEMON] Pipeline synced.")
+        logger.info("✅ [24/7 DAEMON] Pipeline synchronized.")
     except Exception as e:
-        logger.error(f"❌ [24/7 DAEMON]  {e}")
+        logger.error(f"❌ [24/7 DAEMON] Error: {e}")
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     scheduler.add_job(background_scraping_job, "interval", hours=6)
     scheduler.start()
-    logger.info("🛡️ [SYSTEM] RO-INTEL Enterprise API active with 24/7 scheduler.")
+    logger.info("🛡️ [SYSTEM] RO-INTEL Engine online with 24/7 daemon.")
     yield
     scheduler.shutdown()
 
 app = FastAPI(
     title="RO-INTEL Enterprise Procurement Engine",
-    version="2.1.0",
+    version="2.2.0",
     lifespan=lifespan
 )
 
@@ -70,10 +71,16 @@ app.add_middleware(
 
 # --- MODELS ---
 class AuthSyncRequest(BaseModel):
-    email: EmailStr
-    full_name: Optional[str] = None
+    email: EmailSl_name: Optional[str] = None
     avatar_url: Optional[str] = None
     provider: Optional[str] = "google"
+
+class ProformaRequest(BaseModel):
+    plan_id: str
+    company_name: str
+    cui_fiscal: str
+    billing_email: EmailStr
+    billing_address: Optional[str] = "România"
 
 class BusinessScanRequest(BaseModel):
     company_name: str
@@ -86,10 +93,6 @@ class BusinessScanRequest(BaseModel):
 class CopilotQueryRequest(BaseModel):
     query: str
     tenant_id: Optional[str] = "t1_infra_transilvania"
-
-class StageUpdateRequest(BaseModel):
-    new_stage: str
-    notes: Optional[str] = None
 
 class CheckoutRequest(BaseModel):
     plan_id: str
@@ -116,16 +119,16 @@ class ClarificationLetterRequest(BaseModel):
 @app.get("/")
 def root_index():
     return {
-        "engine": "RO-INTEL Enterprise Intelligence Engine",
+        "engine": "RO-INTEL Enterprise Procurement Engine",
         "status": "online",
-        "version": "2.1.0",
-        "endpoints": ["/api/v1/tenants/{tenant_id}/feed", "/api/v1/copilot/chat", "/api/v1/business-eligibility/evaluate"]
+        "version": "2.2.0"
     }
 
 @app.get("/health")
 def health_check():
     return {"status": "healthy", "cache": "online"}
 
+# --- AUTH SYNC ---
 @app.post("/api/v1/auth/sync")
 async def sync_user_auth(payload: AuthSyncRequest):
     assigned_tenant = "t1_infra_transilvania"
@@ -137,7 +140,7 @@ async def sync_user_auth(payload: AuthSyncRequest):
     return {
         "status": "synced",
         "user": {
-            "e": payload.email,
+            "email": payload.email,
             "full_name": payload.full_name or payload.email.split("@")[0].title(),
             "tenant_id": assigned_tenant,
             "role": "Director Bidding & Strategie",
@@ -145,13 +148,83 @@ async def sync_user_auth(payload: AuthSyncRequest):
         }
     }
 
+# --- BILLING & PROFORMA ---
 @app.get("/api/v1/billing/plans")
 def list_billing_plans():
     return StripeBillingEngine.get_plans()
 
+@app.post("/api/v1/tenants/{tenant_id}/billing/proforma")
+def generate_proforma(tenant_id: str, payload: ProformaRequest):
+    return StripeBillingEngine.generate_proforma_invoice(
+        tenant_id=tenant_id,
+        plan_id=payload.plan_id,
+        company_name=payload.company_name,
+        cui_fiscal=payload.cui_fiscal,
+        billing_email=payload.billing_email,
+        billing_address=payload.billing_address
+    )
+
 @app.post("/api/v1/tenants/{tenant_id}/billing/checkout")
 def create_tenant_checkout(tenant_id: str, payload: CheckoutRequest):
     return StripeBillingEngine.create_checkout_session(tenant_id, payload.plan_id, payload.currency)
+
+# --- CAIET FILE UPLOAD SCANNER (PDF / DOCX) ---
+@app.post("/api/v1/addons/upload-caiet")
+async def upload_and_analyze_caiet(
+    file: UploadFile = File(...),
+    project_title: str = Form(...)
+):
+    file_bytes = await file.read()
+    extracted_text = CaietDeSarciniAnalyzer.extract_text_from_file(file_bytes, file.filename)
+    if not extracted_text:
+        raise HTTPException(status_code=400, detail="Nu s-a putut extrage text din fișierul încărcat.")
+    return CaietDeSarciniAnalyzer.analyze_specification_text(extracted_text, project_title)
+
+# --- OPPORTUNITIES FEED WITH FREEMIUM SHIELD ---
+@app.get("/api/v1/tenants/{tenant_id}/feed")
+async def get_tenant_feed(
+    tenant_id: str,
+    product_id: Optional[str] = None,
+    category: Optional[str] = None,
+    force_refresh: bool = False,
+    is_subscribed: bool = True  # Set to True for full access
+):
+    cache_key = f"feed:{tenant_id}:{product_id or 'all'}:{category or 'all'}:{is_subscribed}"
+    if not force_refresh:
+        cached_data = global_cache.get(cache_key)
+        if cached_data:
+            return cached_data
+
+    orchestrator = OpportunityOrchestrator()
+    pipeline_result = await orchestrator.run_pipeline()
+    raw_leads = pipeline_result.get("leads", [])
+
+    matched_leads = []
+    for lead in raw_leads:
+        if category and category != "all" and lead.get("category") != category:
+            continue
+
+        match_info = TenantMatchingEngine.evaluate_opportunity_for_tenant(lead, tenant_id)
+        if match_info["is_match"]:
+            if product_id:
+                has_product = any(p["product_id"] == product_id for p in match_info["product_matches"])
+                if not has_product:
+                    continue
+            
+            lead_copy = dict(lead)
+            lead_copy["opportunity_score"] = match_info["tenant_opportunity_score"]
+            lead_copy["product_matches"] = match_info["product_matches"]
+            lead_copy["match_reasons"] = match_info["match_reasons"]
+            matched_leads.append(lead_copy)
+
+    matched_leads.sort(key=lambda x: x.get("opportunity_score", 0), reverse=True)
+    
+    # Apply Freemium Shield: Unlocked for subscribed users
+    gated_leads = FreemiumGatekeeper.enforce_paywall_tier(matched_leads, has_active_subscription=is_subscribed)
+    
+    payload = {"tenant_id": tenant_id, "count": len(gated_leads), "leads": gated_leads}
+    global_cache.set(cache_key, payload, ttl_seconds=60)
+    return payload
 
 @app.post("/api/v1/business-eligibility/evaluate")
 def evaluate_company_eligibility(payload: BusinessScanRequest):
@@ -183,46 +256,6 @@ async def get_tenant_products(tenant_id: str):
     if not org:
         raise HTTPException(status_code=404, detail="Organizație inexistentă")
     return {"tenant_id": tenant_id, "company_name": org["name"], "products": org["products"]}
-
-@app.get("/api/v1/tenants/{tenant_id}/feed")
-async def get_tenant_feed(
-    tenant_id: str,
-    product_id: Optional[str] = None,
-    category: Optional[str] = None,
-    force_refresh: bool = False
-):
-    cache_key = f"feed:{tenant_id}:{product_id or 'all'}:{category or 'all'}"
-    if not force_refresh:
-        cached_data = global_cache.get(cache_key)
-        if cached_data:
-            return cached_data
-
-    orchestrator = OpportunityOrchestrator()
-    pipeline_result = await orchestrator.run_pipeline()
-    raw_leads = pipeline_result.get("leads", [])
-
-    matched_leads = []
-    for lead in raw_leads:
-        if category and category != "all" and lead.get("category") != category:
-            continue
-
-        match_info = TenantMatchingEngine.evaluate_opportunity_for_tenant(lead, tenant_id)
-        if match_info["is_match"]:
-            if product_id:
-                has_product = any(p["product_id"] == product_id for p in match_info["product_matches"])
-                if not has_product:
-                    continue
-            
-            lead_copy = dict(lead)
-            lead_copy["opportunity_score"] = match_info["tenant_opportunity_score"]
-            lead_copy["product_matches"] = match_info["product_matches"]
-            lead_copy["match_reasons"] = match_info["match_reasons"]
-            matched_leads.append(lead_copy)
-
-    matched_leads.sort(key=lambda x: x.get("opportunity_score", 0), reverse=True)
-    payload = {"tenant_id": tenant_id, "count": len(matched_leads), "leads": matched_leads}
-    global_cache.set(cache_key, payload, ttl_seconds=60)
-    return payload
 
 @app.post("/api/v1/addons/analyze-caiet")
 def analyze_caiet_sarcini(payload: CaietAnalysisRequest):
