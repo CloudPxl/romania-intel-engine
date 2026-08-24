@@ -1,119 +1,82 @@
-import os
-import json
 import logging
-from typing import Dict, Any, Optional
-from openai import AsyncOpenAI
+from typing import Dict, Any
 from scrapers.models import RawInstitutionalSignal
 
 logger = logging.getLogger("AIRefinery")
-XAI_API_KEY = os.getenv("XAI_API_KEY", "")
 
-class ProcurementAIRefinery:
-    """
-    High-precision intelligence refinery for institutional procurement signals in Romania.
-    """
-    def __init__(self):
-        self.client = AsyncOpenAI(
-            api_key=XAI_API_KEY or "dummy_key",
-            base_url="[https://api.x.ai/v1](https://api.x.ai/v1)"
-        )
-
-    def _generate_fallback_intelligence(self, signal: RawInstitutionalSignal) -> Dict[str, Any]:
+class IntelligenceRefineryEngine:
+    @staticmethod
+    def refine_signal(signal: RawInstitutionalSignal) -> Dict[str, Any]:
         val = signal.estimated_value_ron
-        is_large = val >= 25000000.0
+        title = signal.project_title.lower()
+        desc = signal.raw_description.lower()
 
-        stage = "Consultare de Piata & Avizare Tehnica" if "consultare" in signal.project_title.lower() or signal.source_type == "SICAP" else "Autorizare / Pre-Contractare"
-        estimated_launch = "T4 2026 (Octombrie - Noiembrie)" if is_large else "T3-T4 2026 (Septembrie - Octombrie)"
-        funding = "PNRR / Fonduri Europene Nerambursabile" if is_large or "mipe" in signal.source_type.lower() else "Buget Local / CNI"
+        score = 7.5
+        if val >= 100000000.0:
+            score += 2.0
+        elif val >= 30000000.0:
+            score += 1.4
+        elif val >= 10000000.0:
+            score += 0.8
+
+        if any(kw in title or kw in desc for kw in ["consultare", "indicatori", "studiu de fezabilitate", "avizare", "ghid"]):
+            score += 0.5
+
+        final_score = min(10.0, round(score, 1))
+
+        if signal.category == "infrastructura":
+            pitch = (
+                "Subliniați timpii rapizi de execuție, capacitatea de mobilizare a utilajelor grele și certificările ISO 9001/14001 "
+                "pentru a securiza punctajul maxim la factorul de evaluare tehnică."
+            )
+        elif signal.category == "sanatate":
+            pitch = (
+                "Evidențiați garanția extinsă (minimum 36 luni), suportul tehnic 24/7 cu intervenție sub 4 ore și compatibilitatea DICOM/HL7 "
+                "pentru integrarea directă cu sistemele spitalicești existente."
+            )
+        elif signal.category == "energie":
+            pitch = (
+                "Prezentați randamentul ridicat al celulelor solare (>22.5%), sistemele de protecție avansată BESS și capabilitatea de mentenanță predictivă SCADA."
+            )
+        elif signal.category == "aparare":
+            pitch = (
+                "Accentați conformitatea strictă cu standardele militare NATO STANAG, criptarea hardware rezistentă la interferențe și avizele de securitate ORNISS/NATO."
+            )
+        else:
+            pitch = (
+                "Focalizați-vă pe arhitectura deschisă bazată pe microservicii, API-urile REST documentate pentru interoperabilitate și SLA-ul de 99.9% disponibilitate în cloud."
+            )
+
+        if "PNRR" in signal.project_title or "MIPE" in signal.source_type or "PNRR" in signal.source_type:
+            funding = "PNRR / Fonduri Europene Nerambursabile (100% Garantat)"
+        elif "Modernizare" in signal.source_type or "Modernizare" in signal.project_title:
+            funding = "Fondul de Modernizare UE"
+        elif "CNI" in signal.source_type or "CNI" in signal.project_title:
+            funding = "Buget Național CNI (Ministerul Dezvoltării)"
+        else:
+            funding = "Buget Local Municipal / Județean"
 
         return {
-            "executive_summary": (
-                f"{signal.entity_name} ({signal.county}) deruleaza faza preliminara pentru: {signal.project_title}. "
-                f"Miza strategica este de {val:,.0f} RON, vizand modernizarea infrastructurii din judetul {signal.county}."
-            ),
-            "sales_pitch_angle": (
-                "Pozitionati oferta pe fiabilitate ridicata, mentenanta preventiva inclusa si timpi de raspuns sub 4 ore "
-                "pentru a maximiza punctajul la factorii de evaluare tehnici din caietul de sarcini."
-            ),
+            "source_id": signal.source_id,
+            "source_type": signal.source_type,
+            "category": signal.category,
+            "sub_category": signal.sub_category,
+            "county": signal.county,
+            "locality": signal.locality,
+            "project_title": signal.project_title,
+            "entity_name": signal.entity_name,
+            "financial_value_ron": signal.estimated_value_ron,
+            "published_date": signal.published_date,
+            "action_deadline": signal.action_deadline,
+            "executive_summary": signal.raw_description,
+            "sales_pitch_angle": pitch,
             "funding_source": funding,
             "estimated_timeline": {
-                "current_stage": stage,
-                "estimated_tender_launch": estimated_launch,
-                "recommended_action_window": "Urmatoarele 14 zile (faza de dialog preliminar)"
+                "current_stage": "Consultare de Piață & Dialog Tehnic",
+                "estimated_tender_launch": "T4 2026 (Octombrie - Noiembrie)",
+                "recommended_action_window": "Următoarele 14 zile (Depunere punct de vedere tehnic)"
             },
-            "key_stakeholders": "Directia Tehnica, Serviciul Achizitii Publice & Comisia de Evaluare",
-            "competition_risk_radar": "Mediu (Atribuire pe cel mai bun raport calitate-pret)",
-            "trade_tags": [
-                signal.category,
-                signal.county.lower(),
-                "achizitii-strategice",
-                "pre-seap"
-            ],
-            "opportunity_score": 9.4 if is_large else 8.9,
-            "scoring_breakdown": {
-                "budget_viability": 9.5 if val > 0 else 7.0,
-                "procurement_urgency": 9.0,
-                "technical_margin_potential": 9.2
-            }
+            "opportunity_score": final_score,
+            "source_url": signal.source_url,
+            "metadata": signal.metadata
         }
-
-    async def refine_signal(self, signal: RawInstitutionalSignal) -> Dict[str, Any]:
-        """
-        Deep qualitative analysis using Grok LLM with structured commercial JSON output.
-        """
-        if not XAI_API_KEY or XAI_API_KEY == "dummy_key":
-            return self._generate_fallback_intelligence(signal)
-
-        prompt = f"""
-        Esti Director Comercial Senior si Expert in Strategia Achizitiilor Publice din Romania (2026).
-        Analizeaza in profunzime urmatorul semnal institutional pre-SEAP:
-
-        ID SURSA: {signal.source_id}
-        TIP REGISTRU: {signal.source_type}
-        CATEGORIE: {signal.category}
-        BENEFICIAR: {signal.entity_name} ({signal.locality}, jud. {signal.county})
-        TITLU PROIECT: {signal.project_title}
-        BUGET ESTIMAT: {signal.estimated_value_ron:,.0f} RON
-        DESCRIERE BRUTA: {signal.raw_description}
-        TERMEN LIMITA CURENT: {signal.action_deadline or "Nespecificat"}
-
-        Genereaza dosarul de intelligence comerciala. Returneaza STRICT un JSON valid:
-        {{
-            "executive_summary": "Sinteza concisa de 2-3 fraze despre ce se construieste/achizitioneaza si miza comerciala reala.",
-            "sales_pitch_angle": "Unghiul tactic exact: pe ce diferentiatori tehnici si cerinte de calitate trebuie sa insiste ofertantul.",
-            "funding_source": "Ex: PNRR C6 / CNI / Buget Local / POIM / Fonduri Proprii",
-            "estimated_timeline": {{
-                "current_stage": "Consultare Piata / Avizare HCL / Autorizatie Construire",
-                "estimated_tender_launch": "Ex: T4 2026 (Noiembrie)",
-                "recommended_action_window": "Ex: Urmatoarele 14 zile"
-            }},
-            "key_stakeholders": "Ex: Directia Tehnica & Serviciul Achizitii Publice",
-            "competition_risk_radar": "Scazut / Mediu / Ridicat",
-            "trade_tags": ["tag1", "tag2", "tag3"],
-            "opportunity_score": 9.3,
-            "scoring_breakdown": {{
-                "budget_viability": 9.5,
-                "procurement_urgency": 9.0,
-                "technical_margin_potential": 9.2
-            }}
-        }}
-        """
-
-        try:
-            res = await self.client.chat.completions.create(
-                model="grok-beta",
-                messages=[
-                    {"role": "system", "content": "Raspunde exclusiv in format JSON valid in limba romana."},
-                    {"role": "user", "content": prompt}
-                ],
-                temperature=0.2
-            )
-            raw_content = res.choices[0].message.content.strip()
-            if raw_content.startswith("```json"):
-                raw_content = raw_content[7:-3].strip()
-            elif raw_content.startswith("```"):
-                raw_content = raw_content[3:-3].strip()
-            return json.loads(raw_content)
-        except Exception as e:
-            logger.error(f"[AIRefinery] Grok API refinement fallback triggered: {e}")
-            return self._generate_fallback_intelligence(signal)
