@@ -15,14 +15,12 @@ class OpportunityOrchestrator:
         self.pnrr = PnrrMipeIngestionEngine()
 
     async def run_pipeline(self) -> Dict[str, Any]:
-        logger.info("⚡ [1/3] Extracting signals from all 4 ingestion engines...")
         signals = []
         signals.extend(await self.sicap.fetch_market_consultations())
         signals.extend(await self.municipal.fetch_market_consultations())
         signals.extend(await self.cni.fetch_market_consultations())
         signals.extend(await self.pnrr.fetch_market_consultations())
 
-        logger.info(f"⚡ [2/3] Processing {len(signals)} extracted signals through the AI Refinery...")
         leads = []
         for s in signals:
             score = 9.4 if s.estimated_value_ron > 20000000 else 8.8
@@ -36,10 +34,7 @@ class OpportunityOrchestrator:
                 "entity_name": s.entity_name,
                 "financial_value_ron": s.estimated_value_ron,
                 "executive_summary": s.raw_description,
-                "sales_pitch_angle": (
-                    "Poziționați oferta pe fiabilitate ridicată, mentenanță preventivă inclusă și timpi de răspuns sub 4 ore "
-                    "pentru a maximiza punctajul la factorii de evaluare tehnici din caietul de sarcini."
-                ),
+                "sales_pitch_angle": "Poziționați oferta pe fiabilitate ridicată, mentenanță preventivă inclusă și timpi de răspuns sub 4 ore.",
                 "funding_source": "PNRR / Fonduri Europene Nerambursabile" if "PNRR" in s.project_title or "MIPE" in s.source_type else "Buget Local / CNI",
                 "estimated_timeline": {
                     "current_stage": "Consultare de Piață & Avizare Tehnică",
@@ -52,5 +47,4 @@ class OpportunityOrchestrator:
                 "metadata": s.metadata
             })
 
-        logger.info(f"⚡ [3/3] Intelligence pipeline complete. {len(leads)} dossiers generated.")
         return {"leads": leads, "total_count": len(leads)}
