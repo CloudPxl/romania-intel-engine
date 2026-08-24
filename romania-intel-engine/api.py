@@ -71,7 +71,8 @@ app.add_middleware(
 
 # --- MODELS ---
 class AuthSyncRequest(BaseModel):
-    email: EmailSl_name: Optional[str] = None
+    email: EmailStr
+    full_name: Optional[str] = None
     avatar_url: Optional[str] = None
     provider: Optional[str] = "google"
 
@@ -180,14 +181,14 @@ async def upload_and_analyze_caiet(
         raise HTTPException(status_code=400, detail="Nu s-a putut extrage text din fișierul încărcat.")
     return CaietDeSarciniAnalyzer.analyze_specification_text(extracted_text, project_title)
 
-# --- OPPORTUNITIES FEED WITH FREEMIUM SHIELD ---
+# --- OPPORTUNITIES FEED ---
 @app.get("/api/v1/tenants/{tenant_id}/feed")
 async def get_tenant_feed(
     tenant_id: str,
     product_id: Optional[str] = None,
     category: Optional[str] = None,
     force_refresh: bool = False,
-    is_subscribed: bool = True  # Set to True for full access
+    is_subscribed: bool = True
 ):
     cache_key = f"feed:{tenant_id}:{product_id or 'all'}:{category or 'all'}:{is_subscribed}"
     if not force_refresh:
@@ -218,8 +219,6 @@ async def get_tenant_feed(
             matched_leads.append(lead_copy)
 
     matched_leads.sort(key=lambda x: x.get("opportunity_score", 0), reverse=True)
-    
-    # Apply Freemium Shield: Unlocked for subscribed users
     gated_leads = FreemiumGatekeeper.enforce_paywall_tier(matched_leads, has_active_subscription=is_subscribed)
     
     payload = {"tenant_id": tenant_id, "count": len(gated_leads), "leads": gated_leads}
