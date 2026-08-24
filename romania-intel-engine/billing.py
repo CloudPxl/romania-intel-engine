@@ -6,14 +6,10 @@ from datetime import datetime
 
 logger = logging.getLogger("BillingEngine")
 
-STRIPE_SECRET_KEY = os.getenv("STRIPE_SECRET_KEY", "")
-STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET", "")
-
-# Official RO-INTEL B2B Bank Details for Ordin de Plata (OP)
 B2B_BANK_DETAILS = {
-    "beneficiary": "RO-INTEL PROCUREMENT INTELLIGENCE",
-    "bank_name": "Banca Transilvania / Revolut Business",
-    "iban_ron": "RO98BTRL00000000000000XX",
+    "beneficiary": "RO-INTEL PROCUREMENT INTELLIGENCE SRL",
+    "bank_name": "Banca Transilvania",
+    "iban_ron": "RO49BTRL00000000000000RO",
     "swift_bic": "BTRLRO22",
     "payment_details_prefix": "Abonament RO-INTEL Desk ref: "
 }
@@ -25,8 +21,8 @@ SUBSCRIPTION_PLANS = {
         "price_eur": 100,
         "billing_interval": "lunar",
         "features": [
-            "Acces complet la toate cele 8 registre active (SICAP, CNI, MIPE, Județe)",
-            "Feed Live Pre-SEAP & Consultări de Piață",
+            "Acces complet la toate cele 8 registre active (SICAP, CNI, MIPE, Judete)",
+            "Feed Live Pre-SEAP & Consultari de Piata",
             "Sinteze Executive & Bugete Estimate xAI Grok",
             "Export CSV date calificate",
             "1 Workspace & 2 Locuri utilizatori"
@@ -39,13 +35,13 @@ SUBSCRIPTION_PLANS = {
         "billing_interval": "lunar",
         "features": [
             "Tot ce include pachetul Acces Complet",
-            "Camere VIP Specializate (Apărare & Securitate, M&A GovCon)",
-            "Multi-Product Divisions (Monitorizare separată pe linii de produse)",
+            "Camere VIP Specializate (Aparare & Securitate, M&A GovCon)",
+            "Multi-Product Divisions (Monitorizare separata pe linii de produse)",
             "Scanner Clauze Restrictive & Caiete de Sarcini (PDF/DOCX)",
-            "Simulator Șanse de Câștig & Marjă Optimă",
+            "Simulator Sanse de Castig & Marja Optima",
             "Generator Adrese Oficiale Legea 544 & Legea 98",
             "Copilot AI Interactiv Nelimitat",
-            "Până la 10 Locuri utilizatori"
+            "Pana la 10 Locuri utilizatori"
         ]
     }
 }
@@ -67,15 +63,11 @@ class StripeBillingEngine:
         company_name: str,
         cui_fiscal: str,
         billing_email: str,
-        billing_address: Optional[str] = "România"
+        billing_address: Optional[str] = "Romania"
     ) -> Dict[str, Any]:
-        plan = SUBSCRIPTION_PLANS.get(plan_id)
-        if not plan:
-            return {"status": "error", "message": "Plan tarifar inexistent"}
-
+        plan = SUBSCRIPTION_PLANS.get(plan_id, SUBSCRIPTION_PLANS["plan_founder_vip"])
         invoice_number = f"RO-INTEL-2026-{int(time.time()) % 100000:05d}"
         issue_date = datetime.now().strftime("%d.%m.%Y")
-        due_date = datetime.now().strftime("%d.%m.%Y")
         total_amount = plan["price_ron"]
 
         proforma_html = f"""
@@ -100,13 +92,13 @@ class StripeBillingEngine:
         <body>
             <div class="header">
                 <div>
-                    <div class="title">FACTURĂ PROFORMĂ</div>
-                    <div>Seria / Număr: <b>{invoice_number}</b></div>
+                    <div class="title">FACTURA PROFORMA</div>
+                    <div>Seria / Numar: <b>{invoice_number}</b></div>
                     <div>Data emiterii: <b>{issue_date}</b></div>
                 </div>
                 <div style="text-align: right;">
                     <div style="font-weight: bold; font-size: 18px; color: #0284c7;">RO-INTEL DESK</div>
-                    <div>Inteligență B2B Achiziții Publice</div>
+                    <div>Inteligenta B2B Achizitii Publice</div>
                     <div>https://ro-intel.xyz</div>
                 </div>
             </div>
@@ -114,7 +106,7 @@ class StripeBillingEngine:
             <div class="grid">
                 <div class="box">
                     <b style="color: #64748b;">FURNIZOR:</b><br>
-                    <b>RO-INTEL INTELLIGENCE</b><br>
+                    <b>RO-INTEL INTELLIGENCE SRL</b><br>
                     Email: billing@ro-intel.xyz<br>
                     Web: https://ro-intel.xyz
                 </div>
@@ -132,29 +124,29 @@ class StripeBillingEngine:
                     <tr>
                         <th>Nr.</th>
                         <th>Descriere Serviciu</th>
-                        <th>Perioadă</th>
+                        <th>Perioada</th>
                         <th style="text-align: right;">Total RON</th>
                     </tr>
                 </thead>
                 <tbody>
                     <tr>
                         <td>1</td>
-                        <td><b>Abonament Platformă: {plan['name']}</b><br><span style="color: #64748b; font-size: 11px;">Acces feed pre-SEAP, consultări de piață, radar AI Grok și instrumente de ofertare.</span></td>
-                        <td>1 Lună</td>
+                        <td><b>Abonament Platforma: {plan['name']}</b><br><span style="color: #64748b; font-size: 11px;">Acces feed pre-SEAP, consultari de piata, radar AI Grok si instrumente de ofertare.</span></td>
+                        <td>1 Luna</td>
                         <td style="text-align: right; font-weight: bold;">{total_amount:,.2f} RON</td>
                     </tr>
                 </tbody>
             </table>
 
-            <div class="total">Total de Plată: {total_amount:,.2f} RON</div>
+            <div class="total">Total de Plata: {total_amount:,.2f} RON</div>
 
             <div class="bank-box">
-                <b style="color: #0369a1;">INSTRUCȚIUNI DE PLATĂ PRIN ORDIN DE PLATĂ (OP):</b><br>
+                <b style="color: #0369a1;">INSTRUCTIUNI DE PLATA PRIN ORDIN DE PLATA (OP):</b><br>
                 Banca: <b>{B2B_BANK_DETAILS['bank_name']}</b><br>
                 IBAN RON: <b>{B2B_BANK_DETAILS['iban_ron']}</b><br>
                 Beneficiar: <b>{B2B_BANK_DETAILS['beneficiary']}</b><br>
-                Detalii Plată: <b>{B2B_BANK_DETAILS['payment_details_prefix']}{invoice_number} ({cui_fiscal})</b><br><br>
-                <i>Contul dvs. se activează automat la confirmarea plății sau la transmiterea OP-ului către desk@ro-intel.xyz.</i>
+                Detalii Plata: <b>{B2B_BANK_DETAILS['payment_details_prefix']}{invoice_number} ({cui_fiscal})</b><br><br>
+                <i>Contul dvs. se activeaza automat la confirmarea platii sau la transmiterea OP-ului catre desk@ro-intel.xyz.</i>
             </div>
         </body>
         </html>
@@ -174,49 +166,10 @@ class StripeBillingEngine:
 
     @staticmethod
     def create_checkout_session(tenant_id: str, plan_id: str, currency: str = "ron") -> Dict[str, Any]:
-        plan = SUBSCRIPTION_PLANS.get(plan_id)
-        if not plan:
-            return {"status": "error", "message": "Plan tarifar invalid"}
-
-        amount = plan["price_ron"] * 100
-
-        if STRIPE_SECRET_KEY:
-            try:
-                import stripe
-                stripe.api_key = STRIPE_SECRET_KEY
-                session = stripe.checkout.Session.create(
-                    payment_method_types=["card"],
-                    line_items=[{
-                        "price_data": {
-                            "currency": currency.lower(),
-                            "product_data": {
-                                "name": f"RO-INTEL Desk: {plan['name']}",
-                                "description": f"Acces Enterprise B2B Procurement Intelligence ({tenant_id})"
-                            },
-                            "unit_amount": amount,
-                            "recurring": {"interval": "month"}
-                        },
-                        "quantity": 1,
-                    }],
-                    mode="subscription",
-                    success_url="https://ro-intel.xyz?billing=success",
-                    cancel_url="https://ro-intel.xyz?billing=cancelled",
-                    metadata={"tenant_id": tenant_id, "plan_id": plan_id}
-                )
-                return {
-                    "status": "success",
-                    "checkout_url": session.url,
-                    "session_id": session.id,
-                    "plan": plan["name"],
-                    "amount_ron": plan["price_ron"]
-                }
-            except Exception as e:
-                logger.error(f"[Stripe] Checkout creation error: {e}")
-
-        # Fallback to direct proforma flow when Stripe live key is unconfigured
+        plan = SUBSCRIPTION_PLANS.get(plan_id, SUBSCRIPTION_PLANS["plan_founder_vip"])
         return {
             "status": "proforma_required",
-            "message": "Generați factura proformă pentru plată prin transfer bancar / Ordin de Plată (OP).",
+            "message": "Generati factura proforma pentru plata prin transfer bancar / Ordin de Plata (OP).",
             "plan_id": plan_id,
             "amount_ron": plan["price_ron"]
         }

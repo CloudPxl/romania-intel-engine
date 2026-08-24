@@ -1,5 +1,4 @@
 import logging
-from datetime import datetime, timedelta
 from typing import List
 from scrapers.base_scraper import BaseScraper
 from scrapers.models import RawInstitutionalSignal
@@ -11,8 +10,6 @@ class SicapIngestionEngine(BaseScraper):
         super().__init__(name="SicapEngine", rate_limit_delay=0.3)
 
     async def fetch_market_consultations(self) -> List[RawInstitutionalSignal]:
-        logger.info("📡 Scanning SICAP/SEAP Consultări de Piață (Art. 139 Legea 98/2016)...")
-        
         return [
             RawInstitutionalSignal(
                 source_id="SICAP-MC-2026-10892",
@@ -23,10 +20,10 @@ class SicapIngestionEngine(BaseScraper):
                 entity_name="Municipiul Iași (Primăria Iași)",
                 project_title="Consultare Piață: Sistem integrat de management inteligent al traficului (ITS), semnalizare adaptivă și camere ANPR",
                 estimated_value_ron=18200000.0,
-                raw_description="Stabilire cerințe tehnice și estimare bugetară pentru extinderea sistemului SCATS pe 32 de intersecții, subsistem detecție automată a incidentelor AID și bucle inductive.",
+                raw_description="Stabilire cerințe tehnice și estimare bugetară pentru extinderea sistemului SCATS pe 32 de intersecții, subsistem detecție automată incidente AID și bucle inductive.",
                 action_deadline="2026-09-18",
                 source_url="https://e-licitatie.ro/pub/notices/mc-notices/view/1001",
-                metadata={"cpv_code": "34996000-5", "stage": "Consultare de piata", "legal_basis": "Art. 139 Legea 98/2016"}
+                metadata={"cpv_code": "34996000-5", "stage": "Consultare de piata"}
             ),
             RawInstitutionalSignal(
                 source_id="SICAP-MC-2026-10904",
@@ -40,7 +37,7 @@ class SicapIngestionEngine(BaseScraper):
                 raw_description="Culegere opinii piață privind specificațiile clinice pentru acceleratoare de mare energie cu ghidaj imagistic IGRT și planificare automată.",
                 action_deadline="2026-09-25",
                 source_url="https://e-licitatie.ro/pub/notices/mc-notices/view/1002",
-                metadata={"cpv_code": "33151000-3", "stage": "Consultare de piata", "legal_basis": "Art. 139 Legea 98/2016"}
+                metadata={"cpv_code": "33151000-3", "stage": "Consultare de piata"}
             ),
             RawInstitutionalSignal(
                 source_id="SICAP-MC-2026-10915",

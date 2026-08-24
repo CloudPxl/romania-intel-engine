@@ -6,8 +6,8 @@ import logging
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException, Depends, Request, Response, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse, HTMLResponse
-from pydantic import BaseModel, EmailStr, Field
+from fastapi.responses import StreamingResponse
+from pydantic import BaseModel, EmailStr
 from typing import List, Optional
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
@@ -32,20 +32,20 @@ scheduler = AsyncIOScheduler()
 copilot_engine = ProcurementAICopilot()
 
 async def background_scraping_job():
-    logger.info("⏰ [24/7 DAEMON] Ingesting & qualifying pre-SEAP signals...")
+    logger.info("[24/7 DAEMON] Ingesting and qualifying pre-SEAP signals...")
     try:
         orchestrator = OpportunityOrchestrator()
         await orchestrator.run_pipeline()
         global_cache.invalidate()
-        logger.info("✅ [24/7 DAEMON] Pipeline synchronized.")
+        logger.info("[24/7 DAEMON] Pipeline synchronized.")
     except Exception as e:
-        logger.error(f"❌ [24/7 DAEMON] Error: {e}")
+        logger.error(f"[24/7 DAEMON] Error: {e}")
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     scheduler.add_job(background_scraping_job, "interval", hours=6)
     scheduler.start()
-    logger.info("🛡️ [SYSTEM] RO-INTEL Engine online with 24/7 daemon.")
+    logger.info("[SYSTEM] RO-INTEL Engine online with 24/7 daemon.")
     yield
     scheduler.shutdown()
 
@@ -69,7 +69,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# --- MODELS ---
 class AuthSyncRequest(BaseModel):
     email: EmailStr
     full_name: Optional[str] = None
@@ -81,7 +80,7 @@ class ProformaRequest(BaseModel):
     company_name: str
     cui_fiscal: str
     billing_email: EmailStr
-    billing_address: Optional[str] = "România"
+    billing_address: Optional[str] = "Romania"
 
 class BusinessScanRequest(BaseModel):
     company_name: str
@@ -129,7 +128,6 @@ def root_index():
 def health_check():
     return {"status": "healthy", "cache": "online"}
 
-# --- AUTH SYNC ---
 @app.post("/api/v1/auth/sync")
 async def sync_user_auth(payload: AuthSyncRequest):
     assigned_tenant = "t1_infra_transilvania"
@@ -149,7 +147,6 @@ async def sync_user_auth(payload: AuthSyncRequest):
         }
     }
 
-# --- BILLING & PROFORMA ---
 @app.get("/api/v1/billing/plans")
 def list_billing_plans():
     return StripeBillingEngine.get_plans()
@@ -169,7 +166,6 @@ def generate_proforma(tenant_id: str, payload: ProformaRequest):
 def create_tenant_checkout(tenant_id: str, payload: CheckoutRequest):
     return StripeBillingEngine.create_checkout_session(tenant_id, payload.plan_id, payload.currency)
 
-# --- CAIET FILE UPLOAD SCANNER (PDF / DOCX) ---
 @app.post("/api/v1/addons/upload-caiet")
 async def upload_and_analyze_caiet(
     file: UploadFile = File(...),
@@ -178,10 +174,9 @@ async def upload_and_analyze_caiet(
     file_bytes = await file.read()
     extracted_text = CaietDeSarciniAnalyzer.extract_text_from_file(file_bytes, file.filename)
     if not extracted_text:
-        raise HTTPException(status_code=400, detail="Nu s-a putut extrage text din fișierul încărcat.")
+        raise HTTPException(status_code=400, detail="Nu s-a putut extrage text din fisierul incarcat.")
     return CaietDeSarciniAnalyzer.analyze_specification_text(extracted_text, project_title)
 
-# --- OPPORTUNITIES FEED ---
 @app.get("/api/v1/tenants/{tenant_id}/feed")
 async def get_tenant_feed(
     tenant_id: str,
@@ -253,7 +248,7 @@ async def copilot_chat(payload: CopilotQueryRequest):
 async def get_tenant_products(tenant_id: str):
     org = TENANT_ORGANIZATIONS.get(tenant_id)
     if not org:
-        raise HTTPException(status_code=404, detail="Organizație inexistentă")
+        raise HTTPException(status_code=404, detail="Organizatie inexistenta")
     return {"tenant_id": tenant_id, "company_name": org["name"], "products": org["products"]}
 
 @app.post("/api/v1/addons/analyze-caiet")

@@ -1,14 +1,10 @@
 import time
 import logging
-from typing import Dict, Any, Optional
+from typing import Any, Optional, Dict
 
 logger = logging.getLogger("CacheEngine")
 
 class MemoryCacheEngine:
-    """
-    In-memory LRU-TTL cache engine to serve concurrent requests
-    without overloading database connection pools.
-    """
     def __init__(self, default_ttl_seconds: int = 90):
         self._cache: Dict[str, Dict[str, Any]] = {}
         self.default_ttl = default_ttl_seconds
@@ -17,11 +13,9 @@ class MemoryCacheEngine:
         entry = self._cache.get(key)
         if not entry:
             return None
-
         if time.time() > entry["expires_at"]:
             del self._cache[key]
             return None
-
         return entry["value"]
 
     def set(self, key: str, value: Any, ttl_seconds: Optional[int] = None):

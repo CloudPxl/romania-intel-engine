@@ -4,32 +4,18 @@ from datetime import datetime
 
 logger = logging.getLogger("WorkflowEngine")
 
-# In-memory concurrent state for fast access with Supabase synchronization
-CONCURRENT_DEAL_PIPELINE: Dict[str, List[Dict[str, Any]]] = {
+CONCURRENT_DEAL_PIPELINE = {
     "t1_infra_transilvania": [
         {
             "deal_id": "DEAL-IASI-ITS-01",
             "product_id": "prod_smart_traffic",
-            "opportunity_id": "SICAP-MC-IASI-ITS-101",
+            "opportunity_id": "SICAP-MC-2026-10892",
             "project_title": "Sistem inteligent de management al traficului Iași",
             "stage": "consultation_drafted",
-            "assigned_to": "andrei.muresan@infraconstruct.ro",
+            "assigned_to": "director@infraconstruct.ro",
             "target_margin_pct": 21.0,
             "estimated_value_ron": 18200000.0,
             "notes": "Fișa tehnică preliminară pregătită pentru transmitere la Primăria Iași."
-        }
-    ],
-    "t2_medtech_bucuresti": [
-        {
-            "deal_id": "DEAL-IRO-RAD-01",
-            "product_id": "prod_oncology_hardware",
-            "opportunity_id": "SICAP-MC-IASI-IRO-202",
-            "project_title": "Acceleratoare liniare particule IRO Iași",
-            "stage": "caiet_sarcini_analysis",
-            "assigned_to": "dr.popescu@medtechpharma.ro",
-            "target_margin_pct": 28.5,
-            "estimated_value_ron": 34000000.0,
-            "notes": "Specificațiile tehnice de radioterapie stereotaxică sunt 100% compatibile."
         }
     ]
 }

@@ -15,20 +15,17 @@ class WinProbabilityEngine:
             return {"status": "error", "message": "Buget estimat invalid"}
 
         discount_pct = round(((estimated_budget_ron - proposed_price_ron) / estimated_budget_ron) * 100, 2)
-        
-        # Base probability calculation
         base_prob = 55.0
         
-        # Scoring logic based on Romanian procurement trends (best price-quality ratio)
         if 5.0 <= discount_pct <= 14.0:
-            base_prob += 20.0  # Sweet spot for quality-price tenders
+            base_prob += 20.0
         elif discount_pct > 20.0:
-            base_prob += 10.0  # High price score but risk of abnormally low price justification (Art. 210)
+            base_prob += 10.0
         elif discount_pct < 3.0:
-            base_prob -= 15.0  # Vulnerable to aggressive competitors
+            base_prob -= 15.0
 
         if has_local_partnership:
-            base_prob += 12.0  # Local presence bonus for technical logistics
+            base_prob += 12.0
 
         final_prob = max(10.0, min(95.0, round(base_prob, 1)))
 
@@ -39,7 +36,7 @@ class WinProbabilityEngine:
             "win_probability_score": f"{final_prob}%",
             "rating": "Favorabil" if final_prob >= 75 else "Competitiv (Risc Mediu)" if final_prob >= 50 else "Nefavorabil",
             "tactical_guidance": (
-                "Marja de preț se situează în intervalul optim de competitivitate (5-14% discount). "
-                "Focalizați-vă pe maximizarea punctajului tehnic la garanție și timpi de intervenție."
+                "Marja de pret se situeaza in intervalul optim de competitivitate (5-14% discount). "
+                "Focalizati-va pe maximizarea punctajului tehnic la garantie si timpi de interventie."
             )
         }

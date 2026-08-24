@@ -17,34 +17,32 @@ class LegalClarificationGenerator:
         today_str = datetime.now().strftime("%d.%m.%Y")
 
         letter_text = f"""
-Către: {authority_name}
-În atenția: Serviciului Achiziții Publice / Direcției Tehnice
+Catre: {authority_name}
+In atentia: Serviciului Achizitii Publice / Directiei Tehnice
 
-Ref: Procedura de consultare de piață / semnal pre-SEAP {source_id}
+Ref: Procedura de consultare de piata / semnal pre-SEAP {source_id}
 Obiect: "{project_title}"
 
 Data: {today_str}
 
-Stimate domnule / Stimată doamnă Director,
+Stimate domnule / Stimata doamna Director,
 
-Subscrisa, {company_name}, înregistrată la Registrul Comerțului, CUI {cui_fiscal}, în calitate de operator economic de profil interesat de participarea la procedura menționată în referință,
+Subscrisa, {company_name}, inregistrata la Registrul Comertului, CUI {cui_fiscal}, in calitate de operator economic de profil interesat de participarea la procedura mentionata in referinta,
 
-Având în vedere principiile nediscriminării, tratamentului egal și proporționalității consacrate de Art. 2 alin. (2) din Legea nr. 98/2016 privind achizițiile publice, precum și prevederile Legii nr. 544/2001 privind liberul acces la informațiile de interes public,
+Avand in vedere principiile nediscriminarii, tratamentului egal si proportionalitatii consacrate de Art. 2 alin. (2) din Legea nr. 98/2016 privind achizitiile publice, precum si prevederile Legii nr. 544/2001 privind liberul acces la informatiile de interes public,
 
-Vă înaintăm prezenta SOLICITARE DE CLARIFICĂRI / PUNCT DE VEDERE TEHNIC cu privire la cerințele preliminare ale procedurii:
+Va inaintam prezenta SOLICITARE DE CLARIFICARI / PUNCT DE VEDERE TEHNIC cu privire la cerintele preliminare ale procedurii:
 
 {clarification_points}
 
-Vă rugăm să aveți în vedere ajustarea cerințelor tehnice astfel încât să asigurați un mediu concurențial real și accesul liber al soluțiilor tehnice inovatoare și eficiente din punct de vedere energetic.
+Va rugam sa aveti in vedere ajustarea cerintelor tehnice astfel incat sa asigurati un mediu concurential real si accesul liber al solutiilor tehnice performante.
 
-În speranța unui dialog tehnico-instituțional constructiv, vă stăm la dispoziție pentru orice demonstrații tehnice preliminare.
-
-Cu stimă,
-Departamentul Bidding & Afaceri Publice
+Cu stima,
+Departamentul Bidding & Strategie Achizitii
 {company_name}
 """
         return {
-            "document_type": "Adresă Oficială Solicitare Clarificări Legea 98/2016",
+            "document_type": "Adresa Oficiala Solicitare Clarificari Legea 98/2016",
             "recipient": authority_name,
             "reference_id": source_id,
             "generated_letter": letter_text.strip()
