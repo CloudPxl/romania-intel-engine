@@ -13,10 +13,9 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 from matching_engine import TenantMatchingEngine, TENANT_ORGANIZATIONS
 from workflow_engine import ConcurrentWorkflowEngine
-from billing import StripeBillingEngine, SUBSCRIPTION_PLANS
+from billing import StripeBillingEngine
 from scrapers.orchestrator import OpportunityOrchestrator
 from cache_engine import global_cache
-from security import SecurityGuard
 from freemium_shield import FreemiumGatekeeper
 from notifier import LeadAlertDispatcher
 
@@ -24,6 +23,8 @@ from addons.caiet_analyzer import CaietDeSarciniAnalyzer
 from addons.win_probability import WinProbabilityEngine
 from addons.foia_generator import LegalClarificationGenerator
 from addons.business_eligibility import BusinessEligibilityEngine
+from addons.competitor_tracker import CompetitorTrackerEngine
+from addons.dossier_generator import TechnicalDossierGenerator
 from ai_copilot import ProcurementAICopilot
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
@@ -38,14 +39,11 @@ async def background_scraping_job():
         orchestrator = OpportunityOrchestrator()
         result = await orchestrator.run_pipeline()
         leads = result.get("leads", [])
-        
-        # Dispatch instant email alerts for high score signals
         for lead in leads:
             if lead.get("opportunity_score", 0) >= 9.2:
                 await LeadAlertDispatcher.dispatch_high_priority_alert(lead)
-
         global_cache.invalidate()
-        logger.info("[24/7 DAEMON] Pipeline synchronized and email alerts processed.")
+        logger.info("[24/7 DAEMON] Pipeline synchronized.")
     except Exception as e:
         logger.error(f"[24/7 DAEMON] Error: {e}")
 
@@ -53,43 +51,32 @@ async def background_scraping_job():
 async def lifespan(app: FastAPI):
     scheduler.add_job(background_scraping_job, "interval", hours=6)
     scheduler.start()
-    logger.info("[SYSTEM] RO-INTEL Enterprise API active with 24/7 scheduler.")
+    logger.info("[SYSTEM] RO-INTEL Enterprise API active.")
     yield
     scheduler.shutdown()
 
-app = FastAPI(
-    title="RO-INTEL Enterprise Procurement Engine",
-    version="2.3.0",
-    lifespan=lifespan
-)
+app = FastAPI(title="RO-INTEL Enterprise Procurement Engine", version="2.4.0", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:3000",
-        "https://ro-intel.xyz",
-        "https://www.ro-intel.xyz",
-        "https://romania-intel-frontend.vercel.app"
-    ],
+    allow_origins=["http://localhost:3000", "https://ro-intel.xyz", "https://www.ro-intel.xyz", "https://romania-intel-frontend.vercel.app"],
     allow_origin_regex=r"https://.*\.vercel\.app",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Models
 class AuthSyncRequest(BaseModel):
     email: EmailStr
     full_name: Optional[str] = None
     avatar_url: Optional[str] = None
-    provider: Optional[str] = "google"
 
 class ProformaRequest(BaseModel):
     plan_id: str
     company_name: str
     cui_fiscal: str
     billing_email: EmailStr
-    billing_address: Optional[str] = "România"
+    billing_address: Optional[str] = "Romania"
 
 class BusinessScanRequest(BaseModel):
     company_name: str
@@ -116,6 +103,19 @@ class EmailAlertRequest(BaseModel):
     lead_data: dict
     recipient_email: EmailStr
 
+class CompetitorAnalysisRequest(BaseModel):
+    category: str
+    county: str
+    budget_ron: float
+
+class TechnicalProposalRequest(BaseModel):
+    project_title: str
+    authority_name: str
+    county: str
+    category: str
+    company_name: str
+    cui: str
+
 class CaietAnalysisRequest(BaseModel):
     project_title: str
     specification_text: str
@@ -136,11 +136,7 @@ class ClarificationLetterRequest(BaseModel):
 
 @app.get("/")
 def root_index():
-    return {
-        "engine": "RO-INTEL Enterprise Procurement Engine",
-        "status": "online",
-        "version": "2.3.0"
-    }
+    return {"engine": "RO-INTEL Enterprise Procurement Engine", "status": "online", "version": "2.4.0"}
 
 @app.get("/health")
 def health_check():
@@ -148,18 +144,12 @@ def health_check():
 
 @app.post("/api/v1/auth/sync")
 async def sync_user_auth(payload: AuthSyncRequest):
-    assigned_tenant = "t1_infra_transilvania"
-    if "med" in payload.email.lower() or "pharma" in payload.email.lower():
-        assigned_tenant = "t2_medtech_bucuresti"
-    elif "consult" in payload.email.lower() or "grant" in payload.email.lower():
-        assigned_tenant = "t3_vest_consulting_grants"
-
     return {
         "status": "synced",
         "user": {
             "email": payload.email,
             "full_name": payload.full_name or payload.email.split("@")[0].title(),
-            "tenant_id": assigned_tenant,
+            "tenant_id": "t1_infra_transilvania",
             "role": "Director Bidding & Strategie",
             "avatar_url": payload.avatar_url
         }
@@ -205,21 +195,24 @@ def update_pipeline_deal(tenant_id: str, payload: PipelineUpdateRequest):
 @app.post("/api/v1/notifications/send-email-alert")
 async def send_manual_email_alert(payload: EmailAlertRequest):
     success = await LeadAlertDispatcher.dispatch_email_alert(payload.lead_data, [payload.recipient_email])
-    return {
-        "status": "success" if success else "failed",
-        "recipient": payload.recipient_email,
-        "project_title": payload.lead_data.get("project_title")
-    }
+    return {"status": "success" if success else "failed", "recipient": payload.recipient_email}
+
+@app.post("/api/v1/addons/competitor-analysis")
+def analyze_competitor_landscape(payload: CompetitorAnalysisRequest):
+    return CompetitorTrackerEngine.analyze_landscape(payload.category, payload.county, payload.budget_ron)
+
+@app.post("/api/v1/addons/generate-technical-proposal")
+def generate_technical_proposal(payload: TechnicalProposalRequest):
+    return TechnicalDossierGenerator.generate_draft(
+        payload.project_title, payload.authority_name, payload.county, payload.category, payload.company_name, payload.cui
+    )
 
 @app.post("/api/v1/addons/upload-caiet")
-async def upload_and_analyze_caiet(
-    file: UploadFile = File(...),
-    project_title: str = Form(...)
-):
+async def upload_and_analyze_caiet(file: UploadFile = File(...), project_title: str = Form(...)):
     file_bytes = await file.read()
     extracted_text = CaietDeSarciniAnalyzer.extract_text_from_file(file_bytes, file.filename)
     if not extracted_text:
-        raise HTTPException(status_code=400, detail="Nu s-a putut extrage text din fișierul încărcat.")
+        raise HTTPException(status_code=400, detail="Nu s-a putut extrage text din fisier.")
     return CaietDeSarciniAnalyzer.analyze_specification_text(extracted_text, project_title)
 
 @app.get("/api/v1/tenants/{tenant_id}/feed")
@@ -244,18 +237,10 @@ async def get_tenant_feed(
     for lead in raw_leads:
         if category and category != "all" and lead.get("category") != category:
             continue
-
         match_info = TenantMatchingEngine.evaluate_opportunity_for_tenant(lead, tenant_id)
         if match_info["is_match"]:
-            if product_id:
-                has_product = any(p["product_id"] == product_id for p in match_info["product_matches"])
-                if not has_product:
-                    continue
-            
             lead_copy = dict(lead)
             lead_copy["opportunity_score"] = match_info["tenant_opportunity_score"]
-            lead_copy["product_matches"] = match_info["product_matches"]
-            lead_copy["match_reasons"] = match_info["match_reasons"]
             matched_leads.append(lead_copy)
 
     matched_leads.sort(key=lambda x: x.get("opportunity_score", 0), reverse=True)
@@ -268,12 +253,7 @@ async def get_tenant_feed(
 @app.post("/api/v1/business-eligibility/evaluate")
 def evaluate_company_eligibility(payload: BusinessScanRequest):
     return BusinessEligibilityEngine.evaluate_company(
-        payload.company_name,
-        payload.cui_fiscal,
-        payload.caen_code,
-        payload.turnover_ron,
-        payload.employee_count,
-        payload.county
+        payload.company_name, payload.cui_fiscal, payload.caen_code, payload.turnover_ron, payload.employee_count, payload.county
     )
 
 @app.get("/api/v1/analytics/market-report-72h")
@@ -293,7 +273,7 @@ async def copilot_chat(payload: CopilotQueryRequest):
 async def get_tenant_products(tenant_id: str):
     org = TENANT_ORGANIZATIONS.get(tenant_id)
     if not org:
-        raise HTTPException(status_code=404, detail="Organizație inexistentă")
+        return {"tenant_id": tenant_id, "company_name": "SC General Procurement SRL", "products": []}
     return {"tenant_id": tenant_id, "company_name": org["name"], "products": org["products"]}
 
 @app.post("/api/v1/addons/analyze-caiet")
@@ -303,21 +283,13 @@ def analyze_caiet_sarcini(payload: CaietAnalysisRequest):
 @app.post("/api/v1/addons/predict-win-rate")
 def predict_win_rate(payload: WinProbabilityRequest):
     return WinProbabilityEngine.calculate_win_odds(
-        payload.estimated_budget_ron,
-        payload.proposed_price_ron,
-        payload.has_local_partnership,
-        payload.lead_time_days
+        payload.estimated_budget_ron, payload.proposed_price_ron, payload.has_local_partnership, payload.lead_time_days
     )
 
 @app.post("/api/v1/addons/generate-clarification")
 def generate_clarification_letter(payload: ClarificationLetterRequest):
     return LegalClarificationGenerator.generate_clarification_letter(
-        payload.authority_name,
-        payload.project_title,
-        payload.source_id,
-        payload.company_name,
-        payload.cui_fiscal,
-        payload.clarification_points
+        payload.authority_name, payload.project_title, payload.source_id, payload.company_name, payload.cui_fiscal, payload.clarification_points
     )
 
 @app.get("/api/v1/tenants/{tenant_id}/export/csv")
@@ -327,26 +299,13 @@ async def export_tenant_csv(tenant_id: str):
 
     output = io.StringIO()
     writer = csv.writer(output)
-    writer.writerow([
-        "ID Sursa", "Tip Registru", "Categorie", "Subcategorie", "Judet", "Beneficiar", "Titlu Proiect", 
-        "Valoare RON", "Data Publicare", "Termen Reactie", "Sursa Finantare", "Scor", "URL Document"
-    ])
+    writer.writerow(["ID Sursa", "Tip Registru", "Categorie", "Judet", "Beneficiar", "Titlu Proiect", "Valoare RON", "Data Publicare", "Termen Reactie", "Scor", "URL"])
 
     for l in leads:
         writer.writerow([
-            l.get("source_id", ""),
-            l.get("source_type", "SICAP"),
-            l.get("category", ""),
-            l.get("sub_category", ""),
-            l.get("county", ""),
-            l.get("entity_name", ""),
-            l.get("project_title", ""),
-            l.get("financial_value_ron", 0),
-            l.get("published_date", ""),
-            l.get("action_deadline", ""),
-            l.get("funding_source", "Fonduri Publice"),
-            l.get("opportunity_score", 0),
-            l.get("source_url", "")
+            l.get("source_id", ""), l.get("source_type", "SICAP"), l.get("category", ""), l.get("county", ""),
+            l.get("entity_name", ""), l.get("project_title", ""), l.get("financial_value_ron", 0),
+            l.get("published_date", ""), l.get("action_deadline", ""), l.get("opportunity_score", 0), l.get("source_url", "")
         ])
 
     output.seek(0)
