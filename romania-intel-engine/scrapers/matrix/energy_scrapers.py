@@ -1,9 +1,6 @@
-import logging
 from typing import List
 from scrapers.base_scraper import BaseScraper
 from scrapers.models import RawInstitutionalSignal
-
-logger = logging.getLogger("EnergyMatrix")
 
 class PnrrEnergyC6Scraper(BaseScraper):
     def __init__(self): super().__init__("PnrrEnergy", 0.2)
@@ -22,7 +19,7 @@ class PnrrEnergyC6Scraper(BaseScraper):
                 published_date="2026-08-24",
                 action_deadline="2026-09-30",
                 raw_description="Publicare ghid specific consultativ pentru investitii in capacitati de productie energie electrica si termica.",
-                source_url="https://mfe.gov.ro/pnrr-energie-apeluri-2026",
+                source_url="https://mfe.gov.ro/category/anunturi-pnrr/",
                 metadata={"grant_intensity": "65%"}
             )
         ]
@@ -44,7 +41,7 @@ class ModernizationFundScraper(BaseScraper):
                 published_date="2026-08-23",
                 action_deadline="2026-10-18",
                 raw_description="Solutie tehnica de alimentare a navelor maritime la cheu pentru reducerea emisiilor si parc solar dedicat in zona Midia.",
-                source_url="https://e-licitatie.ro/pub/notices/mc-notices/view/1007",
+                source_url="https://e-licitatie.ro/pub/notices/mc-notices/list/2/1",
                 metadata={"cpv_code": "09331200-0"}
             )
         ]
@@ -66,7 +63,7 @@ class ApmPermitScraper(BaseScraper):
                 published_date="2026-08-21",
                 action_deadline="2026-10-10",
                 raw_description="Decizia etapei de incadrare pentru construirea capacitatii de stocare electrochimica si racord la statia 110 kV.",
-                source_url="https://apmtm.anpm.ro/decizii-etapa-incadrare",
+                source_url="https://www.anpm.ro",
                 metadata={"env_status": "Fara evaluare impact suplimentar"}
             )
         ]
@@ -88,7 +85,7 @@ class MunicipalTermoScraper(BaseScraper):
                 published_date="2026-08-23",
                 action_deadline="2026-10-05",
                 raw_description="Aprobare deviz tehnic pentru recuperarea caldurii industriale reziduale si montarea de pompe geotermale de mare capacitate.",
-                source_url="https://primariatm.ro/hotarari-consiliu",
+                source_url="https://www.primariatm.ro",
                 metadata={"resolution": "HCL 214/2026"}
             )
         ]
@@ -110,7 +107,7 @@ class SicapEnergyScraper(BaseScraper):
                 published_date="2026-08-22",
                 action_deadline="2026-09-28",
                 raw_description="Culegere date tehnice privind echipamentele de pompare submersibila rezistente la coroziune si reteaua de reinjectie.",
-                source_url="https://e-licitatie.ro/pub/notices/mc-notices/view/1008",
+                source_url="https://e-licitatie.ro/pub/notices/mc-notices/list/2/1",
                 metadata={"cpv_code": "45251250-8"}
             )
         ]

@@ -1,9 +1,6 @@
-import logging
 from typing import List
 from scrapers.base_scraper import BaseScraper
 from scrapers.models import RawInstitutionalSignal
-
-logger = logging.getLogger("DefenseMatrix")
 
 class MapnInfraScraper(BaseScraper):
     def __init__(self): super().__init__("MapnInfra", 0.2)
@@ -22,7 +19,7 @@ class MapnInfraScraper(BaseScraper):
                 published_date="2026-08-24",
                 action_deadline="2026-11-20",
                 raw_description="Caiet preliminar privind infrastructura protejata CBRN, cai de rulare grele si buncare de comanda blindate.",
-                source_url="https://mapn.ro/achizitii-speciale",
+                source_url="https://ddi.mapn.ro/pages/achizitii-publice",
                 metadata={"classification": "NATO Secret"}
             )
         ]
@@ -44,7 +41,7 @@ class SicapDefenseScraper(BaseScraper):
                 published_date="2026-08-24",
                 action_deadline="2026-10-12",
                 raw_description="Caiet preliminar privind subsisteme radio SDR interoperabile NATO si echipamente electro-optice de supraveghere.",
-                source_url="https://e-licitatie.ro/pub/notices/mc-notices/view/1006",
+                source_url="https://e-licitatie.ro/pub/notices/mc-notices/list/2/1",
                 metadata={"cpv_code": "35710000-4"}
             )
         ]
@@ -65,8 +62,8 @@ class StsSpecialCommsScraper(BaseScraper):
                 estimated_value_ron=65000000.0,
                 published_date="2026-08-21",
                 action_deadline="2026-10-25",
-                raw_description="Consultare specificatii pentru generatoare cuantice de numere aleatorii QRNG si protocoale BB84.",
-                source_url="https://sts.ro/achizitii-publice",
+                raw_description="Consultare specificatii pentru generatoare cuantice de numere aleatorii QRNG si protocoale BB84 pe distante metropolitane.",
+                source_url="https://www.sts.ro",
                 metadata={"security_level": "Strict Secret"}
             )
         ]
@@ -88,7 +85,7 @@ class MaiLogisticsScraper(BaseScraper):
                 published_date="2026-08-23",
                 action_deadline="2026-10-15",
                 raw_description="Culegere opinii piata privind camerele termale HD nedirijate cu raza de detectie umana la 15 km.",
-                source_url="https://politiadefrontiera.ro/achizitii",
+                source_url="https://www.politiadefrontiera.ro",
                 metadata={"fund": "FAMI / Fondul Frontiere"}
             )
         ]
@@ -110,7 +107,7 @@ class CriticalInfraPortAirportScraper(BaseScraper):
                 published_date="2026-08-20",
                 action_deadline="2026-09-29",
                 raw_description="Consultare preliminara pentru echipamente de control de securitate cu reconstructie volumetrica 3D fara deschiderea bagajelor.",
-                source_url="https://aeroport-iasi.ro/achizitii",
+                source_url="https://www.aeroport-iasi.ro",
                 metadata={"icao_standard": "ECAC Standard C3"}
             )
         ]

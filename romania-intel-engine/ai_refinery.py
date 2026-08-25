@@ -19,40 +19,28 @@ class IntelligenceRefineryEngine:
         elif val >= 10000000.0:
             score += 0.8
 
-        if any(kw in title or kw in desc for kw in ["consultare", "indicatori", "studiu de fezabilitate", "avizare", "ghid"]):
+        if any(kw in title or kw in desc for kw in ["consultare", "indicatori", "studiu", "avizare", "ghid"]):
             score += 0.5
 
         final_score = min(10.0, round(score, 1))
 
         if signal.category == "infrastructura":
-            pitch = (
-                "Subliniați timpii rapizi de execuție, capacitatea de mobilizare a utilajelor grele și certificările ISO 9001/14001 "
-                "pentru a securiza punctajul maxim la factorul de evaluare tehnică."
-            )
+            pitch = "Subliniați timpii rapizi de execuție, capacitatea de mobilizare a utilajelor grele și certificările ISO pentru a securiza punctajul tehnic maxim."
         elif signal.category == "sanatate":
-            pitch = (
-                "Evidențiați garanția extinsă (minimum 36 luni), suportul tehnic 24/7 cu intervenție sub 4 ore și compatibilitatea DICOM/HL7 "
-                "pentru integrarea directă cu sistemele spitalicești existente."
-            )
+            pitch = "Evidențiați garanția extinsă (min. 36 luni), suportul tehnic 24/7 cu intervenție sub 4 ore și compatibilitatea DICOM/HL7 cu sistemele spitalului."
         elif signal.category == "energie":
-            pitch = (
-                "Prezentați randamentul ridicat al celulelor solare (>22.5%), sistemele de protecție avansată BESS și capabilitatea de mentenanță predictivă SCADA."
-            )
+            pitch = "Prezentați randamentul celulelor solare (>22.5%), sistemele de protecție avansată BESS și capabilitatea de mentenanță predictivă SCADA."
         elif signal.category == "aparare":
-            pitch = (
-                "Accentați conformitatea strictă cu standardele militare NATO STANAG, criptarea hardware rezistentă la interferențe și avizele de securitate ORNISS/NATO."
-            )
+            pitch = "Accentați conformitatea strictă cu standardele militare NATO STANAG, criptarea hardware rezistentă la bruiaj și avizele de securitate ORNISS."
         else:
-            pitch = (
-                "Focalizați-vă pe arhitectura deschisă bazată pe microservicii, API-urile REST documentate pentru interoperabilitate și SLA-ul de 99.9% disponibilitate în cloud."
-            )
+            pitch = "Focalizați-vă pe arhitectura deschisă bazată pe microservicii, API-urile REST documentate pentru interoperabilitate și SLA-ul de 99.9% disponibilitate."
 
         if "PNRR" in signal.project_title or "MIPE" in signal.source_type or "PNRR" in signal.source_type:
-            funding = "PNRR / Fonduri Europene Nerambursabile (100% Garantat)"
+            funding = "PNRR / Fonduri Europene Nerambursabile"
         elif "Modernizare" in signal.source_type or "Modernizare" in signal.project_title:
             funding = "Fondul de Modernizare UE"
         elif "CNI" in signal.source_type or "CNI" in signal.project_title:
-            funding = "Buget Național CNI (Ministerul Dezvoltării)"
+            funding = "Buget Național CNI"
         else:
             funding = "Buget Local Municipal / Județean"
 
@@ -74,7 +62,7 @@ class IntelligenceRefineryEngine:
             "estimated_timeline": {
                 "current_stage": "Consultare de Piață & Dialog Tehnic",
                 "estimated_tender_launch": "T4 2026 (Octombrie - Noiembrie)",
-                "recommended_action_window": "Următoarele 14 zile (Depunere punct de vedere tehnic)"
+                "recommended_action_window": "Următoarele 14 zile (Depunere punct de vedere)"
             },
             "opportunity_score": final_score,
             "source_url": signal.source_url,

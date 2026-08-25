@@ -18,6 +18,7 @@ from scrapers.orchestrator import OpportunityOrchestrator
 from cache_engine import global_cache
 from security import SecurityGuard
 from freemium_shield import FreemiumGatekeeper
+from notifier import LeadAlertDispatcher
 
 from addons.caiet_analyzer import CaietDeSarciniAnalyzer
 from addons.win_probability import WinProbabilityEngine
@@ -35,9 +36,16 @@ async def background_scraping_job():
     logger.info("[24/7 DAEMON] Ingesting and qualifying pre-SEAP signals...")
     try:
         orchestrator = OpportunityOrchestrator()
-        await orchestrator.run_pipeline()
+        result = await orchestrator.run_pipeline()
+        leads = result.get("leads", [])
+        
+        # Dispatch instant email alerts for high score signals
+        for lead in leads:
+            if lead.get("opportunity_score", 0) >= 9.2:
+                await LeadAlertDispatcher.dispatch_high_priority_alert(lead)
+
         global_cache.invalidate()
-        logger.info("[24/7 DAEMON] Pipeline synchronized.")
+        logger.info("[24/7 DAEMON] Pipeline synchronized and email alerts processed.")
     except Exception as e:
         logger.error(f"[24/7 DAEMON] Error: {e}")
 
@@ -45,13 +53,13 @@ async def background_scraping_job():
 async def lifespan(app: FastAPI):
     scheduler.add_job(background_scraping_job, "interval", hours=6)
     scheduler.start()
-    logger.info("[SYSTEM] RO-INTEL Engine online with 24/7 daemon.")
+    logger.info("[SYSTEM] RO-INTEL Enterprise API active with 24/7 scheduler.")
     yield
     scheduler.shutdown()
 
 app = FastAPI(
     title="RO-INTEL Enterprise Procurement Engine",
-    version="2.2.0",
+    version="2.3.0",
     lifespan=lifespan
 )
 
@@ -69,6 +77,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Models
 class AuthSyncRequest(BaseModel):
     email: EmailStr
     full_name: Optional[str] = None
@@ -80,7 +89,7 @@ class ProformaRequest(BaseModel):
     company_name: str
     cui_fiscal: str
     billing_email: EmailStr
-    billing_address: Optional[str] = "Romania"
+    billing_address: Optional[str] = "România"
 
 class BusinessScanRequest(BaseModel):
     company_name: str
@@ -94,9 +103,18 @@ class CopilotQueryRequest(BaseModel):
     query: str
     tenant_id: Optional[str] = "t1_infra_transilvania"
 
-class CheckoutRequest(BaseModel):
-    plan_id: str
-    currency: Optional[str] = "ron"
+class PipelineAddRequest(BaseModel):
+    lead_data: dict
+
+class PipelineUpdateRequest(BaseModel):
+    deal_id: str
+    new_stage: str
+    notes: Optional[str] = None
+    proposed_price: Optional[float] = None
+
+class EmailAlertRequest(BaseModel):
+    lead_data: dict
+    recipient_email: EmailStr
 
 class CaietAnalysisRequest(BaseModel):
     project_title: str
@@ -121,7 +139,7 @@ def root_index():
     return {
         "engine": "RO-INTEL Enterprise Procurement Engine",
         "status": "online",
-        "version": "2.2.0"
+        "version": "2.3.0"
     }
 
 @app.get("/health")
@@ -162,9 +180,36 @@ def generate_proforma(tenant_id: str, payload: ProformaRequest):
         billing_address=payload.billing_address
     )
 
-@app.post("/api/v1/tenants/{tenant_id}/billing/checkout")
-def create_tenant_checkout(tenant_id: str, payload: CheckoutRequest):
-    return StripeBillingEngine.create_checkout_session(tenant_id, payload.plan_id, payload.currency)
+@app.get("/api/v1/tenants/{tenant_id}/pipeline")
+def get_tenant_pipeline(tenant_id: str, stage: Optional[str] = None):
+    return {
+        "tenant_id": tenant_id,
+        "stages": ConcurrentWorkflowEngine.get_stages(),
+        "deals": ConcurrentWorkflowEngine.get_tenant_pipeline(tenant_id, stage)
+    }
+
+@app.post("/api/v1/tenants/{tenant_id}/pipeline/add")
+def add_pipeline_deal(tenant_id: str, payload: PipelineAddRequest):
+    return ConcurrentWorkflowEngine.add_lead_to_pipeline(tenant_id, payload.lead_data)
+
+@app.post("/api/v1/tenants/{tenant_id}/pipeline/update")
+def update_pipeline_deal(tenant_id: str, payload: PipelineUpdateRequest):
+    return ConcurrentWorkflowEngine.update_deal_stage(
+        tenant_id=tenant_id,
+        deal_id=payload.deal_id,
+        new_stage=payload.new_stage,
+        notes=payload.notes,
+        proposed_price=payload.proposed_price
+    )
+
+@app.post("/api/v1/notifications/send-email-alert")
+async def send_manual_email_alert(payload: EmailAlertRequest):
+    success = await LeadAlertDispatcher.dispatch_email_alert(payload.lead_data, [payload.recipient_email])
+    return {
+        "status": "success" if success else "failed",
+        "recipient": payload.recipient_email,
+        "project_title": payload.lead_data.get("project_title")
+    }
 
 @app.post("/api/v1/addons/upload-caiet")
 async def upload_and_analyze_caiet(
@@ -174,7 +219,7 @@ async def upload_and_analyze_caiet(
     file_bytes = await file.read()
     extracted_text = CaietDeSarciniAnalyzer.extract_text_from_file(file_bytes, file.filename)
     if not extracted_text:
-        raise HTTPException(status_code=400, detail="Nu s-a putut extrage text din fisierul incarcat.")
+        raise HTTPException(status_code=400, detail="Nu s-a putut extrage text din fișierul încărcat.")
     return CaietDeSarciniAnalyzer.analyze_specification_text(extracted_text, project_title)
 
 @app.get("/api/v1/tenants/{tenant_id}/feed")
@@ -248,7 +293,7 @@ async def copilot_chat(payload: CopilotQueryRequest):
 async def get_tenant_products(tenant_id: str):
     org = TENANT_ORGANIZATIONS.get(tenant_id)
     if not org:
-        raise HTTPException(status_code=404, detail="Organizatie inexistenta")
+        raise HTTPException(status_code=404, detail="Organizație inexistentă")
     return {"tenant_id": tenant_id, "company_name": org["name"], "products": org["products"]}
 
 @app.post("/api/v1/addons/analyze-caiet")
@@ -283,8 +328,8 @@ async def export_tenant_csv(tenant_id: str):
     output = io.StringIO()
     writer = csv.writer(output)
     writer.writerow([
-        "ID Sursa", "Tip Registru", "Categorie", "Judet", "Beneficiar", "Titlu Proiect", 
-        "Valoare RON", "Sursa Finantare", "Lansare SEAP Est.", "Scor", "URL Document"
+        "ID Sursa", "Tip Registru", "Categorie", "Subcategorie", "Judet", "Beneficiar", "Titlu Proiect", 
+        "Valoare RON", "Data Publicare", "Termen Reactie", "Sursa Finantare", "Scor", "URL Document"
     ])
 
     for l in leads:
@@ -292,12 +337,14 @@ async def export_tenant_csv(tenant_id: str):
             l.get("source_id", ""),
             l.get("source_type", "SICAP"),
             l.get("category", ""),
+            l.get("sub_category", ""),
             l.get("county", ""),
             l.get("entity_name", ""),
             l.get("project_title", ""),
             l.get("financial_value_ron", 0),
+            l.get("published_date", ""),
+            l.get("action_deadline", ""),
             l.get("funding_source", "Fonduri Publice"),
-            l.get("estimated_timeline", {}).get("estimated_tender_launch", "T4 2026"),
             l.get("opportunity_score", 0),
             l.get("source_url", "")
         ])

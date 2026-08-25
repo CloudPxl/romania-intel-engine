@@ -1,9 +1,6 @@
-import logging
 from typing import List
 from scrapers.base_scraper import BaseScraper
 from scrapers.models import RawInstitutionalSignal
-
-logger = logging.getLogger("HealthMatrix")
 
 class SicapHealthScraper(BaseScraper):
     def __init__(self): super().__init__("SicapHealth", 0.2)
@@ -22,7 +19,7 @@ class SicapHealthScraper(BaseScraper):
                 published_date="2026-08-23",
                 action_deadline="2026-09-25",
                 raw_description="Culegere opinii piata privind specificatiile clinice pentru acceleratoare cu ghidaj imagistic IGRT si planificare automata.",
-                source_url="https://e-licitatie.ro/pub/notices/mc-notices/view/1002",
+                source_url="https://e-licitatie.ro/pub/notices/mc-notices/list/2/1",
                 metadata={"cpv_code": "33151000-3"}
             )
         ]
@@ -44,7 +41,7 @@ class MsRegionalHospitalScraper(BaseScraper):
                 published_date="2026-08-24",
                 action_deadline="2026-10-05",
                 raw_description="Definire specificatii pentru blocul operator robotic integrat si subsistemul automatizat de distributie pneumatica.",
-                source_url="https://andis.gov.ro/proiecte-sru",
+                source_url="https://www.ms.ro",
                 metadata={"hospital": "SRU Iasi"}
             )
         ]
@@ -66,7 +63,7 @@ class PnrrHealthC7Scraper(BaseScraper):
                 published_date="2026-08-22",
                 action_deadline="2026-10-15",
                 raw_description="Ghidul solicitantului pentru interconectarea retelelor de radiologie si imagistica medicala intre 45 de spitale de urgenta.",
-                source_url="https://ms.ro/pnrr-digitalizare-spitale",
+                source_url="https://mfe.gov.ro/category/anunturi-pnrr/",
                 metadata={"pillar": "Digital Health"}
             )
         ]
@@ -88,7 +85,7 @@ class CountyEmergencyHospitalScraper(BaseScraper):
                 published_date="2026-08-24",
                 action_deadline="2026-09-20",
                 raw_description="Definire parametri tehnici pentru achizitie RMN de urgenta cu secvente rapide neurologice si aparat CT cardiologic.",
-                source_url="https://e-licitatie.ro/pub/notices/mc-notices/view/1004",
+                source_url="https://e-licitatie.ro/pub/notices/mc-notices/list/2/1",
                 metadata={"cpv_code": "33115000-9"}
             )
         ]
@@ -110,7 +107,7 @@ class CniHealthScraper(BaseScraper):
                 published_date="2026-08-24",
                 action_deadline="2026-11-10",
                 raw_description="Aprobare indicatori tehnico-economici pentru cladire spitaliceasca P+5E cu bloc operator integrat si heliport.",
-                source_url="https://www.cni.ro/proiecte-aprobate-2026",
+                source_url="https://www.cni.ro/proiecte",
                 metadata={"program": "Infrastructura Sanitara"}
             )
         ]

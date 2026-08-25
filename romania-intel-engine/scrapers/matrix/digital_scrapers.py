@@ -1,9 +1,6 @@
-import logging
 from typing import List
 from scrapers.base_scraper import BaseScraper
 from scrapers.models import RawInstitutionalSignal
-
-logger = logging.getLogger("DigitalMatrix")
 
 class SicapDigitalScraper(BaseScraper):
     def __init__(self): super().__init__("SicapDigital", 0.2)
@@ -21,8 +18,8 @@ class SicapDigitalScraper(BaseScraper):
                 estimated_value_ron=14500000.0,
                 published_date="2026-08-20",
                 action_deadline="2026-09-15",
-                raw_description="Analiza solutii prioritizare tramvaie si troleibuze in nodurile aglomerate, integrare cu aplicatia mobila calatori.",
-                source_url="https://e-licitatie.ro/pub/notices/mc-notices/view/1003",
+                raw_description="Analiza solutii prioritizare tramvaie si troleibuze in nodurile aglomerate, integrare cu aplicatia mobila de informare calatori.",
+                source_url="https://e-licitatie.ro/pub/notices/mc-notices/list/2/1",
                 metadata={"cpv_code": "48732000-8"}
             )
         ]
@@ -44,7 +41,7 @@ class AdrRegionalDigiScraper(BaseScraper):
                 published_date="2026-08-24",
                 action_deadline="2026-10-20",
                 raw_description="Ghid consultativ pentru granturi nerambursabile intre 250.000 si 1.500.000 EUR pentru integrare ERP, senzori IoT industriali si cloud.",
-                source_url="https://regionordvest.ro/apeluri-digitalizare-2026",
+                source_url="https://regionordvest.ro",
                 metadata={"grant_program": "PRNV 2026"}
             )
         ]
@@ -66,7 +63,7 @@ class McidGovCloudScraper(BaseScraper):
                 published_date="2026-08-23",
                 action_deadline="2026-10-30",
                 raw_description="Consultare arhitectura microservicii securizata pentru schimbul automatizat de date intre ANAF, ONRC, MAI si administratiile locale.",
-                source_url="https://mcid.gov.ro/consultari-publice-cloud",
+                source_url="https://www.research.gov.ro/interes-public/achizitii-publice/",
                 metadata={"legal_basis": "Legea Interoperabilitatii"}
             )
         ]
@@ -88,7 +85,7 @@ class TechParksInnovationScraper(BaseScraper):
                 published_date="2026-08-22",
                 action_deadline="2026-10-20",
                 raw_description="Aprobare parteneriat judetean pentru extinderea infrastructurii de laboratoare de testare industriala si eficienta robotica.",
-                source_url="https://oradea.ro/hotarari-consiliu-local",
+                source_url="https://oradea.ro/consiliul-local/hotarari-ale-consiliului-local/",
                 metadata={"resolution": "HCL 492/2026"}
             )
         ]
@@ -110,7 +107,7 @@ class SmartTransportUrbanScraper(BaseScraper):
                 published_date="2026-08-24",
                 action_deadline="2026-09-25",
                 raw_description="Consultare specificatii validatoare bancare contactless la fiecare usa si dispecerat integrat de monitorizare flota GPS.",
-                source_url="https://sctpiasi.ro/achizitii",
+                source_url="https://www.primaria-iasi.ro",
                 metadata={"cpv_code": "30144200-2"}
             )
         ]

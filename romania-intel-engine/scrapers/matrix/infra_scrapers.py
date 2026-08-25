@@ -1,9 +1,6 @@
-import logging
 from typing import List
 from scrapers.base_scraper import BaseScraper
 from scrapers.models import RawInstitutionalSignal
-
-logger = logging.getLogger("InfraMatrix")
 
 class SicapInfraScraper(BaseScraper):
     def __init__(self): super().__init__("SicapInfra", 0.2)
@@ -22,7 +19,7 @@ class SicapInfraScraper(BaseScraper):
                 published_date="2026-08-22",
                 action_deadline="2026-09-18",
                 raw_description="Consultare preliminara pentru stabilirea cerintelor tehnice de extindere a subsistemului de semnalizare adaptiva si detectie AID.",
-                source_url="https://e-licitatie.ro/pub/notices/mc-notices/view/1001",
+                source_url="https://e-licitatie.ro/pub/notices/mc-notices/list/2/1",
                 metadata={"cpv_code": "34996000-5"}
             )
         ]
@@ -38,13 +35,13 @@ class CniInfraScraper(BaseScraper):
                 sub_category="Complexe Multifunctionale nZEB",
                 county="Iasi",
                 locality="Iasi",
-                entity_name="Compania Nationala de Investitii (CNI) / Primaria Iasi",
+                entity_name="Compania Nationala de Initii (CNI) / Primaria Iasi",
                 project_title="CNI: Proiectare si executie Sala Polivalenta Regina Maria (10.000 locuri)",
                 estimated_value_ron=240000000.0,
                 published_date="2026-08-20",
                 action_deadline="2026-10-30",
                 raw_description="Avizare indicatori tehnico-economici in comisia interministeriala pentru complex sportiv cu fatada fotovoltaica integrata.",
-                source_url="https://www.cni.ro/proiecte-aprobate-2026",
+                source_url="https://www.cni.ro/proiecte",
                 metadata={"program": "Sali Polivalente"}
             )
         ]
@@ -66,7 +63,7 @@ class CnairCfrScraper(BaseScraper):
                 published_date="2026-08-24",
                 action_deadline="2026-10-15",
                 raw_description="Definire criterii de calificare tehnica pentru viaducte speciale, tuneluri cut&cover si structuri de consolidare versanti.",
-                source_url="https://www.cnadnr.ro/ro/proiecte/consultari-piata",
+                source_url="https://www.cnadnr.ro/ro/transparenta/programul-anual-al-achizitiilor-publice",
                 metadata={"corridor": "TEN-T Core A8"}
             )
         ]
@@ -88,7 +85,7 @@ class UrbanismAcScraper(BaseScraper):
                 published_date="2026-08-19",
                 action_deadline="2026-10-30",
                 raw_description="Emitere autorizatie de construire pentru infrastructura subterana, deviere utilitati si puturi de lansare TBM.",
-                source_url="https://florestirn.ro/urbanism/autorizatii-construire-2026",
+                source_url="https://primariaclujnapoca.ro/achizitii-publice/",
                 metadata={"permit_no": "AC 1142/2026"}
             )
         ]
@@ -110,7 +107,7 @@ class CountyHclScraper(BaseScraper):
                 published_date="2026-08-21",
                 action_deadline="2026-11-15",
                 raw_description="Aprobare studiu de fezabilitate si deviz general pentru fluidizarea traficului in intersectia Podu Ros si conectare axa Nicolina.",
-                source_url="https://primaria-iasi.ro/hotarari-consiliu-2026",
+                source_url="https://www.primaria-iasi.ro",
                 metadata={"resolution": "HCL 388/2026"}
             )
         ]
