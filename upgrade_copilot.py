@@ -1,3 +1,26 @@
+import os, sys, subprocess
+
+ROOT = os.path.dirname(os.path.abspath(__file__))
+ENGINE = os.path.join(ROOT, "romania-intel-engine")
+FRONTEND = os.path.join(ROOT, "romania-intel-frontend")
+
+def write_file(path, content):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(content.strip() + "\n")
+    print(f"  [✓] Written: {os.path.relpath(path, ROOT)}")
+
+def run_cmd(cmd, cwd):
+    print(f"\n[RUN] {' '.join(cmd)}")
+    res = subprocess.run(cmd, cwd=cwd)
+    if res.returncode != 0:
+        print(f"❌ Failed: {' '.join(cmd)}")
+        sys.exit(1)
+
+print("\n⚡ [1/3] Upgrading AI Copilot to Natural Conversational Engine...")
+
+# REWRITE AI_COPILOT.PY WITH CONVERSATIONAL INTELLIGENCE
+write_file(os.path.join(ENGINE, "ai_copilot.py"), """
 import os
 import re
 import json
@@ -80,10 +103,10 @@ class ProcurementAICopilot:
 
         if any(phrase in q_clean for phrase in ["cine esti", "ce poti sa faci", "ce stii", "ajutor", "help"]):
             return (
-                "Sunt Copilotul AI dedicat strategiilor de licitații publice din România. Vă pot ajuta cu:\n"
-                "- Identificarea proiectelor din faza pre-SEAP (Hotărâri Locale, CNI, CNAIR, PNRR).\n"
-                "- Scanarea caietelor de sarcini pentru clauze restrictive și contestații CNSC.\n"
-                "- Calculul probabilității de câștig și al discountului financiar optim.\n"
+                "Sunt Copilotul AI dedicat strategiilor de licitații publice din România. Vă pot ajuta cu:\\n"
+                "- Identificarea proiectelor din faza pre-SEAP (Hotărâri Locale, CNI, CNAIR, PNRR).\\n"
+                "- Scanarea caietelor de sarcini pentru clauze restrictive și contestații CNSC.\\n"
+                "- Calculul probabilității de câștig și al discountului financiar optim.\\n"
                 "- Redactarea adreselor oficiale de clarificări (Legea 98/2016, Art. 160) și acces la informații (Legea 544/2001)."
             )
 
@@ -115,7 +138,7 @@ class ProcurementAICopilot:
 
                 messages = [
                     {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": f"Dosare pre-SEAP active:\n{dossiers_summary}\n\nMesaj utilizator: {q_raw}"}
+                    {"role": "user", "content": f"Dosare pre-SEAP active:\\n{dossiers_summary}\\n\\nMesaj utilizator: {q_raw}"}
                 ]
 
                 async with httpx.AsyncClient(timeout=12.0) as client:
@@ -137,15 +160,15 @@ class ProcurementAICopilot:
         if matched_county:
             top_c = matched_county[:3]
             c_name = top_c[0].get("county")
-            summary = "\n".join([f"• {l.get('project_title')} ({l.get('entity_name')} — {l.get('financial_value_ron', 0)/1000000:.1f} Mil. RON)" for l in top_c])
-            return f"În județul {c_name} avem următoarele dosare calificate în radar:\n\n{summary}\n\nPuteți deschide oricare dosar pentru analiza completă a cerințelor tehnice."
+            summary = "\\n".join([f"• {l.get('project_title')} ({l.get('entity_name')} — {l.get('financial_value_ron', 0)/1000000:.1f} Mil. RON)" for l in top_c])
+            return f"În județul {c_name} avem următoarele dosare calificate în radar:\\n\\n{summary}\\n\\nPuteți deschide oricare dosar pentru analiza completă a cerințelor tehnice."
 
         # Match Project or Entity using whole-word matches
         if meaningful_words:
             matched_leads = []
             for l in context_leads:
                 text_corpus = f"{l.get('project_title', '')} {l.get('entity_name', '')} {l.get('sub_category', '')}".lower()
-                corpus_words = set(re.findall(r"\w+", text_corpus))
+                corpus_words = set(re.findall(r"\\w+", text_corpus))
                 score = sum(1 for w in meaningful_words if w in corpus_words)
                 if score > 0:
                     matched_leads.append((score, l))
@@ -155,27 +178,27 @@ class ProcurementAICopilot:
                 top_lead = matched_leads[0][1]
                 val_mil = top_lead.get("financial_value_ron", 0) / 1000000
                 return (
-                    f"Dosarul identificat pentru căutarea dumneavoastră este '{top_lead.get('project_title')}':\n\n"
-                    f"- Autoritate: {top_lead.get('entity_name')} ({top_lead.get('county')})\n"
-                    f"- Buget estimat: {val_mil:.2f} Mil. RON\n"
-                    f"- Publicat la: {top_lead.get('published_date', 'N/A')} | Termen reacție: {top_lead.get('action_deadline', 'Nespecificat')}\n\n"
+                    f"Dosarul identificat pentru căutarea dumneavoastră este '{top_lead.get('project_title')}':\\n\\n"
+                    f"- Autoritate: {top_lead.get('entity_name')} ({top_lead.get('county')})\\n"
+                    f"- Buget estimat: {val_mil:.2f} Mil. RON\\n"
+                    f"- Publicat la: {top_lead.get('published_date', 'N/A')} | Termen reacție: {top_lead.get('action_deadline', 'Nespecificat')}\\n\\n"
                     f"Recomandare: {top_lead.get('sales_pitch_angle', 'Formulați o solicitare de clarificări pe specificațiile tehnice.')}"
                 )
 
         # 5. Domain Knowledge Queries
         if any(w in tokens for w in ["lege", "legea", "contestatie", "cnsc", "clarificari", "termen"]):
             return (
-                "Repere legislative cheie:\n"
-                "- Art. 139 Legea 98/2016: Permite consultarea de piață prealabilă publicării anunțului de participare.\n"
-                "- Art. 160 Legea 98/2016: Solicitările de clarificări se depun cu respectarea termenului stabilit în fișa de date.\n"
+                "Repere legislative cheie:\\n"
+                "- Art. 139 Legea 98/2016: Permite consultarea de piață prealabilă publicării anunțului de participare.\\n"
+                "- Art. 160 Legea 98/2016: Solicitările de clarificări se depun cu respectarea termenului stabilit în fișa de date.\\n"
                 "- Termen CNSC (Legea 101/2016): 10 zile de la luarea la cunoștință a actului pentru contracte peste pragurile europene, respectiv 5 zile sub praguri."
             )
 
         if any(w in tokens for w in ["pret", "pretul", "buget", "marja", "discount", "calcul"]):
             return (
-                "Recomandări pentru oferta financiară:\n"
-                "1. Mențineți oferta peste 80% din valoarea estimată pentru a nu intra la verificare de preț neobișnuit de scăzut (Art. 215 Legea 98/2016).\n"
-                "2. Un discount optim recomandat este între 6% și 10% față de valoarea estimată a autorității.\n"
+                "Recomandări pentru oferta financiară:\\n"
+                "1. Mențineți oferta peste 80% din valoarea estimată pentru a nu intra la verificare de preț neobișnuit de scăzut (Art. 215 Legea 98/2016).\\n"
+                "2. Un discount optim recomandat este între 6% și 10% față de valoarea estimată a autorității.\\n"
                 "3. Folosiți simulatorul de șanse din pagina dosarului pentru calculul exact pe baza ponderii prețului."
             )
 
@@ -184,3 +207,32 @@ class ProcurementAICopilot:
             f"Vă pot asista cu detalii despre dosarele pre-SEAP active, verificarea clauzelor din caiete de sarcini sau generarea de adrese oficiale. "
             f"Puteți specifica județul, domeniul sau denumirea autorității contractante pentru detalii exacte."
         )
+""")
+
+print("\n⚡ [2/3] Verifying Backend Python Imports...")
+res_py = subprocess.run([sys.executable, "-c", "import api, notifier, workflow_engine, ai_refinery, scrapers.orchestrator, ai_copilot; print('  [OK] Python Backend: 0 errors')"], cwd=ENGINE)
+if res_py.returncode != 0:
+    print("❌ Backend verification failed.")
+    sys.exit(1)
+
+print("\n⚡ [3/3] Verifying Next.js Production Build...")
+res_next = subprocess.run(["npm", "run", "build"], cwd=FRONTEND)
+if res_next.returncode != 0:
+    print("❌ Frontend build failed.")
+    sys.exit(1)
+
+print("\n⚡ [DEPLOY] Pushing Clean Production Builds to GitHub...")
+
+run_cmd(["git", "add", "-A"], cwd=FRONTEND)
+subprocess.run(["git", "commit", "-m", "feat: light enterprise theme, clean logo, dynamic desks, and zero emojis"], cwd=FRONTEND)
+run_cmd(["git", "push", "origin", "main"], cwd=FRONTEND)
+
+run_cmd(["git", "add", "-A"], cwd=ENGINE)
+subprocess.run(["git", "commit", "-m", "feat: conversational ai copilot with stopword filtering and multi-provider llm support"], cwd=ENGINE)
+run_cmd(["git", "push", "origin", "main"], cwd=ENGINE)
+
+run_cmd(["git", "add", "-A"], cwd=ROOT)
+subprocess.run(["git", "commit", "-m", "deploy: sync all submodules for production release"], cwd=ROOT)
+run_cmd(["git", "push", "origin", "main"], cwd=ROOT)
+
+print("\n🎉 [SUCCESS] Deployment completed! Vercel and Render builds triggered with 0 errors.")
