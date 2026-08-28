@@ -17,10 +17,43 @@ SMTP_FROM = os.getenv("SMTP_FROM", "alerts@ro-intel.xyz")
 NOTIFICATION_EMAIL_TO = os.getenv("NOTIFICATION_EMAIL_TO", "director@infraconstruct.ro,office@ro-intel.xyz")
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
-SLACK_WEBHOOK_URL = os.getenv("SLACK_WEBHOOK_URL", "")
+TELEGRAM_ADMIN_CHAT_ID = os.getenv("TELEGRAM_ADMIN_CHAT_ID", "")
 
 class LeadAlertDispatcher:
+    @staticmethod
+    async def dispatch_telegram_message(chat_id: str, text: str) -> bool:
+        """Low-level Telegram send, used both for admin/system alerts (circuit
+        breaker trips, staleness) and per-tenant lead alerts. Unlike the SMTP
+        path below, an unconfigured bot token is reported as a real failure
+        rather than a simulated success."""
+        if not TELEGRAM_BOT_TOKEN or not chat_id:
+            logger.warning("[Telegram] TELEGRAM_BOT_TOKEN or chat_id not set — alert not sent.")
+            return False
+        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                resp = await client.post(url, json={"chat_id": chat_id, "text": text, "parse_mode": "HTML"})
+                resp.raise_for_status()
+            return True
+        except Exception as e:
+            logger.error(f"❌ Failed to send Telegram alert: {e}")
+            return False
+
+    @classmethod
+    async def dispatch_admin_alert(cls, text: str) -> bool:
+        """System/operator-facing alerts (circuit breaker trips, staleness
+        watchdog) — separate from tenant-facing lead alerts below."""
+        if TELEGRAM_ADMIN_CHAT_ID:
+            sent = await cls.dispatch_telegram_message(TELEGRAM_ADMIN_CHAT_ID, text)
+            if sent:
+                return True
+        recipients = [e.strip() for e in NOTIFICATION_EMAIL_TO.split(",") if e.strip()]
+        if not recipients:
+            return False
+        return await asyncio.to_thread(
+            cls._send_email_sync, recipients, "[RO-INTEL] Alertă Sistem", f"<pre>{text}</pre>", text
+        )
+
     @staticmethod
     def _send_email_sync(to_emails: List[str], subject: str, html_body: str, text_body: str) -> bool:
         if not SMTP_HOST or not SMTP_USER or not SMTP_PASSWORD:
@@ -96,5 +129,43 @@ body {{ font-family: -apple-system, sans-serif; background-color: #060b13; color
 
     @classmethod
     async def dispatch_high_priority_alert(cls, lead: Dict[str, Any], recipient_emails: Optional[List[str]] = None):
+        """Legacy, non-tenant-aware path — kept for the old 6h batch job
+        (api.py:background_scraping_job / daemon.py) while it still runs
+        alongside the new per-tenant streaming pipeline. New code should use
+        dispatch_lead_alert_to_tenant instead."""
         if lead.get("opportunity_score", 0) >= 9.0:
             await cls.dispatch_email_alert(lead, recipient_emails)
+
+    @classmethod
+    async def dispatch_lead_alert_to_tenant(cls, lead: Dict[str, Any], tenant_id: str, match_info: Dict[str, Any]) -> Dict[str, bool]:
+        """Tenant-aware, per-channel-idempotent alert dispatch for the
+        streaming pipeline (orchestrator.run_tick). Fires Telegram (instant)
+        and email (rich HTML dossier) independently — one failing doesn't
+        block the other — and only records a channel as dispatched once it
+        actually succeeds, gated by min_alert_score per tenant rather than
+        the old global 9.0/9.2 hardcoded thresholds."""
+        import db
+        from matching_engine import TENANT_ORGANIZATIONS
+
+        tenant = TENANT_ORGANIZATIONS.get(tenant_id, {})
+        min_score = tenant.get("min_alert_score", 9.0)
+        if match_info.get("tenant_opportunity_score", 0) < min_score:
+            return {"telegram": False, "email": False}
+
+        source_id = lead.get("source_id", "")
+        results = {"telegram": False, "email": False}
+
+        chat_id = tenant.get("telegram_chat_id")
+        if chat_id and not await db.has_alert_been_dispatched(tenant_id, source_id, "telegram"):
+            text = f"🚨 <b>{lead.get('project_title', '')}</b>\n{lead.get('entity_name', '')} ({lead.get('county', '')})\nScor: {match_info.get('tenant_opportunity_score')}/10\n{lead.get('source_url', '')}"
+            if await cls.dispatch_telegram_message(chat_id, text):
+                await db.record_alert_dispatch(tenant_id, source_id, "telegram")
+                results["telegram"] = True
+
+        emails = tenant.get("alert_emails") or []
+        if emails and not await db.has_alert_been_dispatched(tenant_id, source_id, "email"):
+            if await cls.dispatch_email_alert(lead, emails):
+                await db.record_alert_dispatch(tenant_id, source_id, "email")
+                results["email"] = True
+
+        return results

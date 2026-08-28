@@ -1,0 +1,26 @@
+name: Scraper Heartbeat
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch: {}
+
+jobs:
+  tick:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Trigger ingestion tick
+        run: |
+          curl -sf -X POST "${{ secrets.RENDER_APP_URL }}/api/v1/system/tick" \
+            -H "X-Tick-Secret: ${{ secrets.TICK_SECRET }}" \
+            --max-time 280
+
+      - name: Verify freshness
+        run: |
+          resp=$(curl -sf "${{ secrets.RENDER_APP_URL }}/api/v1/system/status")
+          echo "$resp"
+          is_stale=$(echo "$resp" | python3 -c "import json,sys; print(json.load(sys.stdin)['is_stale'])")
+          if [ "$is_stale" != "False" ]; then
+            echo "::error::Ingestion is stale — /api/v1/system/status reports is_stale=true"
+            exit 1
+          fi

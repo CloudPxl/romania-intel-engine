@@ -1,0 +1,7 @@
+# Dev-only tooling — not installed on Render (see render.yaml buildCommand).
+# Playwright is used only for the legacy src/ scraper prototype and for
+# manually re-capturing e-licitatie's internal API contract if it ever
+# changes (scrapers/matrix/elicitatie_scraper.py replicates that contract
+# via plain httpx at runtime, so no browser is needed in production).
+-r requirements.txt
+playwright>=1.42.0

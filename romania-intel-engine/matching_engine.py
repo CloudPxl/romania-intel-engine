@@ -7,6 +7,9 @@ TENANT_ORGANIZATIONS = {
     "t1_infra_transilvania": {
         "name": "SC Infra Construct Transilvania SRL",
         "primary_domain": "infrastructura",
+        "alert_emails": ["director@infraconstruct.ro"],
+        "telegram_chat_id": None,
+        "min_alert_score": 9.0,
         "products": [
             {
                 "product_id": "prod_heavy_infra",
@@ -29,6 +32,9 @@ TENANT_ORGANIZATIONS = {
     "t2_medtech_bucuresti": {
         "name": "SC MedTech Pharma SRL",
         "primary_domain": "sanatate",
+        "alert_emails": ["office@ro-intel.xyz"],
+        "telegram_chat_id": None,
+        "min_alert_score": 9.0,
         "products": [
             {
                 "product_id": "prod_radiology_advanced",
@@ -43,6 +49,9 @@ TENANT_ORGANIZATIONS = {
     "t3_vest_consulting_grants": {
         "name": "SC Vest Project Consulting",
         "primary_domain": "energie",
+        "alert_emails": ["office@ro-intel.xyz"],
+        "telegram_chat_id": None,
+        "min_alert_score": 9.0,
         "products": [
             {
                 "product_id": "prod_green_energy",

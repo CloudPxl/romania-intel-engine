@@ -4,13 +4,15 @@ import io
 import asyncio
 import logging
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, HTTPException, Depends, Request, Response, UploadFile, File, Form
+from datetime import datetime, timezone
+from fastapi import FastAPI, HTTPException, Depends, Request, Response, UploadFile, File, Form, Header
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, EmailStr
 from typing import List, Optional
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
+import db
 from matching_engine import TenantMatchingEngine, TENANT_ORGANIZATIONS
 from workflow_engine import ConcurrentWorkflowEngine
 from billing import StripeBillingEngine
@@ -30,6 +32,10 @@ logger = logging.getLogger("RO-INTEL-API")
 
 scheduler = AsyncIOScheduler()
 copilot_engine = ProcurementAICopilot()
+orchestrator = OpportunityOrchestrator()
+
+TICK_SECRET = os.getenv("TICK_SECRET", "")
+STALENESS_THRESHOLD_MINUTES = 20
 
 async def background_scraping_job():
     logger.info("[24/7 DAEMON] Ingesting and qualifying pre-SEAP signals...")
@@ -121,6 +127,27 @@ def root_index():
 @app.get("/health")
 def health_check():
     return {"status": "healthy", "cache": "online"}
+
+@app.post("/api/v1/system/tick")
+async def system_tick(x_tick_secret: Optional[str] = Header(None)):
+    """Driven by the free GitHub Actions heartbeat (and any external pinger)
+    instead of relying on the Render dyno's own uptime — see
+    .github/workflows/heartbeat.yml. Runs only scrapers whose own polling
+    interval has elapsed (db.is_source_due) and streams matches/alerts per
+    signal (scrapers/orchestrator.py:run_tick)."""
+    if not TICK_SECRET or x_tick_secret != TICK_SECRET:
+        raise HTTPException(status_code=401, detail="unauthorized")
+    return await asyncio.wait_for(orchestrator.run_tick(), timeout=240)
+
+@app.get("/api/v1/system/status")
+async def system_status():
+    last = await db.get_last_successful_tick()
+    minutes_since = (datetime.now(timezone.utc) - last).total_seconds() / 60 if last else None
+    return {
+        "last_tick_completed_at": last.isoformat() if last else None,
+        "minutes_since_last_tick": minutes_since,
+        "is_stale": minutes_since is None or minutes_since > STALENESS_THRESHOLD_MINUTES,
+    }
 
 @app.get("/api/v1/newsletter/feed")
 def get_newsletter_feed():

@@ -66,5 +66,8 @@ class IntelligenceRefineryEngine:
             },
             "opportunity_score": final_score,
             "source_url": signal.source_url,
+            "caen_codes": signal.caen_codes,
+            "cpv_code": signal.cpv_code,
+            "document_url": signal.document_url,
             "metadata": signal.metadata
         }
