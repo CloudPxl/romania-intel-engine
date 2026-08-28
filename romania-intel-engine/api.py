@@ -15,17 +15,15 @@ from matching_engine import TenantMatchingEngine, TENANT_ORGANIZATIONS
 from workflow_engine import ConcurrentWorkflowEngine
 from billing import StripeBillingEngine
 from scrapers.orchestrator import OpportunityOrchestrator
-from cache_engine import global_cache
+from cache_engine import global_cache, newsletter_store
 from freemium_shield import FreemiumGatekeeper
 from notifier import LeadAlertDispatcher
 
 from addons.caiet_analyzer import CaietDeSarciniAnalyzer
 from addons.win_probability import WinProbabilityEngine
-from addons.foia_generator import LegalClarificationGenerator
-from addons.business_eligibility import BusinessEligibilityEngine
 from addons.competitor_tracker import CompetitorTrackerEngine
-from addons.dossier_generator import TechnicalDossierGenerator
 from ai_copilot import ProcurementAICopilot
+from routers import eligibility, drafting, analysis
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 logger = logging.getLogger("RO-INTEL-API")
@@ -39,6 +37,7 @@ async def background_scraping_job():
         orchestrator = OpportunityOrchestrator()
         result = await orchestrator.run_pipeline()
         leads = result.get("leads", [])
+        newsletter_store.save(leads)
         for lead in leads:
             if lead.get("opportunity_score", 0) >= 9.2:
                 await LeadAlertDispatcher.dispatch_high_priority_alert(lead)
@@ -51,6 +50,7 @@ async def background_scraping_job():
 async def lifespan(app: FastAPI):
     scheduler.add_job(background_scraping_job, "interval", hours=6)
     scheduler.start()
+    asyncio.create_task(background_scraping_job())
     logger.info("[SYSTEM] RO-INTEL Enterprise API active.")
     yield
     scheduler.shutdown()
@@ -66,6 +66,10 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+app.include_router(eligibility.router)
+app.include_router(drafting.router)
+app.include_router(analysis.router)
+
 class AuthSyncRequest(BaseModel):
     email: EmailStr
     full_name: Optional[str] = None
@@ -77,14 +81,6 @@ class ProformaRequest(BaseModel):
     cui_fiscal: str
     billing_email: EmailStr
     billing_address: Optional[str] = "Romania"
-
-class BusinessScanRequest(BaseModel):
-    company_name: str
-    cui_fiscal: str
-    caen_code: str
-    turnover_ron: float
-    employee_count: int
-    county: str
 
 class CopilotQueryRequest(BaseModel):
     query: str
@@ -108,14 +104,6 @@ class CompetitorAnalysisRequest(BaseModel):
     county: str
     budget_ron: float
 
-class TechnicalProposalRequest(BaseModel):
-    project_title: str
-    authority_name: str
-    county: str
-    category: str
-    company_name: str
-    cui: str
-
 class CaietAnalysisRequest(BaseModel):
     project_title: str
     specification_text: str
@@ -126,14 +114,6 @@ class WinProbabilityRequest(BaseModel):
     has_local_partnership: Optional[bool] = False
     lead_time_days: Optional[int] = 30
 
-class ClarificationLetterRequest(BaseModel):
-    authority_name: str
-    project_title: str
-    source_id: str
-    company_name: str
-    cui_fiscal: str
-    clarification_points: str
-
 @app.get("/")
 def root_index():
     return {"engine": "RO-INTEL Enterprise Procurement Engine", "status": "online", "version": "2.4.0"}
@@ -141,6 +121,10 @@ def root_index():
 @app.get("/health")
 def health_check():
     return {"status": "healthy", "cache": "online"}
+
+@app.get("/api/v1/newsletter/feed")
+def get_newsletter_feed():
+    return newsletter_store.load()
 
 @app.post("/api/v1/auth/sync")
 async def sync_user_auth(payload: AuthSyncRequest):
@@ -201,12 +185,6 @@ async def send_manual_email_alert(payload: EmailAlertRequest):
 def analyze_competitor_landscape(payload: CompetitorAnalysisRequest):
     return CompetitorTrackerEngine.analyze_landscape(payload.category, payload.county, payload.budget_ron)
 
-@app.post("/api/v1/addons/generate-technical-proposal")
-def generate_technical_proposal(payload: TechnicalProposalRequest):
-    return TechnicalDossierGenerator.generate_draft(
-        payload.project_title, payload.authority_name, payload.county, payload.category, payload.company_name, payload.cui
-    )
-
 @app.post("/api/v1/addons/upload-caiet")
 async def upload_and_analyze_caiet(file: UploadFile = File(...), project_title: str = Form(...)):
     file_bytes = await file.read()
@@ -250,12 +228,6 @@ async def get_tenant_feed(
     global_cache.set(cache_key, payload, ttl_seconds=60)
     return payload
 
-@app.post("/api/v1/business-eligibility/evaluate")
-def evaluate_company_eligibility(payload: BusinessScanRequest):
-    return BusinessEligibilityEngine.evaluate_company(
-        payload.company_name, payload.cui_fiscal, payload.caen_code, payload.turnover_ron, payload.employee_count, payload.county
-    )
-
 @app.get("/api/v1/analytics/market-report-72h")
 async def get_72h_report(tenant_id: str = "t1_infra_transilvania"):
     feed_data = await get_tenant_feed(tenant_id)
@@ -284,12 +256,6 @@ def analyze_caiet_sarcini(payload: CaietAnalysisRequest):
 def predict_win_rate(payload: WinProbabilityRequest):
     return WinProbabilityEngine.calculate_win_odds(
         payload.estimated_budget_ron, payload.proposed_price_ron, payload.has_local_partnership, payload.lead_time_days
-    )
-
-@app.post("/api/v1/addons/generate-clarification")
-def generate_clarification_letter(payload: ClarificationLetterRequest):
-    return LegalClarificationGenerator.generate_clarification_letter(
-        payload.authority_name, payload.project_title, payload.source_id, payload.company_name, payload.cui_fiscal, payload.clarification_points
     )
 
 @app.get("/api/v1/tenants/{tenant_id}/export/csv")
