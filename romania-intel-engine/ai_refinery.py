@@ -55,8 +55,41 @@ STAGE_PROFILES = {
         "weight": 0.9,
         "action": "Analizați caietul de sarcini și pregătiți oferta.",
     },
+    # The four below are stated explicitly by municipal_scrapers.py's
+    # source-specific classification (PMB's own announcement titles
+    # distinguish these cleanly) rather than inferred from keywords. They
+    # were previously absent from this dict, so a declared stage of e.g.
+    # "awarded" failed the `declared in STAGE_PROFILES` check in
+    # _infer_stage below and silently fell through to weak text-based
+    # guessing — the richer classification was being computed and then
+    # thrown away.
+    "annual_plan": {
+        "label": "Plan anual de achiziții publicat",
+        "weight": 1.3,
+        "action": "Poziționare timpurie: contactați autoritatea înainte de publicarea caietului de sarcini individual.",
+    },
+    "tender_open": {
+        "label": "Anunț de participare / licitație deschisă",
+        "weight": 0.9,
+        "action": "Analizați anunțul și caietul de sarcini; pregătiți oferta înainte de termenul limită.",
+    },
+    "awarded": {
+        "label": "Contract atribuit (rezultat procedură)",
+        # Deliberately below every actionable stage, including "unknown":
+        # this is a closed procedure, not a lead to bid on. It is kept in
+        # the feed (not dropped) because who won what, for how much, is
+        # genuine competitive intelligence for addons/competitor_tracker.py
+        # — but it must never outrank a real open opportunity on score.
+        "weight": -1.0,
+        "action": "Informație competitivă: analizați câștigătorul și valoarea contractului pentru poziționarea pe proceduri similare viitoare.",
+    },
     "unknown": {
         "label": "Stadiu neconfirmat",
+        "weight": 0.6,
+        "action": "Confirmați stadiul procedurii la sursa oficială.",
+    },
+    "notice": {
+        "label": "Anunț instituțional (stadiu nespecificat)",
         "weight": 0.6,
         "action": "Confirmați stadiul procedurii la sursa oficială.",
     },

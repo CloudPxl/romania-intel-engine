@@ -2,6 +2,7 @@ import os
 import json
 import time
 import logging
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional, Dict, List
 
@@ -51,7 +52,14 @@ class NewsletterStore:
         self.path.parent.mkdir(parents=True, exist_ok=True)
 
     def save(self, leads: List[Dict[str, Any]]) -> None:
-        payload = {"updated_at": time.time(), "count": len(leads), "leads": leads}
+        # ISO string, not a raw epoch float — the Postgres-backed path
+        # (api.py:_load_feed) always returns updated_at as an ISO string,
+        # and this file-cache fallback previously leaked a bare Unix
+        # timestamp (e.g. 1788033181.83) straight through to API
+        # responses whenever it served as the fallback, which is an
+        # internal implementation detail no client should have to parse.
+        updated_at = datetime.now(timezone.utc).isoformat()
+        payload = {"updated_at": updated_at, "count": len(leads), "leads": leads}
         tmp_path = self.path.with_suffix(".tmp")
         with open(tmp_path, "w", encoding="utf-8") as f:
             json.dump(payload, f, ensure_ascii=False)
