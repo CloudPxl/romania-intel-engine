@@ -2,9 +2,11 @@ import os
 import csv
 import io
 import asyncio
+import json
 import logging
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
+from decimal import Decimal
 from fastapi import FastAPI, HTTPException, Depends, Request, Response, UploadFile, File, Form, Header
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
@@ -180,6 +182,40 @@ async def system_status():
         "is_stale": minutes_since is None or minutes_since > STALENESS_THRESHOLD_MINUTES,
     }
 
+def _row_to_lead(row: Dict[str, Any]) -> Dict[str, Any]:
+    """Converts a Postgres row into the JSON-serialisable lead shape the API
+    already returns from the file cache.
+
+    Three conversions are mandatory, not cosmetic — without them FastAPI
+    raises while encoding and the endpoint 500s:
+      * NUMERIC (estimated_value_ron, opportunity_score) arrives as
+        decimal.Decimal, which the default JSON encoder cannot serialise.
+      * DATE/TIMESTAMP arrive as date/datetime objects.
+      * JSONB arrives as a raw string, while every consumer expects a dict.
+    """
+    lead: Dict[str, Any] = {}
+    for key, value in dict(row).items():
+        if isinstance(value, Decimal):
+            lead[key] = float(value)
+        elif isinstance(value, (datetime, date)):
+            lead[key] = value.isoformat()
+        else:
+            lead[key] = value
+
+    metadata = lead.get("metadata")
+    if isinstance(metadata, str):
+        try:
+            lead["metadata"] = json.loads(metadata)
+        except (json.JSONDecodeError, TypeError):
+            lead["metadata"] = {}
+
+    # The DB column is estimated_value_ron; the API contract and the
+    # frontend both read financial_value_ron.
+    if lead.get("financial_value_ron") is None:
+        lead["financial_value_ron"] = lead.get("estimated_value_ron") or 0.0
+    return lead
+
+
 async def _load_feed() -> Dict[str, Any]:
     """Reads the durable copy first, falling back to the on-disk cache.
 
@@ -202,18 +238,7 @@ async def _load_feed() -> Dict[str, Any]:
     if not rows:
         return newsletter_store.load()
 
-    leads = []
-    for row in rows:
-        lead = dict(row)
-        # The DB column is estimated_value_ron; the API contract and the
-        # frontend both read financial_value_ron.
-        if lead.get("financial_value_ron") is None:
-            lead["financial_value_ron"] = lead.get("estimated_value_ron") or 0.0
-        for key in ("published_date", "action_deadline", "first_seen_at", "last_seen_at"):
-            value = lead.get(key)
-            if value is not None and not isinstance(value, str):
-                lead[key] = value.isoformat()
-        leads.append(lead)
+    leads = [_row_to_lead(row) for row in rows]
 
     newest = max((r.get("last_seen_at") for r in rows if r.get("last_seen_at")), default=None)
     return {
