@@ -1,10 +1,53 @@
 import io
 import logging
-from typing import Dict, Any
+import re
+from typing import Dict, Any, List
 from pypdf import PdfReader
 import docx
 
 logger = logging.getLogger("CaietAnalyzer")
+
+# ISO/SR EN standard numbers as they actually appear in Romanian caiete de
+# sarcini — "ISO 9001", "SR EN ISO 14001", "ISO/IEC 27001" — captured by
+# family so "ISO 9001:2015" and "ISO 9001" both fold to the same entry.
+_ISO_PATTERN = re.compile(
+    r"(?:SR\s+EN\s+)?ISO(?:/IEC)?\s*(\d{4,5})(?::\d{4})?",
+    re.IGNORECASE,
+)
+
+# Turnover ("cifra de afaceri") clauses: the number and its unit almost
+# always sit within a short window of the trigger phrase, e.g. "cifra de
+# afaceri medie anuala ... de minim 5.000.000 lei" — so the pattern
+# captures the phrase and a following amount+unit rather than requiring
+# an exact fixed template.
+_TURNOVER_PATTERN = re.compile(
+    r"cifr\w*\s+de\s+afaceri[^.\n]{0,120}?"
+    r"([\d.,]{3,})\s*(lei|ron|euro|eur)",
+    re.IGNORECASE,
+)
+
+# Roles that count as "key personnel" when a caiet lists mandatory experts.
+# Matched as whole phrases so "manager" alone (too generic, fires on
+# unrelated text) never counts without its qualifying noun.
+_KEY_PERSONNEL_PATTERNS = [
+    "manager de proiect", "responsabil tehnic cu executia", "responsabil tehnic",
+    "sef de santier", "coordonator ssm", "responsabil ssm",
+    "responsabil cu controlul calitatii", "auditor energetic",
+    "inginer electroenergetician", "inginer de sistem", "arhitect de solutie",
+    "responsabil securitate cibernetica", "responsabil protectia datelor",
+    "expert cheie", "expert tehnic", "diriginte de santier",
+    "responsabil de mediu", "medic coordonator",
+]
+
+# Mandatory-equipment phrasing: "dotare cu", "utilaje precum", "echipamente
+# minime" etc. followed by the actual equipment noun phrase up to the next
+# sentence boundary.
+_EQUIPMENT_TRIGGER_PATTERN = re.compile(
+    r"(?:dotare(?:a)?\s+cu|utilaje?(?:le)?\s+(?:minime?\s+)?(?:necesare|solicitate|precum)?|"
+    r"echipamente?(?:le)?\s+minime?(?:\s+necesare)?)"
+    r"\s*[:\-]?\s*([^.\n]{5,200})",
+    re.IGNORECASE,
+)
 
 # Matching runs through text_utils, which folds diacritics and matches whole
 # words. This matters more here than anywhere else in the codebase: a real
@@ -79,8 +122,49 @@ class CaietDeSarciniAnalyzer:
         return extracted_text.strip()
 
     @staticmethod
+    def extract_qualification_criteria(text: str) -> Dict[str, Any]:
+        """Pulls the structured qualification requirements out of a caiet
+        de sarcini — turnover floor, required ISO/SR EN certifications, key
+        personnel roles, and mandatory equipment — as distinct from the
+        restrictive-clause scan above, which flags *anti-competitive*
+        wording rather than *what a bidder must show* to qualify at all.
+        Both readings matter to a bidder deciding whether to pursue a
+        tender: one says "can I compete", the other says "am I eligible".
+        """
+        from text_utils import matching_terms
+
+        turnover_hits = []
+        for match in _TURNOVER_PATTERN.finditer(text):
+            amount, unit = match.group(1), match.group(2)
+            turnover_hits.append(f"{amount} {unit.upper()}")
+
+        iso_hits = sorted({f"ISO {m.group(1)}" for m in _ISO_PATTERN.finditer(text)})
+
+        personnel_hits = matching_terms(text, _KEY_PERSONNEL_PATTERNS)
+
+        equipment_hits: List[str] = []
+        for match in _EQUIPMENT_TRIGGER_PATTERN.finditer(text):
+            snippet = match.group(1).strip(" :-")
+            if snippet and snippet not in equipment_hits:
+                equipment_hits.append(snippet)
+
+        return {
+            "turnover_requirements": turnover_hits[:5] or ["Nespecificat explicit în textul analizat"],
+            "required_certifications": iso_hits or ["Nicio certificare ISO/SR EN identificată explicit"],
+            "key_personnel_roles": personnel_hits or ["Niciun rol de personal-cheie identificat explicit"],
+            "mandatory_equipment": equipment_hits[:5] or ["Niciun echipament obligatoriu identificat explicit"],
+            "extraction_note": (
+                "Extragere automată bazată pe tipare de text uzuale în caietele de sarcini din România. "
+                "O cerință absentă din această listă poate fi totuși prezentă în document sub o formulare "
+                "neacoperită de tipare — verificați manual secțiunea de capacitate tehnică și economică."
+            ),
+        }
+
+    @staticmethod
     def analyze_specification_text(text: str, project_title: str) -> Dict[str, Any]:
         from text_utils import matching_terms
+
+        qualification_criteria = CaietDeSarciniAnalyzer.extract_qualification_criteria(text)
 
         flagged_risks = []
         overall_risk_score = 1.0
@@ -115,6 +199,7 @@ class CaietDeSarciniAnalyzer:
             "bias_risk_level": risk_level,
             "bias_score": min(10.0, round(overall_risk_score, 1)),
             "extracted_character_count": len(text),
+            "qualification_criteria": qualification_criteria,
             "detected_red_flags": flagged_risks if flagged_risks else [
                 {"pattern": "Niciunul", "severity": "OK",
                  "tactical_advisory": "Nu au fost identificate tipare restrictive dintre cele verificate."}
