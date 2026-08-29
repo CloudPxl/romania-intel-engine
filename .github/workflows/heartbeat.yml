@@ -8,6 +8,14 @@ on:
 jobs:
   tick:
     runs-on: ubuntu-latest
+    env:
+      # Render's edge (Cloudflare under the hood) can challenge requests
+      # that look headless — no browser fingerprint, default/blank
+      # User-Agent. curl's default UA ("curl/8.x") is exactly that
+      # fingerprint, so every automated call here impersonates an actual
+      # browser's UA string to blend in with normal traffic instead of
+      # reading as a bot.
+      BROWSER_UA: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
     steps:
       - name: Trigger ingestion tick
         run: |
@@ -17,6 +25,7 @@ jobs:
           # dyno waking from sleep) costs hours of ingestion. --retry-all-errors
           # also covers connection resets, which plain --retry ignores.
           curl -sfL --post301 --post302 --post303 -X POST "${{ secrets.RENDER_APP_URL }}/api/v1/system/tick" \
+            -A "$BROWSER_UA" \
             -H "X-Tick-Secret: ${{ secrets.TICK_SECRET }}" \
             --retry 5 --retry-delay 15 --retry-all-errors --connect-timeout 30 \
             --max-time 280
@@ -24,6 +33,7 @@ jobs:
       - name: Verify freshness
         run: |
           resp=$(curl -sfL --retry 3 --retry-delay 10 --retry-all-errors \
+            -A "$BROWSER_UA" \
             "${{ secrets.RENDER_APP_URL }}/api/v1/system/status")
           echo "$resp"
           is_stale=$(echo "$resp" | python3 -c "import json,sys; print(json.load(sys.stdin)['is_stale'])")
