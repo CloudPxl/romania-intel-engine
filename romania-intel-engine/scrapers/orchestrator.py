@@ -16,6 +16,9 @@ from scrapers.matrix.health_scrapers import (
 from scrapers.matrix.energy_scrapers import ApmPermitScraper, ProgramEnergieScraper
 from scrapers.matrix.defense_scrapers import BorderPoliceProcurementScraper
 from scrapers.matrix.digital_scrapers import AdrNordVestScraper, OradeaAchizitiiScraper
+from scrapers.matrix.municipal_scrapers import (
+    PmbAchizitiiScraper, TimisoaraHclScraper, ConstantaAchizitiiScraper
+)
 from ai_refinery import IntelligenceRefineryEngine
 from matching_engine import TENANT_ORGANIZATIONS, TenantMatchingEngine
 from notifier import LeadAlertDispatcher
@@ -51,6 +54,12 @@ class OpportunityOrchestrator:
             # general municipal feed and classifies each notice into its
             # real domain rather than assuming this one.
             AdrNordVestScraper(), OradeaAchizitiiScraper(),
+            # Direct coverage for the 3 of Romania's 5 largest economic
+            # hubs that had no dedicated municipal source (Cluj-Napoca and
+            # Iași already did — UrbanismAcScraper and CountyHclScraper
+            # above). Each is a general municipal feed classified per
+            # notice, same as OradeaAchizitiiScraper.
+            PmbAchizitiiScraper(), TimisoaraHclScraper(), ConstantaAchizitiiScraper(),
         ]
         if os.getenv("ENABLE_LIVE_ELICITATIE", "false").lower() == "true":
             # Real, live SICAP/e-licitatie data — added alongside (not yet
