@@ -1,13 +1,12 @@
-import json
-import re
-from datetime import datetime
-from typing import List, Optional
+from typing import List
 
 from bs4 import BeautifulSoup
 
 from scrapers.base_scraper import BaseScraper
 from scrapers.matrix.cni_common import HEALTH_CATEGORIES, CniRegisterScraper
+from scrapers.matrix.wp_json_common import WordPressCategoryScraper
 from scrapers.models import RawInstitutionalSignal
+from text_utils import parse_ro_long_date
 
 # Two former fixtures in this module (SicapHealthScraper,
 # CountyEmergencyHospitalScraper) both pointed at the same generic
@@ -15,30 +14,6 @@ from scrapers.models import RawInstitutionalSignal
 # scrapes live, so they were redundant and have been removed rather than
 # rebuilt. SICAP health consultations still reach the pipeline — they
 # arrive through ElicitatieLiveScraper, which classifies by keyword.
-
-RO_MONTHS = {
-    "ianuarie": 1, "februarie": 2, "martie": 3, "aprilie": 4,
-    "mai": 5, "iunie": 6, "iulie": 7, "august": 8,
-    "septembrie": 9, "octombrie": 10, "noiembrie": 11, "decembrie": 12,
-}
-
-
-def parse_ro_long_date(value: str) -> str:
-    """'27 August 2024' -> '2024-08-27'. Returns '' when the source's date
-    element is missing or in a shape we don't recognise, so the caller
-    stores nothing rather than a guessed date."""
-    match = re.search(r"(\d{1,2})\s+([A-Za-zăâîșşțţĂÂÎȘŞȚŢ]+)\s+(\d{4})", value or "")
-    if not match:
-        return ""
-    day, month_name, year = match.groups()
-    month = RO_MONTHS.get(month_name.strip().lower())
-    if not month:
-        return ""
-    try:
-        return datetime(int(year), month, int(day)).strftime("%Y-%m-%d")
-    except ValueError:
-        return ""
-
 
 class MsAchizitiiScraper(BaseScraper):
     """Ministerul Sanatatii publishes its own procurement announcements at
@@ -123,96 +98,43 @@ class MsAchizitiiScraper(BaseScraper):
         return list(collected.values())
 
 
-class ProgramSanatateScraper(BaseScraper):
-    """MIPE/MFE (mfe.gov.ro) runs WordPress and exposes a live REST API.
+class ProgramSanatateScraper(WordPressCategoryScraper):
+    """MIPE/MFE funding calls filtered to health.
+
     Reverse-engineered live: funding calls land in categories 2800
     (ultimele-apeluri-prima-pagina) and 2492 (invitatii-de-participare).
     The previously-targeted 'anunturi-pnrr' category (2719) turned out to
     be almost entirely payment lists ('Lista platilor PNRR ...'), which are
     settlement records, not opportunities — hence the switch.
 
-    Posts are filtered to health-relevant calls by keyword, which is what
-    keeps this a *health-domain* source: MFE publishes across every
-    operational programme, and the non-health calls belong to other domains.
+    The keyword gate is what keeps this a *health-domain* source: MFE
+    publishes across every operational programme, and its energy calls are
+    claimed by ProgramEnergieScraper, so the two partition one feed rather
+    than both claiming all of it.
 
-    Two source quirks handled here: responses carry a UTF-8 BOM (so
-    httpx/json .json() parsing fails without stripping it), and the call
-    deadline lives in prose inside the post body ('... pana in data de
-    29.10.2026, ora 16.00'), not in any structured field."""
+    The shared base (wp_json_common) handles this host's UTF-8 BOM and the
+    deadlines that exist only as prose inside the post body.
+    """
 
     API_URL = "https://mfe.gov.ro/wp-json/wp/v2/posts"
     CATEGORIES = "2800,2492"
     PER_PAGE = 60
+    TOPIC_KEYWORDS = [
+        "sanatate", "sanitar", "spital", "spitalicesc", "medic", "medical",
+        "medicala", "clinic", "clinica", "farmaceutic", "oncologic",
+        "ambulatoriu", "paliativ", "maternitate", "policlinica", "dispensar",
+        "health",
+    ]
 
-    HEALTH_KEYWORDS = re.compile(
-        r"s[aă]n[aă]t|spital|medic|clinic|farmac|oncolog|ambulator|"
-        r"paliativ|maternit|policlinic|dispensar|health",
-        re.IGNORECASE,
-    )
-    DEADLINE_RE = re.compile(r"p[âa]n[ăa]\s+(?:[îi]n|la)\s+data\s+de\s+(\d{1,2}\.\d{1,2}\.\d{4})", re.IGNORECASE)
-    TAG_RE = re.compile(r"<[^>]+>")
+    SOURCE_PREFIX = "MFE"
+    SOURCE_TYPE = "MIPE/MFE - Apeluri Finanțare Sănătate"
+    DOMAIN_CATEGORY = "sanatate"
+    SUB_CATEGORY = "Apel de finanțare / Ghidul Solicitantului"
+    ENTITY_NAME = "Ministerul Investițiilor și Proiectelor Europene (MIPE)"
+    FALLBACK_URL = "https://mfe.gov.ro/"
 
     def __init__(self):
         super().__init__("ProgramSanatate", rate_limit_delay=1.0, poll_interval_minutes=180)
-
-    @classmethod
-    def _strip_html(cls, value: str) -> str:
-        import html as html_module
-        return " ".join(html_module.unescape(cls.TAG_RE.sub(" ", value or "")).split())
-
-    @staticmethod
-    def _parse_dotted_date(value: str) -> str:
-        for fmt in ("%d.%m.%Y",):
-            try:
-                return datetime.strptime(value.strip(), fmt).strftime("%Y-%m-%d")
-            except ValueError:
-                continue
-        return ""
-
-    async def fetch_market_consultations(self) -> List[RawInstitutionalSignal]:
-        url = f"{self.API_URL}?categories={self.CATEGORIES}&per_page={self.PER_PAGE}"
-        body = await self.fetch_url(url)
-        if not body:
-            return []
-        try:
-            posts = json.loads(body.lstrip("﻿"))
-        except json.JSONDecodeError:
-            self.logger.error(f"[{self.name}] non-JSON response from {url}")
-            return []
-        if not isinstance(posts, list):
-            self.logger.error(f"[{self.name}] unexpected payload shape from {url}")
-            return []
-
-        signals: List[RawInstitutionalSignal] = []
-        for post in posts:
-            title = self._strip_html((post.get("title") or {}).get("rendered", ""))
-            content = self._strip_html((post.get("content") or {}).get("rendered", ""))
-            if not title or not self.HEALTH_KEYWORDS.search(f"{title} {content}"):
-                continue
-
-            deadline_match = self.DEADLINE_RE.search(content)
-            deadline = self._parse_dotted_date(deadline_match.group(1)) if deadline_match else None
-
-            published = (post.get("date") or "")[:10]
-
-            signals.append(RawInstitutionalSignal(
-                source_id=f"MFE-{post.get('id')}",
-                source_type="MIPE/MFE - Apeluri Finantare",
-                category="sanatate",
-                sub_category="Apel de finantare / Ghidul Solicitantului",
-                county="National",
-                locality="National",
-                entity_name="Ministerul Investitiilor si Proiectelor Europene (MIPE)",
-                project_title=title,
-                published_date=published,
-                action_deadline=deadline,
-                # Funding calls announce an envelope in the guide PDF, not
-                # in the post body — left at 0 rather than guessed.
-                raw_description=content[:1500] or title,
-                source_url=post.get("link") or "https://mfe.gov.ro/",
-                metadata={"wp_post_id": post.get("id")},
-            ))
-        return signals
 
 
 class CniHealthScraper(CniRegisterScraper):

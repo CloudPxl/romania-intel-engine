@@ -84,6 +84,37 @@ def matching_terms(text: str, terms: Iterable[str]) -> List[str]:
     return hits
 
 
+RO_MONTHS = {
+    "ianuarie": 1, "februarie": 2, "martie": 3, "aprilie": 4,
+    "mai": 5, "iunie": 6, "iulie": 7, "august": 8,
+    "septembrie": 9, "octombrie": 10, "noiembrie": 11, "decembrie": 12,
+}
+
+
+def parse_ro_long_date(value: str) -> str:
+    """'27 August 2024' or 'Marți, 04 August 2026' -> '2024-08-27'.
+
+    Returns '' when the source's date element is missing or in a shape we
+    don't recognise, so the caller stores nothing rather than a guessed
+    date. Used by every scraper whose publisher renders dates as Romanian
+    prose instead of an ISO attribute.
+    """
+    import re as _re
+    from datetime import datetime as _dt
+
+    match = _re.search(r"(\d{1,2})\s+([A-Za-zăâîșşțţĂÂÎȘŞȚŢ]+)\s+(\d{4})", value or "")
+    if not match:
+        return ""
+    day, month_name, year = match.groups()
+    month = RO_MONTHS.get(fold(month_name).strip())
+    if not month:
+        return ""
+    try:
+        return _dt(int(year), month, int(day)).strftime("%Y-%m-%d")
+    except ValueError:
+        return ""
+
+
 def normalize_county(county: str) -> str:
     """County names arrive as 'Iași', 'Iasi', 'IAsi', and 'Bistrita Nasaud'
     vs 'Bistrița-Năsăud' depending on the publisher."""

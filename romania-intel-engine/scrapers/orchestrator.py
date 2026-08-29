@@ -13,15 +13,9 @@ from scrapers.matrix.infra_scrapers import (
 from scrapers.matrix.health_scrapers import (
     MsAchizitiiScraper, ProgramSanatateScraper, CniHealthScraper
 )
-from scrapers.matrix.energy_scrapers import (
-    PnrrEnergyC6Scraper, ModernizationFundScraper, ApmPermitScraper, MunicipalTermoScraper, SicapEnergyScraper
-)
-from scrapers.matrix.defense_scrapers import (
-    MapnInfraScraper, SicapDefenseScraper, StsSpecialCommsScraper, MaiLogisticsScraper, CriticalInfraPortAirportScraper
-)
-from scrapers.matrix.digital_scrapers import (
-    SicapDigitalScraper, AdrRegionalDigiScraper, McidGovCloudScraper, TechParksInnovationScraper, SmartTransportUrbanScraper
-)
+from scrapers.matrix.energy_scrapers import ApmPermitScraper, ProgramEnergieScraper
+from scrapers.matrix.defense_scrapers import BorderPoliceProcurementScraper
+from scrapers.matrix.digital_scrapers import AdrNordVestScraper, OradeaAchizitiiScraper
 from ai_refinery import IntelligenceRefineryEngine
 from matching_engine import TENANT_ORGANIZATIONS, TenantMatchingEngine
 from notifier import LeadAlertDispatcher
@@ -37,20 +31,26 @@ TICK_DEADLINE_SECONDS = float(os.getenv("TICK_DEADLINE_SECONDS", "200"))
 
 class OpportunityOrchestrator:
     def __init__(self):
-        # 25 Dedicated Scraper Engines (5 per domain x 5 strategic domains)
+        # Every scraper below reads a live source. The matrix is no longer
+        # a fixed 5-per-domain grid: the old shape was only achievable with
+        # fixtures, and several institutions simply do not publish a
+        # machine-readable procurement feed. Domains are covered by the
+        # sources that genuinely exist, plus ElicitatieLiveScraper, which
+        # spans all five via SICAP market consultations.
         self.scrapers = [
-            # 1. Infra (SICAP market consultations for this domain are covered
-            # live by ElicitatieLiveScraper below, not a per-domain fixture)
+            # 1. Infrastructure
             CniInfraScraper(), CnairCfrScraper(), UrbanismAcScraper(), CountyHclScraper(),
-            # 2. Health (SICAP health consultations arrive via
-            # ElicitatieLiveScraper, not a per-domain fixture)
+            # 2. Health
             MsAchizitiiScraper(), ProgramSanatateScraper(), CniHealthScraper(),
-            # 3. Energy
-            PnrrEnergyC6Scraper(), ModernizationFundScraper(), ApmPermitScraper(), MunicipalTermoScraper(), SicapEnergyScraper(),
-            # 4. Defense
-            MapnInfraScraper(), SicapDefenseScraper(), StsSpecialCommsScraper(), MaiLogisticsScraper(), CriticalInfraPortAirportScraper(),
-            # 5. Digital
-            SicapDigitalScraper(), AdrRegionalDigiScraper(), McidGovCloudScraper(), TechParksInnovationScraper(), SmartTransportUrbanScraper()
+            # 3. Energy (ANPM currently unreachable — see energy_scrapers.py)
+            ProgramEnergieScraper(), ApmPermitScraper(),
+            # 4. Defence (thin by nature: most defence procurement is
+            # classified or published only through SICAP)
+            BorderPoliceProcurementScraper(),
+            # 5. Digital / regional funding. OradeaAchizitiiScraper is a
+            # general municipal feed and classifies each notice into its
+            # real domain rather than assuming this one.
+            AdrNordVestScraper(), OradeaAchizitiiScraper(),
         ]
         if os.getenv("ENABLE_LIVE_ELICITATIE", "false").lower() == "true":
             # Real, live SICAP/e-licitatie data — added alongside (not yet

@@ -1,113 +1,83 @@
 from typing import List
+
 from scrapers.base_scraper import BaseScraper
+from scrapers.matrix.wp_json_common import WordPressCategoryScraper
 from scrapers.models import RawInstitutionalSignal
 
-class PnrrEnergyC6Scraper(BaseScraper):
-    def __init__(self): super().__init__("PnrrEnergy", 0.2)
-    async def fetch_market_consultations(self) -> List[RawInstitutionalSignal]:
-        signal = RawInstitutionalSignal(
-            source_id="PNRR-C6-COGEN-11",
-            source_type="MIPE / PNRR C6",
-            category="energie",
-            sub_category="Cogenerare & Eficienta Energetica",
-            county="Cluj",
-            locality="Dej",
-            entity_name="Ministerul Investitiilor si Proiectelor Europene (MIPE)",
-            project_title="Apel MIPE / PNRR C6: Eficienta energetica si cogenerare de inalta eficienta pentru operatori industriali",
-            estimated_value_ron=48000000.0,
-            published_date="2026-08-24",
-            action_deadline="2026-09-30",
-            raw_description="Publicare ghid specific consultativ pentru investitii in capacitati de productie energie electrica si termica.",
-            source_url="https://mfe.gov.ro/category/anunturi-pnrr/",
-            metadata={"grant_intensity": "65%"}
-        )
-        signal.metadata["live_fetch_verified"] = await self.fetch_url(signal.source_url) is not None
-        return [signal]
+# Two former fixtures in this module pointed at the generic e-licitatie.ro
+# market-consultation list that ElicitatieLiveScraper now scrapes live, so
+# they duplicated an existing source rather than adding one and have been
+# removed: SicapEnergyScraper, and ModernizationFundScraper — the latter
+# despite its name, its source_url was the same e-licitatie listing.
+#
+# MunicipalTermoScraper (primariatm.ro) has also been removed: Timisoara's
+# "Achizitii Publice" page was checked live and is a description of the
+# department's statutory duties, with zero notices, zero dates and zero
+# attached documents. There is no feed there to parse, so no scraper can
+# honestly be built against it.
 
-class ModernizationFundScraper(BaseScraper):
-    def __init__(self): super().__init__("ModernFund", 0.2)
-    async def fetch_market_consultations(self) -> List[RawInstitutionalSignal]:
-        signal = RawInstitutionalSignal(
-            source_id="FM-SOLAR-MIDIA-12",
-            source_type="Fondul de Modernizare",
-            category="energie",
-            sub_category="Parcuri Fotovoltaice & Cold Ironing",
-            county="Constanta",
-            locality="Constanta - Midia",
-            entity_name="Compania Nationala Administratia Porturilor Maritime SA Constanta",
-            project_title="Fondul de Modernizare: Parc Fotovoltaic 20 MWp On-Grid si Statie de Alimentare Electrica Nave",
-            estimated_value_ron=74000000.0,
-            published_date="2026-08-23",
-            action_deadline="2026-10-18",
-            raw_description="Solutie tehnica de alimentare a navelor maritime la cheu pentru reducerea emisiilor si parc solar dedicat in zona Midia.",
-            source_url="https://e-licitatie.ro/pub/notices/mc-notices/list/2/1",
-            metadata={"cpv_code": "09331200-0"}
-        )
-        signal.metadata["live_fetch_verified"] = await self.fetch_url(signal.source_url) is not None
-        return [signal]
+
+class ProgramEnergieScraper(WordPressCategoryScraper):
+    """MIPE/MFE funding calls filtered to energy.
+
+    Same live WordPress REST API as the health-domain scraper (categories
+    2800 "ultimele-apeluri-prima-pagina" and 2492 "invitatii-de-participare"),
+    keyword-gated to energy so the two domains partition one national feed
+    instead of both claiming all of it.
+
+    The category originally targeted here, "anunturi-pnrr" (2719), was
+    checked live and is almost entirely payment lists ("Lista platilor
+    PNRR C9 ..."), which are settlement records rather than opportunities.
+    """
+
+    API_URL = "https://mfe.gov.ro/wp-json/wp/v2/posts"
+    CATEGORIES = "2800,2492"
+    PER_PAGE = 60
+    TOPIC_KEYWORDS = [
+        "energie", "energetic", "energetica", "eficienta energetica",
+        "fotovoltaic", "fotovoltaice", "regenerabil", "regenerabila",
+        "cogenerare", "termoficare", "electric", "electrica", "eolian",
+        "biomasa", "hidrogen", "panouri solare", "repowereu",
+    ]
+
+    SOURCE_PREFIX = "MFE-ENERGIE"
+    SOURCE_TYPE = "MIPE/MFE - Apeluri Finanțare Energie"
+    DOMAIN_CATEGORY = "energie"
+    SUB_CATEGORY = "Apel de finanțare / Ghidul Solicitantului"
+    ENTITY_NAME = "Ministerul Investițiilor și Proiectelor Europene (MIPE)"
+    FALLBACK_URL = "https://mfe.gov.ro/"
+
+    def __init__(self):
+        super().__init__("ProgramEnergie", rate_limit_delay=1.0, poll_interval_minutes=180)
+
 
 class ApmPermitScraper(BaseScraper):
-    def __init__(self): super().__init__("ApmPermits", 0.2)
-    async def fetch_market_consultations(self) -> List[RawInstitutionalSignal]:
-        signal = RawInstitutionalSignal(
-            source_id="APM-BESS-TIMIS-13",
-            source_type="Registru Mediu APM",
-            category="energie",
-            sub_category="Stocare Energie in Baterii (BESS)",
-            county="Timis",
-            locality="Sannicolau Mare",
-            entity_name="APM Timis / Transelectrica",
-            project_title="Aviz Mediu APM: Parc Hibrid Fotovoltaic 45 MW si Sistem Stocare BESS 20 MWh",
-            estimated_value_ron=128000000.0,
-            published_date="2026-08-21",
-            action_deadline="2026-10-10",
-            raw_description="Decizia etapei de incadrare pentru construirea capacitatii de stocare electrochimica si racord la statia 110 kV.",
-            source_url="https://www.anpm.ro",
-            metadata={"env_status": "Fara evaluare impact suplimentar"}
-        )
-        signal.metadata["live_fetch_verified"] = await self.fetch_url(signal.source_url) is not None
-        return [signal]
+    """ANPM (Agenția Națională pentru Protecția Mediului) publishes the
+    environmental-permit decisions that precede large energy projects —
+    genuinely valuable, because a permit decision appears well before any
+    tender notice.
 
-class MunicipalTermoScraper(BaseScraper):
-    def __init__(self): super().__init__("MunTermo", 0.2)
-    async def fetch_market_consultations(self) -> List[RawInstitutionalSignal]:
-        signal = RawInstitutionalSignal(
-            source_id="COLTERM-HEAT-PUMPS-14",
-            source_type="HCL Registru",
-            category="energie",
-            sub_category="Pompe Industriale & Termoficare",
-            county="Timis",
-            locality="Timisoara",
-            entity_name="Consiliul Local Timisoara / Colterm SA",
-            project_title="HCL Timisoara: Modernizare Retea Primara Termoficare si Pompe Industriale de Caldura 15 MWt",
-            estimated_value_ron=58000000.0,
-            published_date="2026-08-23",
-            action_deadline="2026-10-05",
-            raw_description="Aprobare deviz tehnic pentru recuperarea caldurii industriale reziduale si montarea de pompe geotermale de mare capacitate.",
-            source_url="https://www.primariatm.ro",
-            metadata={"resolution": "HCL 214/2026"}
-        )
-        signal.metadata["live_fetch_verified"] = await self.fetch_url(signal.source_url) is not None
-        return [signal]
+    It cannot currently be scraped: anpm.ro does not resolve in DNS at all
+    (checked live — no A record for either anpm.ro or www.anpm.ro, and every
+    scheme/host variant fails to connect). This is an outage or a
+    decommissioned domain on the publisher's side, not a parsing problem,
+    so this scraper reports zero signals and logs the failure rather than
+    inventing permit records. The circuit breaker will trip it after
+    repeated failures; if ANPM returns, the URL below is the entry point.
+    """
 
-class SicapEnergyScraper(BaseScraper):
-    def __init__(self): super().__init__("SicapEnergy", 0.2)
+    LANDING_URL = "https://www.anpm.ro"
+
+    def __init__(self):
+        super().__init__("ApmPermits", rate_limit_delay=1.0, poll_interval_minutes=1440)
+
     async def fetch_market_consultations(self) -> List[RawInstitutionalSignal]:
-        signal = RawInstitutionalSignal(
-            source_id="SICAP-ENERG-BIHOR-15",
-            source_type="SICAP Consultari",
-            category="energie",
-            sub_category="Geotermal & Retele nZEB",
-            county="Bihor",
-            locality="Oradea - Nufarul",
-            entity_name="Municipiul Oradea",
-            project_title="Consultare Piata: Foraj de mare adancime apa geotermala si statie schimbatoare caldura titan",
-            estimated_value_ron=39000000.0,
-            published_date="2026-08-22",
-            action_deadline="2026-09-28",
-            raw_description="Culegere date tehnice privind echipamentele de pompare submersibila rezistente la coroziune si reteaua de reinjectie.",
-            source_url="https://e-licitatie.ro/pub/notices/mc-notices/list/2/1",
-            metadata={"cpv_code": "45251250-8"}
-        )
-        signal.metadata["live_fetch_verified"] = await self.fetch_url(signal.source_url) is not None
-        return [signal]
+        body = await self.fetch_url(self.LANDING_URL)
+        if body is None:
+            self.logger.warning(
+                f"[{self.name}] ANPM unreachable ({self.LANDING_URL}) — 0 signals. "
+                "Domain does not resolve; no permit data can be retrieved."
+            )
+        else:
+            self.logger.info(f"[{self.name}] ANPM reachable again — a real parser can now be implemented.")
+        return []

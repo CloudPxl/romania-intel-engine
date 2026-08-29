@@ -17,23 +17,12 @@ DOCUMENTS_API_URL = "https://e-licitatie.ro/api-pub/PUBLICMCNotice/getDocuments/
 DOWNLOAD_API_URL = "https://e-licitatie.ro/api-pub/PUBLICMCNotice/downloadDocument/"
 DETAIL_VIEW_URL = "https://e-licitatie.ro/pub/notices/mc-notice/view/{id}"
 
-# Heuristic keyword classification into the app's 5 domains — e-licitatie's
-# market-consultation list has no structured category field of its own.
-CATEGORY_KEYWORDS = {
-    "aparare": ["apărăr", "aparare", "mapn", "armată", "armata", "militar", "nato", "cibernetic"],
-    "sanatate": ["sănătat", "sanatat", "spital", "medical", "sanitar"],
-    "energie": ["energie", "electric", "termic", "gaz natural", "fotovoltaic", "regenerabil"],
-    "infrastructura": ["drum", "pod", "pasaj", "asfalt", "canalizare", "alimentare cu apă", "construc", "clădire", "cladire", "urban"],
-}
-DEFAULT_CATEGORY = "digitalizare"
-
-
-def classify_category(entity_name: str, title: str, description: str) -> str:
-    text = f"{entity_name} {title} {description}".lower()
-    for category, keywords in CATEGORY_KEYWORDS.items():
-        if any(kw in text for kw in keywords):
-            return category
-    return DEFAULT_CATEGORY
+# Domain classification is shared with the other general-purpose feeds
+# (see scrapers/matrix/category_classifier.py) so a hospital tender lands
+# in "sanatate" whether it arrives from SICAP or a municipal mirror. The
+# local copy that used to live here did raw substring matching and had to
+# spell every keyword twice to cope with diacritics.
+from scrapers.matrix.category_classifier import CATEGORY_KEYWORDS, DEFAULT_CATEGORY, classify_category  # noqa: F401
 
 
 class ElicitatieLiveScraper(BaseScraper):

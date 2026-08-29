@@ -16,21 +16,18 @@ PIPELINE_STAGES = [
     "lost",
 ]
 
-CONCURRENT_DEAL_PIPELINE = {
-    "t1_infra_transilvania": [
-        {
-            "deal_id": "DEAL-IASI-ITS-01",
-            "product_id": "prod_smart_traffic",
-            "opportunity_id": "SICAP-MC-2026-10892",
-            "project_title": "Sistem inteligent de management al traficului Iași",
-            "stage": "consultation_drafted",
-            "assigned_to": "director@infraconstruct.ro",
-            "target_margin_pct": 21.0,
-            "estimated_value_ron": 18200000.0,
-            "notes": "Fișa tehnică preliminară pregătită pentru transmitere la Primăria Iași."
-        }
-    ]
-}
+# Deals added by users at runtime, keyed by tenant.
+#
+# This previously shipped with a seeded demo deal ("DEAL-IASI-ITS-01")
+# referencing opportunity SICAP-MC-2026-10892 — an id from the old fixture
+# data that no longer exists in any source. It appeared in the live
+# pipeline as though a real bid were in progress, with a real assignee
+# email and a 18.2M RON value attached to nothing. Starting empty is both
+# accurate and what a new tenant should see.
+#
+# Note this is process-local and resets on restart (see CLAUDE.md); the
+# pipeline is not yet persisted to Postgres.
+CONCURRENT_DEAL_PIPELINE: Dict[str, List[Dict[str, Any]]] = {}
 
 class ConcurrentWorkflowEngine:
     @staticmethod

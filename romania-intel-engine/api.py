@@ -228,7 +228,15 @@ async def send_manual_email_alert(payload: EmailAlertRequest):
 
 @app.post("/api/v1/addons/competitor-analysis")
 def analyze_competitor_landscape(payload: CompetitorAnalysisRequest):
-    return CompetitorTrackerEngine.analyze_landscape(payload.category, payload.county, payload.budget_ron)
+    # Feed the engine the opportunities actually ingested, so the sector
+    # view is computed from real data. It previously received nothing and
+    # answered from a hardcoded benchmark table.
+    return CompetitorTrackerEngine.analyze_landscape(
+        payload.category,
+        payload.county,
+        payload.budget_ron,
+        observed_opportunities=newsletter_store.load(),
+    )
 
 @app.post("/api/v1/addons/upload-caiet")
 async def upload_and_analyze_caiet(file: UploadFile = File(...), project_title: str = Form(...)):
