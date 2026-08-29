@@ -348,30 +348,64 @@ async def get_tenant_feed(
     force_refresh: bool = False,
     is_subscribed: bool = True
 ):
-    cache_key = f"feed:{tenant_id}:{product_id or 'all'}:{category or 'all'}:{is_subscribed}"
+    """Matches ingested opportunities against one tenant's product lines.
+
+    This used to call orchestrator.run_pipeline() on every cache miss —
+    a full synchronous re-scrape of all 13 live sources (CNI's ~15k-row
+    register, multi-page PDF parsing, etc.) inside the HTTP request path,
+    on a 90-second cache TTL. On Render's free-tier CPU that reliably took
+    well over a minute, which is why /api/v1/copilot/chat (which calls
+    this for context) was timing out at 90s with no response at all.
+    It also duplicated the ingestion the tick already performs on its own
+    schedule, and — unlike run_tick() — ignored each source's
+    poll_interval_minutes entirely, so a handful of requests could hammer
+    every source far more often than the scrapers were designed for.
+
+    force_refresh now means "recompute matching against the latest
+    ingested data," not "trigger a live re-scrape" — the tick already
+    keeps that data fresh on its own cadence; a request re-running the
+    scrapers themselves was never the right place for that to happen.
+    """
+    product_key = product_id or "all"
+    cache_key = f"feed:{tenant_id}:{product_key}:{category or 'all'}:{is_subscribed}"
     if not force_refresh:
         cached_data = global_cache.get(cache_key)
         if cached_data:
             return cached_data
 
-    orchestrator = OpportunityOrchestrator()
-    pipeline_result = await orchestrator.run_pipeline()
-    raw_leads = pipeline_result.get("leads", [])
+    feed = await _load_feed()
+    raw_leads = feed.get("leads", [])
 
     matched_leads = []
     for lead in raw_leads:
         if category and category != "all" and lead.get("category") != category:
             continue
         match_info = TenantMatchingEngine.evaluate_opportunity_for_tenant(lead, tenant_id)
-        if match_info["is_match"]:
-            lead_copy = dict(lead)
-            lead_copy["opportunity_score"] = match_info["tenant_opportunity_score"]
-            matched_leads.append(lead_copy)
+        if not match_info["is_match"]:
+            continue
+        # product_id was accepted and folded into the cache key but never
+        # actually applied — every request advertising this filter got an
+        # unfiltered result back regardless.
+        if product_id and product_id != "all":
+            if not any(p["product_id"] == product_id for p in match_info["product_matches"]):
+                continue
+        lead_copy = dict(lead)
+        lead_copy["opportunity_score"] = match_info["tenant_opportunity_score"]
+        lead_copy["product_matches"] = match_info["product_matches"]
+        matched_leads.append(lead_copy)
 
     matched_leads.sort(key=lambda x: x.get("opportunity_score", 0), reverse=True)
     gated_leads = FreemiumGatekeeper.enforce_paywall_tier(matched_leads, has_active_subscription=is_subscribed)
-    
-    payload = {"tenant_id": tenant_id, "count": len(gated_leads), "leads": gated_leads}
+
+    payload = {
+        "tenant_id": tenant_id,
+        "count": len(gated_leads),
+        "leads": gated_leads,
+        "data_source": feed.get("source", "file-cache"),
+        "data_updated_at": feed.get("updated_at"),
+    }
+    if feed.get("degraded"):
+        payload["degraded"] = True
     global_cache.set(cache_key, payload, ttl_seconds=60)
     return payload
 

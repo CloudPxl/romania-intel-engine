@@ -131,11 +131,22 @@ class TenantMatchingEngine:
     def _score_product(opportunity: Dict[str, Any], prod: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         """Scores one product line against one opportunity.
 
-        Returns None when the opportunity is not relevant at all. Relevance
-        is *gated*: an opportunity must match this division's domain or its
-        keywords to qualify. Geography alone can never create a match — it
-        previously could, which meant an energy consultancy was alerted
-        about defence contracts purely for being in its county.
+        Returns None when the opportunity is not relevant to *this specific
+        product*. Relevance is gated on keyword evidence, not domain: a
+        tenant can have several products in the same domain (t1's
+        heavy-infrastructure roads division and its separate ITS/smart-
+        traffic division are both "infrastructura"), and domain membership
+        alone doesn't say which one an opportunity actually belongs to.
+
+        This used to also accept domain-alone as sufficient, which meant a
+        plain road-resurfacing contract — zero overlap with the ITS
+        product's keywords (its/trafic/semaforizare/scats/...) — still
+        cleared the match threshold on domain (+3.4) plus county (+1.6)
+        plus budget (+1.5) alone, attributing a roads lead to the smart-
+        traffic product line. The earlier, related fix removed geography
+        as a sufficient signal on its own (an energy tenant was matching
+        defence contracts by county); this closes the same hole one layer
+        down, at the product rather than the domain.
         """
         title = opportunity.get("project_title", "") or ""
         summary = opportunity.get("executive_summary", "") or opportunity.get("raw_description", "") or ""
@@ -151,8 +162,10 @@ class TenantMatchingEngine:
         domain_hit = opportunity.get("category") == prod["domain"]
         matched_kws = matching_terms(text, prod.get("keywords", []))
 
-        # Relevance gate.
-        if not domain_hit and not matched_kws:
+        # Relevance gate: keyword evidence is mandatory. Domain match alone
+        # no longer clears it — it remains a scoring bonus below, so it can
+        # reinforce a keyword-relevant match but never create one by itself.
+        if not matched_kws:
             return None
 
         score = 0.0
