@@ -159,7 +159,20 @@ async def system_tick(x_tick_secret: Optional[str] = Header(None)):
 
 @app.get("/api/v1/system/status")
 async def system_status():
-    last = await db.get_last_successful_tick()
+    # The heartbeat parses this response, and a 500 here fails the whole
+    # workflow run — so a database blip must not take the watchdog down
+    # with it. Report the degradation instead of raising.
+    try:
+        last = await db.get_last_successful_tick()
+    except Exception as e:
+        logger.error(f"[Status] Could not read last tick: {e}")
+        return {
+            "last_tick_completed_at": None,
+            "minutes_since_last_tick": None,
+            "is_stale": True,
+            "degraded": True,
+            "detail": "database unavailable",
+        }
     minutes_since = (datetime.now(timezone.utc) - last).total_seconds() / 60 if last else None
     return {
         "last_tick_completed_at": last.isoformat() if last else None,
