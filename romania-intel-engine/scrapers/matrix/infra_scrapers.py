@@ -1,8 +1,7 @@
-import hashlib
-import json
 import re
 from typing import List
 from scrapers.base_scraper import BaseScraper
+from scrapers.matrix.cni_common import HEALTH_CATEGORIES, CniRegisterScraper
 from scrapers.models import RawInstitutionalSignal
 
 # SICAP market consultations are now covered live by
@@ -10,89 +9,19 @@ from scrapers.models import RawInstitutionalSignal
 # SicapInfraScraper fixture here was redundant and has been removed.
 
 
-class CniInfraScraper(BaseScraper):
-    """CNI (Compania Nationala de Investitii) publishes its full project
-    register through a DataTables server-side JSON endpoint that backs
-    https://www.cni.ro/proiecte-in-achizitie — reverse-engineered live via
-    that page's inline `ajax: "https://www.cni.ro/ajaxProj.php"` config.
-    The endpoint ignores every status/referer filter param we tried and
-    always returns its full unfiltered project list (recordsTotal/
-    recordsFiltered are also always 0, a server-side bug) — filtering by
-    status has to happen client-side, and pagination is done defensively
-    with a fixed page count rather than trusting those count fields."""
+class CniInfraScraper(CniRegisterScraper):
+    """CNI's project register, restricted to public-works categories.
+    Health facilities are carved out and handled by CniHealthScraper — see
+    scrapers/matrix/cni_common.py for the shared fetch and why the two
+    domains must partition the register's categories rather than overlap."""
 
-    AJAX_URL = "https://www.cni.ro/ajaxProj.php"
-    LISTING_URL = "https://www.cni.ro/proiecte-in-achizitie"
-    TARGET_STATUS = "In achizitie"
-    PAGE_SIZE = 500
-    MAX_PAGES = 6
-
-    _ID_RE = re.compile(r"-id-(\d+)-cmsid-\d+")
-    _LINK_RE = re.compile(r'href="([^"]+)"')
+    DOMAIN_CATEGORY = "infrastructura"
 
     def __init__(self):
         super().__init__("CniInfra", rate_limit_delay=1.5, poll_interval_minutes=360)
 
-    @staticmethod
-    def _parse_ron(value: str) -> float:
-        try:
-            cleaned = value.replace("lei", "").strip().replace(".", "").replace(",", ".")
-            return float(cleaned)
-        except (ValueError, AttributeError):
-            return 0.0
-
-    async def _fetch_all_rows(self) -> List[list]:
-        rows: List[list] = []
-        for page in range(self.MAX_PAGES):
-            url = f"{self.AJAX_URL}?draw=1&start={page * self.PAGE_SIZE}&length={self.PAGE_SIZE}"
-            body = await self.fetch_url(url)
-            if not body:
-                break
-            try:
-                page_rows = json.loads(body).get("data", [])
-            except json.JSONDecodeError:
-                self.logger.error(f"[{self.name}] non-JSON response from {url}")
-                break
-            rows.extend(page_rows)
-            if len(page_rows) < self.PAGE_SIZE:
-                break
-        return rows
-
-    async def fetch_market_consultations(self) -> List[RawInstitutionalSignal]:
-        signals: List[RawInstitutionalSignal] = []
-        for row in await self._fetch_all_rows():
-            if len(row) < 8 or row[6] != self.TARGET_STATUS:
-                continue
-            year, category, county, locality, title, budget_str, status, link_html = row[:8]
-
-            link_match = self._LINK_RE.search(link_html or "")
-            detail_url = link_match.group(1).replace("\\/", "/") if link_match else self.LISTING_URL
-            id_match = self._ID_RE.search(detail_url)
-            source_id = (
-                f"CNI-{id_match.group(1)}"
-                if id_match
-                else f"CNI-{hashlib.sha1(f'{year}|{category}|{county}|{locality}|{title}'.encode()).hexdigest()[:16]}"
-            )
-
-            signals.append(RawInstitutionalSignal(
-                source_id=source_id,
-                source_type="CNI Registru Proiecte",
-                category="infrastructura",
-                sub_category=category or "Nespecificat",
-                county=county or "",
-                locality=locality or "",
-                entity_name="Compania Nationala de Investitii (CNI)",
-                project_title=title or "Proiect CNI",
-                estimated_value_ron=self._parse_ron(budget_str),
-                # CNI's feed only gives a reporting year, not an exact date —
-                # left as the bare year rather than fabricating a day/month;
-                # db._parse_date() will store this as NULL, not a fake date.
-                published_date=str(year) if year else "",
-                raw_description=f"Proiect CNI aflat in faza de achizitie publica: {title}, judetul {county}.",
-                source_url=detail_url,
-                metadata={"reported_year": year, "cni_status": status},
-            ))
-        return signals
+    def accepts_category(self, category: str) -> bool:
+        return category not in HEALTH_CATEGORIES
 
 class CnairCfrScraper(BaseScraper):
     """CNAIR's own procurement-plan (PAAP) PDF, live-verified, is a 278-page

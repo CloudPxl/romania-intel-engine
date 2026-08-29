@@ -10,7 +10,7 @@ from scrapers.matrix.infra_scrapers import (
     CniInfraScraper, CnairCfrScraper, UrbanismAcScraper, CountyHclScraper
 )
 from scrapers.matrix.health_scrapers import (
-    SicapHealthScraper, MsRegionalHospitalScraper, PnrrHealthC7Scraper, CountyEmergencyHospitalScraper, CniHealthScraper
+    MsAchizitiiScraper, ProgramSanatateScraper, CniHealthScraper
 )
 from scrapers.matrix.energy_scrapers import (
     PnrrEnergyC6Scraper, ModernizationFundScraper, ApmPermitScraper, MunicipalTermoScraper, SicapEnergyScraper
@@ -34,8 +34,9 @@ class OpportunityOrchestrator:
             # 1. Infra (SICAP market consultations for this domain are covered
             # live by ElicitatieLiveScraper below, not a per-domain fixture)
             CniInfraScraper(), CnairCfrScraper(), UrbanismAcScraper(), CountyHclScraper(),
-            # 2. Health
-            SicapHealthScraper(), MsRegionalHospitalScraper(), PnrrHealthC7Scraper(), CountyEmergencyHospitalScraper(), CniHealthScraper(),
+            # 2. Health (SICAP health consultations arrive via
+            # ElicitatieLiveScraper, not a per-domain fixture)
+            MsAchizitiiScraper(), ProgramSanatateScraper(), CniHealthScraper(),
             # 3. Energy
             PnrrEnergyC6Scraper(), ModernizationFundScraper(), ApmPermitScraper(), MunicipalTermoScraper(), SicapEnergyScraper(),
             # 4. Defense

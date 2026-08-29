@@ -39,10 +39,10 @@ class BaseScraper(ABC):
         response.raise_for_status()
         return response
 
-    async def fetch_url(self, url: str) -> Optional[str]:
+    async def fetch_url(self, url: str, timeout: float = 15.0) -> Optional[str]:
         async with DomainRateLimiter.acquire(url, self.rate_limit_delay):
             try:
-                async with httpx.AsyncClient(timeout=15.0, follow_redirects=True, headers={"User-Agent": USER_AGENT}) as client:
+                async with httpx.AsyncClient(timeout=timeout, follow_redirects=True, headers={"User-Agent": USER_AGENT}) as client:
                     response = await self._get_with_retry(client, url)
                     return response.text
             except (httpx.HTTPError, asyncio.TimeoutError, NonRetryableHTTPError) as e:
