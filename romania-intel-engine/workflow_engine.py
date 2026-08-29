@@ -16,6 +16,27 @@ PIPELINE_STAGES = [
     "lost",
 ]
 
+TERMINAL_STAGES = {"won", "lost"}
+
+# Baseline probability-to-close by stage — the standard sales-pipeline
+# convention (weighted pipeline = value * stage probability), used here
+# because it is a stated, inspectable heuristic rather than a claim of
+# statistical calibration. This mirrors addons/win_probability.py's own
+# stance: the system has never ingested a single award result, so it
+# cannot produce a trained probability — what it can produce is a
+# transparent, auditable weighting, which is what a pipeline forecast
+# needs to be useful without overclaiming precision.
+STAGE_WIN_PROBABILITY: Dict[str, float] = {
+    "discovery": 0.10,
+    "consultation_drafted": 0.20,
+    "consultation_submitted": 0.30,
+    "caiet_sarcini_analysis": 0.40,
+    "offer_prepared": 0.55,
+    "bid_submitted": 0.70,
+    "won": 1.0,
+    "lost": 0.0,
+}
+
 # Deals added by users at runtime, keyed by tenant.
 #
 # This previously shipped with a seeded demo deal ("DEAL-IASI-ITS-01")
@@ -102,3 +123,129 @@ class ConcurrentWorkflowEngine:
                 logger.info(f"📈 Deal {deal_id} moved {previous_stage} -> {new_stage}")
                 return {"status": "success", "deal": d}
         return {"status": "error", "message": "Deal not found"}
+
+    @staticmethod
+    def _reached_stages(deal: Dict[str, Any]) -> set:
+        """Every stage a deal has actually passed through, including its
+        current one. `stage_history` only logs transitions, so a deal that
+        has never moved (still sitting in discovery) has an empty history
+        but has still "reached" discovery — that has to be added explicitly
+        rather than inferred from an empty list."""
+        reached = {"discovery", deal.get("stage")}
+        for entry in deal.get("stage_history", []):
+            if entry.get("to"):
+                reached.add(entry["to"])
+        reached.discard(None)
+        return reached
+
+    @staticmethod
+    def _stage_durations_days(deal: Dict[str, Any], now: datetime) -> Dict[str, float]:
+        """Days spent in each stage the deal has passed through, computed
+        from real transition timestamps in `stage_history` rather than
+        estimated — the time between entering a stage (the previous
+        transition's timestamp, or `created_at` for the first stage) and
+        leaving it (the next transition's timestamp, or `now` if it's the
+        deal's current stage)."""
+        try:
+            entered_at = datetime.fromisoformat(deal["created_at"])
+        except (KeyError, ValueError, TypeError):
+            return {}
+
+        current_stage = "discovery"
+        durations: Dict[str, float] = {}
+        for entry in deal.get("stage_history", []):
+            try:
+                left_at = datetime.fromisoformat(entry["at"])
+            except (KeyError, ValueError, TypeError):
+                continue
+            days = max(0.0, (left_at - entered_at).total_seconds() / 86400)
+            durations[current_stage] = durations.get(current_stage, 0.0) + days
+            current_stage = entry.get("to", current_stage)
+            entered_at = left_at
+
+        days_in_current = max(0.0, (now - entered_at).total_seconds() / 86400)
+        durations[current_stage] = durations.get(current_stage, 0.0) + days_in_current
+        return durations
+
+    @staticmethod
+    def get_pipeline_metrics(tenant_id: str, product_id: Optional[str] = None) -> Dict[str, Any]:
+        """Real pipeline analytics over the tenant's current deals: value
+        weighted by stage-based win probability, actual time spent per
+        stage (from transition timestamps, not estimated), and funnel
+        conversion rates derived from which stages each deal has actually
+        reached — not fixed/seeded numbers.
+        """
+        deals = ConcurrentWorkflowEngine.get_tenant_pipeline(tenant_id, product_id)
+        now = datetime.now()
+
+        total_deals = len(deals)
+        won = [d for d in deals if d.get("stage") == "won"]
+        lost = [d for d in deals if d.get("stage") == "lost"]
+        active = [d for d in deals if d.get("stage") not in TERMINAL_STAGES]
+
+        def _value(d: Dict[str, Any]) -> float:
+            return d.get("proposed_price") or d.get("estimated_value_ron") or 0.0
+
+        active_pipeline_value_ron = sum(_value(d) for d in active)
+        weighted_pipeline_value_ron = sum(
+            _value(d) * STAGE_WIN_PROBABILITY.get(d.get("stage"), 0.0) for d in active
+        )
+        won_value_ron = sum(_value(d) for d in won)
+
+        stage_breakdown: Dict[str, Dict[str, Any]] = {
+            stage: {"count": 0, "value_ron": 0.0} for stage in PIPELINE_STAGES
+        }
+        stage_duration_totals: Dict[str, List[float]] = {stage: [] for stage in PIPELINE_STAGES}
+        reached_counts: Dict[str, int] = {stage: 0 for stage in PIPELINE_STAGES}
+
+        for d in deals:
+            stage = d.get("stage")
+            if stage in stage_breakdown:
+                stage_breakdown[stage]["count"] += 1
+                stage_breakdown[stage]["value_ron"] += _value(d)
+            for reached in ConcurrentWorkflowEngine._reached_stages(d):
+                if reached in reached_counts:
+                    reached_counts[reached] += 1
+            for reached_stage, days in ConcurrentWorkflowEngine._stage_durations_days(d, now).items():
+                if reached_stage in stage_duration_totals:
+                    stage_duration_totals[reached_stage].append(days)
+
+        average_days_in_stage = {
+            stage: round(sum(vals) / len(vals), 1)
+            for stage, vals in stage_duration_totals.items()
+            if vals
+        }
+
+        def _conversion(from_stage: str, to_stage: str) -> Optional[float]:
+            denom = reached_counts.get(from_stage, 0)
+            if denom == 0:
+                return None
+            return round(reached_counts.get(to_stage, 0) / denom * 100, 1)
+
+        closed = len(won) + len(lost)
+
+        return {
+            "tenant_id": tenant_id,
+            "product_id": product_id,
+            "total_deals": total_deals,
+            "active_deals": len(active),
+            "won_deals": len(won),
+            "lost_deals": len(lost),
+            "active_pipeline_value_ron": active_pipeline_value_ron,
+            "weighted_pipeline_value_ron": round(weighted_pipeline_value_ron, 2),
+            "won_value_ron": won_value_ron,
+            "stage_breakdown": stage_breakdown,
+            "average_days_in_stage": average_days_in_stage,
+            "conversion_rates_pct": {
+                "discovery_to_bid_submitted": _conversion("discovery", "bid_submitted"),
+                "bid_submitted_to_won": _conversion("bid_submitted", "won"),
+                "overall_win_rate": round(len(won) / closed * 100, 1) if closed else None,
+            },
+            "methodology_note": (
+                "Valoarea ponderată folosește probabilități standard de închidere pe etapă "
+                "(euristică transparentă, nu un model calibrat pe rezultate istorice — sistemul "
+                "nu a înregistrat încă rezultate reale de atribuire). Ratele de conversie și "
+                "timpul mediu pe etapă sunt calculate din istoricul real de tranziții al "
+                "dosarelor din acest pipeline."
+            ),
+        }

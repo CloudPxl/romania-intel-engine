@@ -195,13 +195,55 @@ def _to_jsonb(value: Dict[str, Any]) -> str:
     return json.dumps(value, ensure_ascii=False, default=str)
 
 
-async def get_recent_opportunities(limit: int = 300) -> List[Dict[str, Any]]:
+async def get_recent_opportunities(
+    limit: int = 300,
+    start_date: Optional[date] = None,
+    end_date: Optional[date] = None,
+    counties: Optional[List[str]] = None,
+    categories: Optional[List[str]] = None,
+    min_value_ron: Optional[float] = None,
+    max_value_ron: Optional[float] = None,
+) -> List[Dict[str, Any]]:
+    """Reads opportunities, optionally narrowed to a market-analysis slice.
+
+    Every filter is optional and additive (AND'd together) so the market
+    analysis endpoint can build exactly the query the client asked for —
+    "only Health projects in Cluj > 1M RON" — without a separate query
+    method per combination. Date filtering runs against
+    COALESCE(published_date, last_seen_at::date): many sources (CNI,
+    PNRR calls) never publish a date at all, and dropping those rows
+    silently out of every date-bounded report would make "accurate"
+    reporting quietly incomplete for exactly the sources that already
+    have the weakest metadata.
+    """
+    conditions: List[str] = []
+    params: List[Any] = []
+
+    def _add(condition_tpl: str, value: Any) -> None:
+        params.append(value)
+        conditions.append(condition_tpl.format(n=len(params)))
+
+    if start_date is not None:
+        _add("COALESCE(published_date, last_seen_at::date) >= ${n}", start_date)
+    if end_date is not None:
+        _add("COALESCE(published_date, last_seen_at::date) <= ${n}", end_date)
+    if counties:
+        _add("county = ANY(${n}::text[])", list(counties))
+    if categories:
+        _add("category = ANY(${n}::text[])", list(categories))
+    if min_value_ron is not None:
+        _add("estimated_value_ron >= ${n}", min_value_ron)
+    if max_value_ron is not None:
+        _add("estimated_value_ron <= ${n}", max_value_ron)
+
+    where_clause = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+    params.append(limit)
+    query = f"SELECT * FROM opportunities {where_clause} ORDER BY last_seen_at DESC LIMIT ${len(params)}"
+
     async with with_connection() as conn:
         if conn is None:
             return []
-        rows = await conn.fetch(
-            "SELECT * FROM opportunities ORDER BY last_seen_at DESC LIMIT $1", limit
-        )
+        rows = await conn.fetch(query, *params)
     return [dict(r) for r in rows]
 
 

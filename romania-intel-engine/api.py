@@ -216,7 +216,41 @@ def _row_to_lead(row: Dict[str, Any]) -> Dict[str, Any]:
     return lead
 
 
-async def _load_feed() -> Dict[str, Any]:
+def _apply_feed_filters(leads: List[Dict[str, Any]], filters: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Applies the same market-analysis filters Postgres would apply, in
+    Python, against the on-disk fallback cache — so a filtered report
+    degrades to "same filters, stale data" when the database is down,
+    rather than silently ignoring the filters and returning everything."""
+    start_date, end_date = filters.get("start_date"), filters.get("end_date")
+    counties = {c.lower() for c in filters.get("counties") or []}
+    categories = {c.lower() for c in filters.get("categories") or []}
+    min_value_ron, max_value_ron = filters.get("min_value_ron"), filters.get("max_value_ron")
+
+    def _keep(lead: Dict[str, Any]) -> bool:
+        if counties and (lead.get("county") or "").lower() not in counties:
+            return False
+        if categories and (lead.get("category") or "").lower() not in categories:
+            return False
+        value = lead.get("financial_value_ron") or 0
+        if min_value_ron is not None and value < min_value_ron:
+            return False
+        if max_value_ron is not None and value > max_value_ron:
+            return False
+        if start_date or end_date:
+            raw = lead.get("published_date") or lead.get("last_seen_at")
+            lead_date = str(raw)[:10] if raw else None
+            if not lead_date:
+                return False
+            if start_date and lead_date < str(start_date):
+                return False
+            if end_date and lead_date > str(end_date):
+                return False
+        return True
+
+    return [l for l in leads if _keep(l)]
+
+
+async def _load_feed(filters: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """Reads the durable copy first, falling back to the on-disk cache.
 
     newsletter_store writes to Render's ephemeral disk, so it is wiped on
@@ -228,10 +262,22 @@ async def _load_feed() -> Dict[str, Any]:
 
     Keeps NewsletterStore's {updated_at, count, leads} shape either way —
     routers/analysis.py and the frontend both read `leads` off this.
+
+    `filters` (start_date, end_date, counties, categories, min_value_ron,
+    max_value_ron — all optional) is pushed down into the Postgres query
+    itself via db.get_recent_opportunities, so a customized market-analysis
+    request queries only the slice it asked for rather than fetching
+    everything and filtering client-side. It is always read fresh here —
+    this function carries no in-memory TTL of its own — so market analysis
+    genuinely re-queries the database on every call, per the standing
+    requirement that strategy/market analysis pull live data every time
+    they're engaged.
     """
+    filters = dict(filters or {})
+    limit = filters.pop("limit", 500)
     db_failed = False
     try:
-        rows = await db.get_recent_opportunities(limit=500)
+        rows = await db.get_recent_opportunities(limit=limit, **filters)
     except Exception as e:
         logger.error(f"[Feed] Postgres read failed, falling back to file cache: {e}")
         rows = []
@@ -239,6 +285,9 @@ async def _load_feed() -> Dict[str, Any]:
 
     if not rows:
         fallback = newsletter_store.load()
+        if filters:
+            fallback["leads"] = _apply_feed_filters(fallback.get("leads", []), filters)[:limit]
+            fallback["count"] = len(fallback["leads"])
         # An empty feed caused by an unreachable database is not the same
         # thing as a market with no opportunities, and the caller cannot
         # tell them apart from the payload alone. Say which it is, so the
@@ -300,6 +349,10 @@ def get_tenant_pipeline(tenant_id: str, stage: Optional[str] = None):
         "stages": ConcurrentWorkflowEngine.get_stages(),
         "deals": ConcurrentWorkflowEngine.get_tenant_pipeline(tenant_id, stage)
     }
+
+@app.get("/api/v1/tenants/{tenant_id}/pipeline/metrics")
+def get_tenant_pipeline_metrics(tenant_id: str, product_id: Optional[str] = None):
+    return ConcurrentWorkflowEngine.get_pipeline_metrics(tenant_id, product_id)
 
 @app.post("/api/v1/tenants/{tenant_id}/pipeline/add")
 def add_pipeline_deal(tenant_id: str, payload: PipelineAddRequest):

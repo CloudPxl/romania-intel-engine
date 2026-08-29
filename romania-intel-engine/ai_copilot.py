@@ -151,84 +151,136 @@ def _format_budget(lead: Dict[str, Any]) -> str:
     return f"{value / 1_000_000:.2f} Mil. RON"
 
 
+def _build_market_telemetry(leads: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Shared deterministic aggregation behind both the fixed 72h radar and
+    the customizable market report — factored out so the two never drift
+    into computing "signals processed" or "pre-tender count" differently.
+
+    The takeaways here are derived from the leads passed in, never fixed
+    text: this used to assert specific market movements ("creștere a
+    procedurilor pre-SEAP în Iași, Cluj, Timiș...") verbatim no matter what
+    the data showed, including when the feed was empty.
+    """
+    from collections import Counter
+
+    published_values = [
+        l.get("financial_value_ron", 0) or 0
+        for l in leads
+        if (l.get("financial_value_ron") or 0) > 0
+    ]
+    county_counts = Counter(l.get("county") for l in leads if l.get("county"))
+    category_counts = Counter(l.get("category", "General") for l in leads)
+    stage_counts = Counter(l.get("procurement_stage", "unknown") for l in leads)
+    pre_tender_stages = ("pre_tender_approved_indicators", "pre_tender_documentation_review", "market_consultation")
+    pre_tender = sum(n for stage, n in stage_counts.items() if stage in pre_tender_stages)
+
+    takeaways: List[str] = []
+    if not leads:
+        takeaways.append("Nu există semnale în fereastra/filtrul analizat.")
+    else:
+        top_counties = county_counts.most_common(3)
+        if top_counties:
+            takeaways.append(
+                "Concentrare geografică: "
+                + ", ".join(f"{c} ({n} semnale)" for c, n in top_counties)
+                + "."
+            )
+        top_cat, top_cat_n = category_counts.most_common(1)[0]
+        takeaways.append(
+            f"Domeniul dominant este '{top_cat}', cu {top_cat_n} din {len(leads)} semnale "
+            f"({top_cat_n / len(leads) * 100:.0f}%)."
+        )
+        if pre_tender:
+            takeaways.append(
+                f"{pre_tender} semnale sunt în fază pre-licitație, unde specificațiile tehnice "
+                "pot fi încă influențate."
+            )
+        undisclosed = len(leads) - len(published_values)
+        if undisclosed:
+            takeaways.append(
+                f"{undisclosed} din {len(leads)} semnale nu au valoare estimată publicată — "
+                "bugetul trebuie confirmat la autoritate."
+            )
+
+    return {
+        "telemetry": {
+            # Only sums figures the sources actually published, and says
+            # how many they cover, so the total is not mistaken for the
+            # full pipeline value.
+            "published_pipeline_ron": sum(published_values),
+            "signals_with_published_value": len(published_values),
+            "signals_processed": len(leads),
+            "top_active_counties": [c for c, _ in county_counts.most_common(5)],
+            "sector_breakdown": dict(category_counts),
+            "stage_breakdown": dict(stage_counts),
+        },
+        "executive_takeaways": takeaways,
+        "strategic_recommendation": (
+            "Prioritizați semnalele în fază pre-licitație: în această etapă puteți influența "
+            "specificațiile tehnice, conform art. 139 din Legea nr. 98/2016 (consultarea pieței)."
+            if pre_tender
+            else "Analizați caietele de sarcini publicate și pregătiți documentația de calificare (DUAE)."
+        ),
+    }
+
+
 class ProcurementAICopilot:
     @staticmethod
     def generate_72h_macro_report(leads: List[Dict[str, Any]]) -> Dict[str, Any]:
-        """Aggregates the actual feed.
+        telemetry = _build_market_telemetry(leads)
+        return {"period": "Ultimele 72 de ore (Radar Achiziții Publice)", **telemetry}
 
-        The takeaways here are derived from the leads passed in. They used
-        to be three fixed sentences asserting specific market movements
-        ("creștere a procedurilor pre-SEAP în Iași, Cluj, Timiș...") that
-        were printed verbatim no matter what the data showed — including
-        when the feed was empty.
+    @staticmethod
+    async def generate_custom_market_report(
+        leads: List[Dict[str, Any]],
+        filters_applied: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """Same deterministic telemetry as the 72h radar, computed over
+        whatever custom slice routers/analysis.py just queried, plus an
+        optional LLM-synthesized executive narrative (bespoke takeaways,
+        strategic recommendations, competitor hypotheses) grounded strictly
+        in that slice. Additive: if no provider is configured or the call
+        fails, the deterministic telemetry above is still a complete,
+        accurate report on its own — the narrative is a bonus, never a
+        dependency.
         """
-        from collections import Counter
+        base = _build_market_telemetry(leads)
+        base["filters_applied"] = filters_applied or {}
+        base["ai_narrative"] = None
 
-        published_values = [
-            l.get("financial_value_ron", 0) or 0
-            for l in leads
-            if (l.get("financial_value_ron") or 0) > 0
-        ]
-        county_counts = Counter(l.get("county") for l in leads if l.get("county"))
-        category_counts = Counter(l.get("category", "General") for l in leads)
-        stage_counts = Counter(l.get("procurement_stage", "unknown") for l in leads)
+        if not list_llm_providers():
+            return base
 
-        takeaways: List[str] = []
-        if not leads:
-            takeaways.append("Nu există semnale noi în fereastra analizată.")
-        else:
-            top_counties = county_counts.most_common(3)
-            if top_counties:
-                takeaways.append(
-                    "Concentrare geografică: "
-                    + ", ".join(f"{c} ({n} semnale)" for c, n in top_counties)
-                    + "."
-                )
-            top_cat, top_cat_n = category_counts.most_common(1)[0]
-            takeaways.append(
-                f"Domeniul dominant este '{top_cat}', cu {top_cat_n} din {len(leads)} semnale "
-                f"({top_cat_n / len(leads) * 100:.0f}%)."
-            )
-            pre_tender = sum(
-                n for stage, n in stage_counts.items()
-                if stage in ("pre_tender_approved_indicators", "pre_tender_documentation_review", "market_consultation")
-            )
-            if pre_tender:
-                takeaways.append(
-                    f"{pre_tender} semnale sunt în fază pre-licitație, unde specificațiile tehnice "
-                    "pot fi încă influențate."
-                )
-            undisclosed = len(leads) - len(published_values)
-            if undisclosed:
-                takeaways.append(
-                    f"{undisclosed} din {len(leads)} semnale nu au valoare estimată publicată — "
-                    "bugetul trebuie confirmat la autoritate."
-                )
+        sample = json.dumps([{
+            "titlu": l.get("project_title"),
+            "beneficiar": l.get("entity_name"),
+            "judet": l.get("county"),
+            "domeniu": l.get("category"),
+            "buget_ron": l.get("financial_value_ron") if (l.get("financial_value_ron") or 0) > 0 else "nepublicat",
+            "stadiu": l.get("procurement_stage"),
+            "sursa": l.get("source_url"),
+        } for l in leads[:25]], ensure_ascii=False)
 
-        return {
-            "period": "Ultimele 72 de ore (Radar Achiziții Publice)",
-            "telemetry": {
-                # Only sums figures the sources actually published, and says
-                # how many they cover, so the total is not mistaken for the
-                # full pipeline value.
-                "published_pipeline_ron": sum(published_values),
-                "signals_with_published_value": len(published_values),
-                "signals_processed": len(leads),
-                "top_active_counties": [c for c, _ in county_counts.most_common(5)],
-                "sector_breakdown": dict(category_counts),
-                "stage_breakdown": dict(stage_counts),
-            },
-            "executive_takeaways": takeaways,
-            "strategic_recommendation": (
-                "Prioritizați semnalele în fază pre-licitație: în această etapă puteți influența "
-                "specificațiile tehnice, conform art. 139 din Legea nr. 98/2016 (consultarea pieței)."
-                if any(
-                    s in stage_counts
-                    for s in ("pre_tender_approved_indicators", "pre_tender_documentation_review", "market_consultation")
-                )
-                else "Analizați caietele de sarcini publicate și pregătiți documentația de calificare (DUAE)."
-            ),
-        }
+        system_prompt = (
+            "Ești director de strategie într-o firmă de consultanță pentru achiziții publice din România. "
+            "Primești un rezumat statistic și un eșantion de dosare reale, deja filtrate exact după criteriile "
+            "clientului. Redactezi un raport de piață bespoke, bazat STRICT pe datele furnizate — nu pe "
+            "cunoștințe generale despre piața românească și nu pe presupuneri despre dosare care nu sunt în "
+            "eșantion. Dacă eșantionul este prea mic pentru o concluzie robustă, spune asta explicit în loc "
+            "să generalizezi. Nu inventa nume de concurenți reali — formulează 'ipoteze de concurență' generice "
+            "și condiționale (tipul de operator care ar fi probabil interesat), nu afirmații despre companii "
+            "anume. Structurează răspunsul în trei secțiuni cu titluri: 'Sinteză executivă', 'Recomandări "
+            "strategice', 'Ipoteze de concurență'. Scrii exclusiv în limba română, ton formal-consultativ."
+        )
+        user_prompt = (
+            f"Filtre aplicate de client: {json.dumps(filters_applied or {}, ensure_ascii=False, default=str)}\n"
+            f"Statistici agregate: {json.dumps(base['telemetry'], ensure_ascii=False)}\n"
+            f"Eșantion de dosare (max 25 din {len(leads)} total): {sample}\n\n"
+            "Redactează raportul bespoke conform instrucțiunilor."
+        )
+        narrative = await complete_text(system_prompt, user_prompt, temperature=0.5, max_tokens=1800, timeout=40.0)
+        base["ai_narrative"] = narrative
+        return base
 
     async def answer_copilot_query(self, query: str, context_leads: List[Dict[str, Any]]) -> str:
         q_raw = query.strip()
