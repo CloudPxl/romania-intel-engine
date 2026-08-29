@@ -8,15 +8,138 @@ import httpx
 logger = logging.getLogger("AICopilot")
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
-XAI_API_KEY = os.getenv("XAI_API_KEY", "")
+# render.yaml has always declared this env var as GROK_API_KEY (not
+# XAI_API_KEY, xAI's own naming) — so a key set on Render was never once
+# read by this module. Accepting both names fixes it without needing a
+# Render dashboard change on top of a code deploy.
+XAI_API_KEY = os.getenv("XAI_API_KEY", "") or os.getenv("GROK_API_KEY", "")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
+
+# Forces one provider regardless of which other keys happen to be set —
+# e.g. LLM_PROVIDER=groq to guarantee a newly-added free key is actually
+# used, without having to remove an old/exhausted key for another
+# provider first. Values: openai | xai | groq | gemini.
+LLM_PROVIDER_OVERRIDE = os.getenv("LLM_PROVIDER", "").strip().lower()
+
+# name -> (base_url, model, api_key). Groq and Gemini both have genuinely
+# free tiers obtainable in minutes (console.groq.com, aistudio.google.com)
+# with no billing setup; OpenAI and xAI do not, in practice, so the free
+# ones are tried first when multiple keys are present. Gemini uses its
+# OpenAI-compatible endpoint so one call shape covers all four providers.
+#
+# Every model id below was verified live against this deployment's actual
+# keys (probed directly against each provider's /chat/completions), not
+# assumed — model catalogs on all of these providers rotate every few
+# months and a plausible-looking id silently 404s or, worse, burns tokens
+# without producing output:
+#   - groq/llama-3.3-70b-versatile: retired: 404 model_not_found. Replaced
+#     with openai/gpt-oss-120b, one of the two general chat models still
+#     live in this key's catalog, verified to answer correctly in Romanian.
+#   - gemini-2.0-flash: retired. gemini-3.6-flash (Google's own suggested
+#     replacement) is a reasoning model that spent ~800 tokens on hidden
+#     "thinking" before producing 32 tokens of visible answer and still
+#     got cut off (finish_reason=length) — impractical for short document
+#     sections. gemini-flash-lite-latest answers directly (finish_reason
+#     stop, no hidden token burn) and, being Google's auto-updating alias
+#     rather than a pinned version, should not go stale the same way.
+#   - grok-beta: retired. grok-3/grok-4 are confirmed real ids (they pass
+#     model validation and reach the credits check), but this deployment's
+#     xAI team has zero credits and xAI has no free tier at all — a 403
+#     permission-denied every time regardless of model id, so this key
+#     will not work until credits are purchased at console.x.ai.
+_PROVIDERS = {
+    "groq": ("https://api.groq.com/openai/v1", "openai/gpt-oss-120b", GROQ_API_KEY),
+    "gemini": ("https://generativelanguage.googleapis.com/v1beta/openai", "gemini-flash-lite-latest", GEMINI_API_KEY),
+    "openai": ("https://api.openai.com/v1", "gpt-4o-mini", OPENAI_API_KEY),
+    "xai": ("https://api.x.ai/v1", "grok-4", XAI_API_KEY),
+}
+_INVALID_KEYS = {"", "dummy_key", "re_dummy"}
 
 ROMANIAN_STOPWORDS = {
     "ce", "faci", "cum", "este", "sunt", "care", "asta", "pentru", "despre", "in", "la", "de",
     "cu", "din", "pe", "am", "ai", "au", "vreau", "caut", "vrei", "poti", "mai", "un", "o",
     "si", "sau", "dar", "iar", "nu", "da", "tot", "toate", "acest", "aceasta", "proiect", "proiecte"
 }
+
+def list_llm_providers() -> List[tuple]:
+    """Every provider with a usable key configured, in try-order, as
+    (name, base_url, model, api_key).
+
+    This used to return only the single first-configured provider — so an
+    exhausted or invalid key for one provider (say xAI) silently blocked
+    every other configured key (Groq, Gemini) from ever being tried, with
+    no error surfaced anywhere. complete_text() below now walks this whole
+    list and only gives up after every configured provider has failed.
+    """
+    if LLM_PROVIDER_OVERRIDE:
+        entry = _PROVIDERS.get(LLM_PROVIDER_OVERRIDE)
+        if entry and entry[2] not in _INVALID_KEYS:
+            return [(LLM_PROVIDER_OVERRIDE, *entry)]
+        logger.warning(
+            f"[LLM] LLM_PROVIDER={LLM_PROVIDER_OVERRIDE!r} has no usable key configured; "
+            "falling back to auto-detection."
+        )
+    return [
+        (name, base_url, model, key)
+        for name, (base_url, model, key) in _PROVIDERS.items()
+        if key not in _INVALID_KEYS
+    ]
+
+
+def resolve_llm_provider() -> Optional[tuple]:
+    """Back-compat single-provider accessor (base_url, model, api_key).
+    Prefer list_llm_providers() / complete_text() for new code — this
+    only reports whether *any* provider is configured."""
+    providers = list_llm_providers()
+    if not providers:
+        return None
+    _, base_url, model, key = providers[0]
+    return base_url, model, key
+
+
+async def complete_text(
+    system_prompt: str,
+    user_prompt: str,
+    temperature: float = 0.4,
+    max_tokens: int = 3000,
+    timeout: float = 45.0,
+) -> Optional[str]:
+    """Shared multi-provider completion call, reused by the copilot chat
+    and by the document generators (dossier/FOIA) for optional deep-section
+    expansion. Tries every configured provider in order and returns the
+    first successful completion. Returns None (never raises) only when
+    every provider is unconfigured or failed — every caller must have a
+    template fallback, since this is a "nice to have" enhancement, not a
+    load-bearing dependency.
+    """
+    providers = list_llm_providers()
+    if not providers:
+        return None
+
+    for name, base_url, model_name, api_key in providers:
+        try:
+            async with httpx.AsyncClient(timeout=timeout) as client:
+                resp = await client.post(
+                    f"{base_url}/chat/completions",
+                    headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+                    json={
+                        "model": model_name,
+                        "messages": [
+                            {"role": "system", "content": system_prompt},
+                            {"role": "user", "content": user_prompt},
+                        ],
+                        "temperature": temperature,
+                        "max_tokens": max_tokens,
+                    },
+                )
+                if resp.status_code == 200:
+                    return resp.json()["choices"][0]["message"]["content"].strip()
+                logger.warning(f"[LLM] {name} ({base_url}) returned {resp.status_code}: {resp.text[:200]} — trying next provider.")
+        except Exception as e:
+            logger.error(f"[LLM] {name} completion call failed: {e} — trying next provider.")
+    return None
+
 
 def _format_budget(lead: Dict[str, Any]) -> str:
     """An undisclosed budget arrives as 0/None. Rendering that as
@@ -29,9 +152,6 @@ def _format_budget(lead: Dict[str, Any]) -> str:
 
 
 class ProcurementAICopilot:
-    def __init__(self):
-        self.api_key = OPENAI_API_KEY or XAI_API_KEY or GROQ_API_KEY or GEMINI_API_KEY or ""
-
     @staticmethod
     def generate_72h_macro_report(leads: List[Dict[str, Any]]) -> Dict[str, Any]:
         """Aggregates the actual feed.
@@ -151,74 +271,55 @@ class ProcurementAICopilot:
             )
 
         # 3. Live LLM Call (if configured on Render)
-        if self.api_key and self.api_key not in ["dummy_key", "re_dummy"]:
-            try:
-                base_url = "https://api.openai.com/v1"
-                model_name = "gpt-4o-mini"
-                if XAI_API_KEY:
-                    base_url, model_name = "https://api.x.ai/v1", "grok-beta"
-                elif GROQ_API_KEY:
-                    base_url, model_name = "https://api.groq.com/openai/v1", "llama-3.3-70b-versatile"
+        if resolve_llm_provider() is not None:
+            system_prompt = (
+                "Ești consultant senior în achiziții publice din România, în cadrul platformei RO-INTEL. "
+                "Vorbești cu profesioniști care depun oferte pe bani publici; răspunsurile tale au consecințe "
+                "juridice și financiare reale.\n\n"
+                "CADRU LEGAL pe care îl stăpânești:\n"
+                "- Legea nr. 98/2016 (achiziții publice clasice): art. 2 alin. (2) principii; art. 7 praguri "
+                "și tipuri de proceduri; art. 139 consultarea pieței; art. 160-161 solicitări de clarificări; "
+                "art. 164/165/167 motive de excludere; art. 193 DUAE; art. 210 preț neobișnuit de scăzut.\n"
+                "- Legea nr. 99/2016 (achiziții sectoriale: utilități, energie, transport, apă).\n"
+                "- Legea nr. 101/2016 (remedii și căi de atac): termene de contestare la CNSC, "
+                "termenul de așteptare (standstill).\n"
+                "- HG nr. 395/2016 (norme de aplicare), Legea nr. 544/2001 (informații publice), "
+                "Legea nr. 10/1995 (calitatea în construcții), Legea nr. 346/2004 (IMM).\n\n"
+                "REGULI DE RĂSPUNS — obligatorii:\n"
+                "1. Când citezi legislația, indică articolul exact. Dacă nu ești sigur de numărul articolului "
+                "sau de forma în vigoare, spune explicit acest lucru și recomandă verificarea în Monitorul Oficial. "
+                "Nu inventa niciodată numere de articole, termene sau praguri.\n"
+                "2. Termenele și pragurile valorice se modifică prin ordine ANAP. Prezintă-le ca orientative și "
+                "recomandă confirmarea pentru procedura concretă.\n"
+                "3. Folosește exclusiv datele din dosarele furnizate în context. Dacă informația cerută nu se "
+                "află acolo, spune că nu o ai — nu completa din memorie și nu estima valori.\n"
+                "4. Când o valoare estimată lipsește din dosar, tratează asta ca 'nepublicată', nu ca zero.\n"
+                "5. Nu oferi consultanță care ar încălca principiile concurenței sau care ar sugera "
+                "influențarea nelegală a unei proceduri. Poți explica participarea legitimă la consultarea "
+                "pieței (art. 139), care este permisă și publică.\n"
+                "6. Ești asistent, nu avocat: pentru contestații și litigii, recomandă consultarea unui "
+                "specialist înainte de depunere.\n\n"
+                "STIL: profesionist, direct, în limba română, fără formule inutile. La întrebări "
+                "conversaționale răspunde firesc și scurt."
+            )
 
-                system_prompt = (
-                    "Ești consultant senior în achiziții publice din România, în cadrul platformei RO-INTEL. "
-                    "Vorbești cu profesioniști care depun oferte pe bani publici; răspunsurile tale au consecințe "
-                    "juridice și financiare reale.\n\n"
-                    "CADRU LEGAL pe care îl stăpânești:\n"
-                    "- Legea nr. 98/2016 (achiziții publice clasice): art. 2 alin. (2) principii; art. 7 praguri "
-                    "și tipuri de proceduri; art. 139 consultarea pieței; art. 160-161 solicitări de clarificări; "
-                    "art. 164/165/167 motive de excludere; art. 193 DUAE; art. 210 preț neobișnuit de scăzut.\n"
-                    "- Legea nr. 99/2016 (achiziții sectoriale: utilități, energie, transport, apă).\n"
-                    "- Legea nr. 101/2016 (remedii și căi de atac): termene de contestare la CNSC, "
-                    "termenul de așteptare (standstill).\n"
-                    "- HG nr. 395/2016 (norme de aplicare), Legea nr. 544/2001 (informații publice), "
-                    "Legea nr. 10/1995 (calitatea în construcții), Legea nr. 346/2004 (IMM).\n\n"
-                    "REGULI DE RĂSPUNS — obligatorii:\n"
-                    "1. Când citezi legislația, indică articolul exact. Dacă nu ești sigur de numărul articolului "
-                    "sau de forma în vigoare, spune explicit acest lucru și recomandă verificarea în Monitorul Oficial. "
-                    "Nu inventa niciodată numere de articole, termene sau praguri.\n"
-                    "2. Termenele și pragurile valorice se modifică prin ordine ANAP. Prezintă-le ca orientative și "
-                    "recomandă confirmarea pentru procedura concretă.\n"
-                    "3. Folosește exclusiv datele din dosarele furnizate în context. Dacă informația cerută nu se "
-                    "află acolo, spune că nu o ai — nu completa din memorie și nu estima valori.\n"
-                    "4. Când o valoare estimată lipsește din dosar, tratează asta ca 'nepublicată', nu ca zero.\n"
-                    "5. Nu oferi consultanță care ar încălca principiile concurenței sau care ar sugera "
-                    "influențarea nelegală a unei proceduri. Poți explica participarea legitimă la consultarea "
-                    "pieței (art. 139), care este permisă și publică.\n"
-                    "6. Ești asistent, nu avocat: pentru contestații și litigii, recomandă consultarea unui "
-                    "specialist înainte de depunere.\n\n"
-                    "STIL: profesionist, direct, în limba română, fără formule inutile. La întrebări "
-                    "conversaționale răspunde firesc și scurt."
-                )
+            dossiers_summary = json.dumps([{
+                "titlu": l.get("project_title"),
+                "beneficiar": l.get("entity_name"),
+                "judet": l.get("county"),
+                # Distinguish "not published" from zero so the model
+                # cannot report an undisclosed budget as a 0 RON contract.
+                "buget_ron": l.get("financial_value_ron") if (l.get("financial_value_ron") or 0) > 0 else "nepublicat",
+                "data": l.get("published_date"),
+                "termen": l.get("action_deadline") or "nepublicat",
+                "stadiu": l.get("procurement_stage"),
+                "sursa": l.get("source_url"),
+            } for l in context_leads[:6]], ensure_ascii=False)
 
-                dossiers_summary = json.dumps([{
-                    "titlu": l.get("project_title"),
-                    "beneficiar": l.get("entity_name"),
-                    "judet": l.get("county"),
-                    # Distinguish "not published" from zero so the model
-                    # cannot report an undisclosed budget as a 0 RON contract.
-                    "buget_ron": l.get("financial_value_ron") if (l.get("financial_value_ron") or 0) > 0 else "nepublicat",
-                    "data": l.get("published_date"),
-                    "termen": l.get("action_deadline") or "nepublicat",
-                    "stadiu": l.get("procurement_stage"),
-                    "sursa": l.get("source_url"),
-                } for l in context_leads[:6]], ensure_ascii=False)
-
-                messages = [
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": f"Dosare pre-SEAP active:\n{dossiers_summary}\n\nMesaj utilizator: {q_raw}"}
-                ]
-
-                async with httpx.AsyncClient(timeout=12.0) as client:
-                    resp = await client.post(
-                        f"{base_url}/chat/completions",
-                        headers={"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"},
-                        json={"model": model_name, "messages": messages, "temperature": 0.4}
-                    )
-                    if resp.status_code == 200:
-                        return resp.json()["choices"][0]["message"]["content"].strip()
-            except Exception as e:
-                logger.error(f"[AICopilot] LLM Error: {e}")
+            user_prompt = f"Dosare pre-SEAP active:\n{dossiers_summary}\n\nMesaj utilizator: {q_raw}"
+            answer = await complete_text(system_prompt, user_prompt, temperature=0.4, max_tokens=1200, timeout=12.0)
+            if answer:
+                return answer
 
         # 4. Filtered Contextual Matching (No false substring collisions)
         meaningful_words = [w for w in tokens if len(w) > 3 and w not in ROMANIAN_STOPWORDS]

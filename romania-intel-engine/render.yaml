@@ -13,6 +13,20 @@ services:
         sync: false
       - key: GROK_API_KEY
         sync: false
+      # Groq and Gemini both have genuinely free tiers (console.groq.com,
+      # aistudio.google.com/apikey) — set either one to get LLM-backed
+      # copilot answers and document expansion without a paid key. The
+      # code tries every configured key in order and fails over between
+      # them (see ai_copilot.py:list_llm_providers), so adding one of
+      # these does not require removing GROK_API_KEY first.
+      - key: GROQ_API_KEY
+        sync: false
+      - key: GEMINI_API_KEY
+        sync: false
+      # Optional: force one provider regardless of which other keys are
+      # set (openai | xai | groq | gemini). Leave unset to auto-detect.
+      - key: LLM_PROVIDER
+        sync: false
       - key: TICK_SECRET
         sync: false
       - key: TELEGRAM_BOT_TOKEN
