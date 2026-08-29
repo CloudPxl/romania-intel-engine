@@ -1,6 +1,6 @@
 import os
 import logging
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from typing import Any, Dict, List, Optional
 
 import asyncpg
@@ -87,10 +87,19 @@ async def upsert_opportunity(record: Dict[str, Any]) -> bool:
     return bool(row["inserted"]) if row else True
 
 
-def _parse_date(value: Any) -> Optional[str]:
+def _parse_date(value: Any) -> Optional[date]:
+    """asyncpg requires real datetime.date objects for DATE columns — it
+    does not auto-cast strings the way some other drivers do."""
     if not value:
         return None
-    return str(value)[:10]
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+    try:
+        return datetime.strptime(str(value)[:10], "%Y-%m-%d").date()
+    except ValueError:
+        return None
 
 
 def _to_jsonb(value: Dict[str, Any]) -> str:

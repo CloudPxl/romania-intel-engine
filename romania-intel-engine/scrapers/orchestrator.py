@@ -124,7 +124,12 @@ class OpportunityOrchestrator:
 
             for sig in signals:
                 refined = IntelligenceRefineryEngine.refine_signal(sig)
-                is_new = await db.upsert_opportunity(refined)
+                try:
+                    is_new = await db.upsert_opportunity(refined)
+                except Exception as e:
+                    errors += 1
+                    logger.error(f"[Tick] Failed to persist opportunity {refined.get('source_id')}: {e}")
+                    continue
                 if not is_new:
                     continue
                 new_count += 1
