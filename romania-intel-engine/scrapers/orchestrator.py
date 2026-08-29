@@ -7,7 +7,7 @@ import db
 from scrapers import circuit_breaker
 from scrapers.matrix.elicitatie_scraper import ElicitatieLiveScraper
 from scrapers.matrix.infra_scrapers import (
-    SicapInfraScraper, CniInfraScraper, CnairCfrScraper, UrbanismAcScraper, CountyHclScraper
+    CniInfraScraper, CnairCfrScraper, UrbanismAcScraper, CountyHclScraper
 )
 from scrapers.matrix.health_scrapers import (
     SicapHealthScraper, MsRegionalHospitalScraper, PnrrHealthC7Scraper, CountyEmergencyHospitalScraper, CniHealthScraper
@@ -31,8 +31,9 @@ class OpportunityOrchestrator:
     def __init__(self):
         # 25 Dedicated Scraper Engines (5 per domain x 5 strategic domains)
         self.scrapers = [
-            # 1. Infra
-            SicapInfraScraper(), CniInfraScraper(), CnairCfrScraper(), UrbanismAcScraper(), CountyHclScraper(),
+            # 1. Infra (SICAP market consultations for this domain are covered
+            # live by ElicitatieLiveScraper below, not a per-domain fixture)
+            CniInfraScraper(), CnairCfrScraper(), UrbanismAcScraper(), CountyHclScraper(),
             # 2. Health
             SicapHealthScraper(), MsRegionalHospitalScraper(), PnrrHealthC7Scraper(), CountyEmergencyHospitalScraper(), CniHealthScraper(),
             # 3. Energy

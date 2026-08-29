@@ -48,3 +48,15 @@ class BaseScraper(ABC):
             except (httpx.HTTPError, asyncio.TimeoutError, NonRetryableHTTPError) as e:
                 self.logger.error(f"[{self.name}] fetch_url failed for {url}: {e}")
                 return None
+
+    async def fetch_bytes(self, url: str, timeout: float = 30.0) -> Optional[bytes]:
+        """Like fetch_url but for binary content (PDFs) — response.text would
+        corrupt anything non-UTF8, so this keeps raw response.content."""
+        async with DomainRateLimiter.acquire(url, self.rate_limit_delay):
+            try:
+                async with httpx.AsyncClient(timeout=timeout, follow_redirects=True, headers={"User-Agent": USER_AGENT}) as client:
+                    response = await self._get_with_retry(client, url)
+                    return response.content
+            except (httpx.HTTPError, asyncio.TimeoutError, NonRetryableHTTPError) as e:
+                self.logger.error(f"[{self.name}] fetch_bytes failed for {url}: {e}")
+                return None
