@@ -53,18 +53,36 @@ async def get_pool() -> Optional[asyncpg.Pool]:
         # a cold start and would otherwise each build their own pool.
         if _pool is not None:
             return _pool
+        kwargs: Dict[str, Any] = {
+            "min_size": 1,
+            "max_size": 5,
+            "max_inactive_connection_lifetime": POOL_MAX_INACTIVE_SECONDS,
+            "command_timeout": COMMAND_TIMEOUT,
+        }
+        if _is_transaction_pooler(DATABASE_URL):
+            # Supabase's transaction pooler multiplexes one server-side
+            # connection across clients, so it cannot keep per-session
+            # prepared statements. asyncpg prepares statements by default
+            # and would fail with "prepared statement _asyncpg_ already
+            # exists" partway through a run. Disabling the statement cache
+            # is what makes the pooler usable at all — and the pooler is
+            # the right endpoint for short-lived free-tier dynos, whose
+            # direct connections get dropped.
+            kwargs["statement_cache_size"] = 0
+            logger.info("[DB] Transaction pooler detected — prepared statement cache disabled.")
         try:
-            _pool = await asyncpg.create_pool(
-                DATABASE_URL,
-                min_size=1,
-                max_size=5,
-                max_inactive_connection_lifetime=POOL_MAX_INACTIVE_SECONDS,
-                command_timeout=COMMAND_TIMEOUT,
-            )
+            _pool = await asyncpg.create_pool(DATABASE_URL, **kwargs)
         except Exception as e:
             logger.error(f"[DB] Failed to create connection pool: {e}")
             return None
     return _pool
+
+
+def _is_transaction_pooler(url: str) -> bool:
+    """Supabase exposes the transaction pooler on port 6543, and its pooler
+    hosts are *.pooler.supabase.com. Detected rather than configured so the
+    connection string can be switched in the dashboard without a redeploy."""
+    return ":6543" in url or "pooler.supabase.com" in url
 
 
 async def _reset_pool() -> None:
