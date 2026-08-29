@@ -9,7 +9,7 @@ from fastapi import FastAPI, HTTPException, Depends, Request, Response, UploadFi
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, EmailStr
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 import db
@@ -167,9 +167,53 @@ async def system_status():
         "is_stale": minutes_since is None or minutes_since > STALENESS_THRESHOLD_MINUTES,
     }
 
+async def _load_feed() -> Dict[str, Any]:
+    """Reads the durable copy first, falling back to the on-disk cache.
+
+    newsletter_store writes to Render's ephemeral disk, so it is wiped on
+    every deploy and restart — the feed was returning 0 entries after a
+    redeploy until the background job had re-scraped everything, even
+    though the same opportunities were sitting safely in Postgres the
+    whole time. Postgres is the source of truth; the file stays as a
+    fallback for when DATABASE_URL is not configured (local runs).
+
+    Keeps NewsletterStore's {updated_at, count, leads} shape either way —
+    routers/analysis.py and the frontend both read `leads` off this.
+    """
+    try:
+        rows = await db.get_recent_opportunities(limit=500)
+    except Exception as e:
+        logger.error(f"[Feed] Postgres read failed, falling back to file cache: {e}")
+        rows = []
+
+    if not rows:
+        return newsletter_store.load()
+
+    leads = []
+    for row in rows:
+        lead = dict(row)
+        # The DB column is estimated_value_ron; the API contract and the
+        # frontend both read financial_value_ron.
+        if lead.get("financial_value_ron") is None:
+            lead["financial_value_ron"] = lead.get("estimated_value_ron") or 0.0
+        for key in ("published_date", "action_deadline", "first_seen_at", "last_seen_at"):
+            value = lead.get(key)
+            if value is not None and not isinstance(value, str):
+                lead[key] = value.isoformat()
+        leads.append(lead)
+
+    newest = max((r.get("last_seen_at") for r in rows if r.get("last_seen_at")), default=None)
+    return {
+        "updated_at": newest.isoformat() if newest is not None and not isinstance(newest, str) else newest,
+        "count": len(leads),
+        "leads": leads,
+        "source": "postgres",
+    }
+
+
 @app.get("/api/v1/newsletter/feed")
-def get_newsletter_feed():
-    return newsletter_store.load()
+async def get_newsletter_feed():
+    return await _load_feed()
 
 @app.post("/api/v1/auth/sync")
 async def sync_user_auth(payload: AuthSyncRequest):
@@ -227,7 +271,7 @@ async def send_manual_email_alert(payload: EmailAlertRequest):
     return {"status": "success" if success else "failed", "recipient": payload.recipient_email}
 
 @app.post("/api/v1/addons/competitor-analysis")
-def analyze_competitor_landscape(payload: CompetitorAnalysisRequest):
+async def analyze_competitor_landscape(payload: CompetitorAnalysisRequest):
     # Feed the engine the opportunities actually ingested, so the sector
     # view is computed from real data. It previously received nothing and
     # answered from a hardcoded benchmark table.
@@ -235,7 +279,7 @@ def analyze_competitor_landscape(payload: CompetitorAnalysisRequest):
         payload.category,
         payload.county,
         payload.budget_ron,
-        observed_opportunities=newsletter_store.load(),
+        observed_opportunities=(await _load_feed()).get("leads", []),
     )
 
 @app.post("/api/v1/addons/upload-caiet")

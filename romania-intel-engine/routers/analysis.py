@@ -7,8 +7,13 @@ router = APIRouter(prefix="/api/v1/analysis", tags=["Market Analysis"])
 
 
 @router.get("/market-trends")
-def get_market_trends():
-    store = newsletter_store.load()
+async def get_market_trends():
+    # Reads through the same Postgres-first loader as the feed, so the
+    # dashboard does not go blank after a redeploy wipes Render's
+    # ephemeral disk while the data is still safe in the database.
+    from api import _load_feed
+
+    store = await _load_feed()
     leads = store.get("leads", [])
 
     total_value_ron = 0.0
