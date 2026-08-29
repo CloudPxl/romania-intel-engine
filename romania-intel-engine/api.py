@@ -415,12 +415,43 @@ async def get_72h_report(tenant_id: str = "t1_infra_transilvania"):
     leads = feed_data.get("leads", [])
     return ProcurementAICopilot.generate_72h_macro_report(leads)
 
+COPILOT_CHAT_DEADLINE_SECONDS = 35.0
+
 @app.post("/api/v1/copilot/chat")
 async def copilot_chat(payload: CopilotQueryRequest):
-    feed_data = await get_tenant_feed(payload.tenant_id or "t1_infra_transilvania")
-    leads = feed_data.get("leads", [])
-    reply = await copilot_engine.answer_copilot_query(payload.query, leads)
-    return {"reply": reply}
+    # answer_copilot_query's own per-provider httpx timeout (12s) should
+    # already bound this to well under a minute even trying all three
+    # configured providers in sequence — but a request was observed live
+    # hanging for 90s+ with literally zero bytes returned, exactly
+    # matching the client's own timeout rather than any bound inside this
+    # call chain. That points at something below httpx's own timeout
+    # enforcement (a stuck DNS resolution is the classic cause — a hung
+    # getaddrinfo() call can bypass an asyncio/httpx timeout entirely).
+    # Wrapping the whole handler in a hard deadline means this endpoint
+    # can no longer hang indefinitely regardless of which layer is at
+    # fault, and degrades to a real answer from the template fallback
+    # path instead of leaving the caller with nothing at all.
+    try:
+        feed_data = await asyncio.wait_for(
+            get_tenant_feed(payload.tenant_id or "t1_infra_transilvania"),
+            timeout=10.0,
+        )
+        leads = feed_data.get("leads", [])
+        reply = await asyncio.wait_for(
+            copilot_engine.answer_copilot_query(payload.query, leads),
+            timeout=COPILOT_CHAT_DEADLINE_SECONDS,
+        )
+        return {"reply": reply}
+    except asyncio.TimeoutError:
+        logger.error(f"[Copilot] Request exceeded {COPILOT_CHAT_DEADLINE_SECONDS}s deadline")
+        return {
+            "reply": (
+                "Îmi pare rău, procesarea a durat prea mult și a fost întreruptă. "
+                "Vă rog reîncercați — dacă problema persistă, este posibil ca un furnizor "
+                "AI extern să răspundă lent momentan."
+            ),
+            "degraded": True,
+        }
 
 @app.get("/api/v1/tenants/{tenant_id}/products")
 async def get_tenant_products(tenant_id: str):
