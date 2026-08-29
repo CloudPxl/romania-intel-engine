@@ -16,7 +16,7 @@ import db
 from matching_engine import TenantMatchingEngine, TENANT_ORGANIZATIONS
 from workflow_engine import ConcurrentWorkflowEngine
 from billing import StripeBillingEngine
-from scrapers.orchestrator import OpportunityOrchestrator
+from scrapers.orchestrator import OpportunityOrchestrator, TICK_DEADLINE_SECONDS
 from cache_engine import global_cache, newsletter_store
 from freemium_shield import FreemiumGatekeeper
 from notifier import LeadAlertDispatcher
@@ -35,7 +35,17 @@ copilot_engine = ProcurementAICopilot()
 orchestrator = OpportunityOrchestrator()
 
 TICK_SECRET = os.getenv("TICK_SECRET", "")
-STALENESS_THRESHOLD_MINUTES = 20
+# How long without a completed tick before ingestion counts as stale.
+#
+# The heartbeat asks GitHub Actions for a tick every 5 minutes, but
+# scheduled workflow delivery there is explicitly best-effort: GitHub
+# delays and drops cron runs under load, and hour-long gaps are normal on
+# a */5 schedule. A 20-minute threshold therefore flagged healthy systems
+# as broken purely because the scheduler was late, which is the fastest
+# way to teach someone to ignore the alert. This is set to catch genuine
+# stoppages (the kind that went unnoticed for four days) rather than
+# ordinary scheduler jitter.
+STALENESS_THRESHOLD_MINUTES = float(os.getenv("STALENESS_THRESHOLD_MINUTES", "180"))
 
 async def background_scraping_job():
     logger.info("[24/7 DAEMON] Ingesting and qualifying pre-SEAP signals...")
@@ -139,7 +149,13 @@ async def system_tick(x_tick_secret: Optional[str] = Header(None)):
     signal (scrapers/orchestrator.py:run_tick)."""
     if not TICK_SECRET or x_tick_secret != TICK_SECRET:
         raise HTTPException(status_code=401, detail="unauthorized")
-    return await asyncio.wait_for(orchestrator.run_tick(), timeout=240)
+    # run_tick enforces its own soft deadline (TICK_DEADLINE_SECONDS) and
+    # records the tick before returning. This outer timeout is only a
+    # backstop for a hang below that layer, so it must stay comfortably
+    # above the soft deadline — if it fired first it would cancel the tick
+    # mid-write and leave the run unrecorded, which is the failure mode
+    # the soft deadline exists to prevent.
+    return await asyncio.wait_for(orchestrator.run_tick(), timeout=TICK_DEADLINE_SECONDS + 60)
 
 @app.get("/api/v1/system/status")
 async def system_status():

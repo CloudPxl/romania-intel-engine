@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import os
+import time
 from typing import List, Dict, Any
 
 import db
@@ -26,6 +27,13 @@ from matching_engine import TENANT_ORGANIZATIONS, TenantMatchingEngine
 from notifier import LeadAlertDispatcher
 
 logger = logging.getLogger("OpportunityOrchestrator")
+
+# Soft budget for one ingestion tick. Sits below the caller's hard timeout
+# in api.py so the tick can wind down and record itself rather than being
+# cancelled mid-flight. Render's free tier runs at 0.1 CPU, where PDF
+# parsing and several hundred DB round-trips are genuinely slow, so this
+# is treated as a routine condition rather than an error.
+TICK_DEADLINE_SECONDS = float(os.getenv("TICK_DEADLINE_SECONDS", "200"))
 
 class OpportunityOrchestrator:
     def __init__(self):
@@ -91,14 +99,29 @@ class OpportunityOrchestrator:
         except Exception as e:
             return scraper, None, e
 
-    async def run_tick(self) -> Dict[str, Any]:
+    async def run_tick(self, deadline_seconds: float = TICK_DEADLINE_SECONDS) -> Dict[str, Any]:
         """Streaming, per-signal pipeline for the free-tier scheduling
-        cutover (/api/v1/system/tick): unlike run_pipeline() above, only
-        scrapers whose own poll_interval_minutes has elapsed are run, results
-        are processed as each scraper finishes (asyncio.as_completed, not
-        gather-then-wait-for-all), and each genuinely new opportunity is
-        matched + alerted per tenant immediately rather than in a final
-        batch loop."""
+        cutover (/api/v1/system/tick): only scrapers whose own
+        poll_interval_minutes has elapsed are run, results are processed as
+        each scraper finishes (asyncio.as_completed, not gather-then-wait),
+        and each genuinely new opportunity is matched + alerted per tenant
+        immediately rather than in a final batch loop.
+
+        The tick enforces its own soft deadline and always records its
+        outcome. Previously the only limit was the caller's
+        asyncio.wait_for, which hard-cancelled the coroutine mid-flight:
+        db.finish_tick() then never ran, so the tick row kept
+        completed_at NULL, get_last_successful_tick() never advanced, and
+        /system/status reported is_stale forever even though ingestion was
+        working. Overrunning now degrades to a partial tick — whatever
+        finished is persisted and recorded, and the sources that did not
+        get their turn simply stay due for the next tick.
+        """
+        started = time.monotonic()
+
+        def remaining() -> float:
+            return deadline_seconds - (time.monotonic() - started)
+
         tick_id = await db.start_tick()
         due = []
         for scraper in self.scrapers:
@@ -108,38 +131,91 @@ class OpportunityOrchestrator:
             if await db.is_source_due(scraper.name, scraper.poll_interval_minutes):
                 due.append(scraper)
 
+        # Most time-sensitive sources first. On a cold database every source
+        # is due at once, and without ordering a daily 69-page PDF parse
+        # could consume the budget ahead of the 10-minute tender feed.
+        due.sort(key=lambda s: s.poll_interval_minutes)
+
         logger.info(f"⚡ [TICK] Running {len(due)}/{len(self.scrapers)} due scraper engines...")
 
         new_count = 0
         errors = 0
-        for coro in asyncio.as_completed([self._run_one_scraper(s) for s in due]):
-            scraper, signals, error = await coro
-            if error is not None:
-                errors += 1
-                logger.error(f"[Tick] Scraper failure for {scraper.name}: {error}")
-                await circuit_breaker.record_result(scraper.name, success=False, error=str(error), records=0,
-                                                     poll_interval_minutes=scraper.poll_interval_minutes)
-                continue
+        completed_sources = 0
+        truncated = False
 
-            await circuit_breaker.record_result(scraper.name, success=True, error=None, records=len(signals),
-                                                 poll_interval_minutes=scraper.poll_interval_minutes)
-
-            for sig in signals:
-                refined = IntelligenceRefineryEngine.refine_signal(sig)
-                try:
-                    is_new = await db.upsert_opportunity(refined)
-                except Exception as e:
+        tasks = [asyncio.create_task(self._run_one_scraper(s)) for s in due]
+        try:
+            for coro in asyncio.as_completed(tasks, timeout=max(1.0, remaining())):
+                scraper, signals, error = await coro
+                if error is not None:
                     errors += 1
-                    logger.error(f"[Tick] Failed to persist opportunity {refined.get('source_id')}: {e}")
+                    logger.error(f"[Tick] Scraper failure for {scraper.name}: {error}")
+                    await circuit_breaker.record_result(
+                        scraper.name, success=False, error=str(error), records=0,
+                        poll_interval_minutes=scraper.poll_interval_minutes,
+                    )
                     continue
-                if not is_new:
-                    continue
-                new_count += 1
-                for tenant_id in TENANT_ORGANIZATIONS:
-                    match = TenantMatchingEngine.evaluate_opportunity_for_tenant(refined, tenant_id)
-                    if match["is_match"]:
-                        await LeadAlertDispatcher.dispatch_lead_alert_to_tenant(refined, tenant_id, match)
 
-        await db.finish_tick(tick_id, len(due), new_count, errors)
-        logger.info(f"✅ [TICK] Complete. sources_run={len(due)} new_opportunities={new_count} errors={errors}")
-        return {"sources_run": len(due), "new_opportunities": new_count, "errors": errors}
+                await circuit_breaker.record_result(
+                    scraper.name, success=True, error=None, records=len(signals),
+                    poll_interval_minutes=scraper.poll_interval_minutes,
+                )
+                completed_sources += 1
+
+                for sig in signals:
+                    if remaining() <= 0:
+                        # A single source can return hundreds of signals;
+                        # persisting them is itself unbounded work, so the
+                        # deadline is enforced inside this loop too.
+                        truncated = True
+                        logger.warning(f"[Tick] Deadline reached while persisting {scraper.name}.")
+                        break
+
+                    refined = IntelligenceRefineryEngine.refine_signal(sig)
+                    try:
+                        is_new = await db.upsert_opportunity(refined)
+                    except Exception as e:
+                        errors += 1
+                        logger.error(f"[Tick] Failed to persist opportunity {refined.get('source_id')}: {e}")
+                        continue
+                    if not is_new:
+                        continue
+                    new_count += 1
+                    for tenant_id in TENANT_ORGANIZATIONS:
+                        match = TenantMatchingEngine.evaluate_opportunity_for_tenant(refined, tenant_id)
+                        if match["is_match"]:
+                            try:
+                                await LeadAlertDispatcher.dispatch_lead_alert_to_tenant(refined, tenant_id, match)
+                            except Exception as e:
+                                # A failing mail/Telegram transport must not
+                                # abort ingestion of the remaining signals.
+                                errors += 1
+                                logger.error(f"[Tick] Alert dispatch failed for {tenant_id}: {e}")
+
+                if truncated:
+                    break
+        except asyncio.TimeoutError:
+            truncated = True
+            logger.warning(
+                f"[Tick] Soft deadline of {deadline_seconds:.0f}s reached; "
+                f"{completed_sources}/{len(due)} sources processed. Remainder stays due."
+            )
+        finally:
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+        await db.finish_tick(tick_id, completed_sources, new_count, errors)
+        logger.info(
+            f"✅ [TICK] Complete. sources_run={completed_sources}/{len(due)} "
+            f"new_opportunities={new_count} errors={errors} truncated={truncated}"
+        )
+        return {
+            "sources_run": completed_sources,
+            "sources_due": len(due),
+            "new_opportunities": new_count,
+            "errors": errors,
+            "truncated": truncated,
+            "duration_seconds": round(time.monotonic() - started, 1),
+        }
