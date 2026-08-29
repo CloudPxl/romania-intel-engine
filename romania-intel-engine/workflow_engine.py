@@ -70,15 +70,38 @@ class ConcurrentWorkflowEngine:
         notes: Optional[str] = None,
         proposed_price: Optional[float] = None,
     ) -> Dict[str, Any]:
+        # Validate before mutating. Without this an unrecognised stage (a
+        # typo, or a renamed stage on the frontend) was written straight
+        # into the deal, silently dropping it out of every stage-filtered
+        # view with no error surfaced anywhere.
+        if new_stage not in PIPELINE_STAGES:
+            logger.warning(f"[Workflow] Rejected unknown stage '{new_stage}' for deal {deal_id}")
+            return {
+                "status": "error",
+                "message": f"Etapă necunoscută: '{new_stage}'",
+                "valid_stages": PIPELINE_STAGES,
+            }
+
+        if proposed_price is not None and proposed_price < 0:
+            return {"status": "error", "message": "Prețul propus nu poate fi negativ."}
+
         deals = CONCURRENT_DEAL_PIPELINE.get(tenant_id, [])
         for d in deals:
             if d.get("deal_id") == deal_id:
+                previous_stage = d.get("stage")
                 d["stage"] = new_stage
                 if notes:
                     d["notes"] = notes
                 if proposed_price is not None:
                     d["proposed_price"] = proposed_price
                 d["updated_at"] = datetime.now().isoformat()
-                logger.info(f"📈 Deal {deal_id} moved to stage: {new_stage}")
+                # Keep an audit trail: which stages a deal passed through
+                # and when is exactly what a post-mortem on a lost bid needs.
+                d.setdefault("stage_history", []).append({
+                    "from": previous_stage,
+                    "to": new_stage,
+                    "at": d["updated_at"],
+                })
+                logger.info(f"📈 Deal {deal_id} moved {previous_stage} -> {new_stage}")
                 return {"status": "success", "deal": d}
         return {"status": "error", "message": "Deal not found"}

@@ -18,33 +18,96 @@ ROMANIAN_STOPWORDS = {
     "si", "sau", "dar", "iar", "nu", "da", "tot", "toate", "acest", "aceasta", "proiect", "proiecte"
 }
 
+def _format_budget(lead: Dict[str, Any]) -> str:
+    """An undisclosed budget arrives as 0/None. Rendering that as
+    '0.00 Mil. RON' tells the user the contract is worth nothing, which is
+    a materially different claim from 'the authority did not publish it'."""
+    value = lead.get("financial_value_ron") or 0
+    if value <= 0:
+        return "buget nepublicat"
+    return f"{value / 1_000_000:.2f} Mil. RON"
+
+
 class ProcurementAICopilot:
     def __init__(self):
         self.api_key = OPENAI_API_KEY or XAI_API_KEY or GROQ_API_KEY or GEMINI_API_KEY or ""
 
     @staticmethod
     def generate_72h_macro_report(leads: List[Dict[str, Any]]) -> Dict[str, Any]:
-        total_val = sum(l.get("financial_value_ron", 0) for l in leads)
-        counties = list(set(l.get("county", "") for l in leads if l.get("county")))
-        categories = {}
-        for l in leads:
-            cat = l.get("category", "General")
-            categories[cat] = categories.get(cat, 0) + 1
+        """Aggregates the actual feed.
+
+        The takeaways here are derived from the leads passed in. They used
+        to be three fixed sentences asserting specific market movements
+        ("creștere a procedurilor pre-SEAP în Iași, Cluj, Timiș...") that
+        were printed verbatim no matter what the data showed — including
+        when the feed was empty.
+        """
+        from collections import Counter
+
+        published_values = [
+            l.get("financial_value_ron", 0) or 0
+            for l in leads
+            if (l.get("financial_value_ron") or 0) > 0
+        ]
+        county_counts = Counter(l.get("county") for l in leads if l.get("county"))
+        category_counts = Counter(l.get("category", "General") for l in leads)
+        stage_counts = Counter(l.get("procurement_stage", "unknown") for l in leads)
+
+        takeaways: List[str] = []
+        if not leads:
+            takeaways.append("Nu există semnale noi în fereastra analizată.")
+        else:
+            top_counties = county_counts.most_common(3)
+            if top_counties:
+                takeaways.append(
+                    "Concentrare geografică: "
+                    + ", ".join(f"{c} ({n} semnale)" for c, n in top_counties)
+                    + "."
+                )
+            top_cat, top_cat_n = category_counts.most_common(1)[0]
+            takeaways.append(
+                f"Domeniul dominant este '{top_cat}', cu {top_cat_n} din {len(leads)} semnale "
+                f"({top_cat_n / len(leads) * 100:.0f}%)."
+            )
+            pre_tender = sum(
+                n for stage, n in stage_counts.items()
+                if stage in ("pre_tender_approved_indicators", "pre_tender_documentation_review", "market_consultation")
+            )
+            if pre_tender:
+                takeaways.append(
+                    f"{pre_tender} semnale sunt în fază pre-licitație, unde specificațiile tehnice "
+                    "pot fi încă influențate."
+                )
+            undisclosed = len(leads) - len(published_values)
+            if undisclosed:
+                takeaways.append(
+                    f"{undisclosed} din {len(leads)} semnale nu au valoare estimată publicată — "
+                    "bugetul trebuie confirmat la autoritate."
+                )
 
         return {
-            "period": "Ultimele 72 de ore (Radar Achizitii Publice)",
+            "period": "Ultimele 72 de ore (Radar Achiziții Publice)",
             "telemetry": {
-                "active_pipeline_ron": total_val,
+                # Only sums figures the sources actually published, and says
+                # how many they cover, so the total is not mistaken for the
+                # full pipeline value.
+                "published_pipeline_ron": sum(published_values),
+                "signals_with_published_value": len(published_values),
                 "signals_processed": len(leads),
-                "top_active_counties": counties[:5],
-                "sector_breakdown": categories
+                "top_active_counties": [c for c, _ in county_counts.most_common(5)],
+                "sector_breakdown": dict(category_counts),
+                "stage_breakdown": dict(stage_counts),
             },
-            "executive_takeaways": [
-                "Crestere a procedurilor pre-SEAP in Iasi, Cluj, Timis si Bucuresti pe ITS, infrastructura spitaliceasca si energie verde.",
-                "Autoritatile contractante publica consultari de piata cu termen mediu de reactie de 14 zile conform Art. 139 Legea 98/2016.",
-                "Apelurile PNRR C6 si C7 au alocari bugetare active pentru digitalizare si eficienta energetica."
-            ],
-            "strategic_recommendation": "Formulati puncte de vedere tehnice in faza de consultare pentru a influenta specificatiile din caietul de sarcini."
+            "executive_takeaways": takeaways,
+            "strategic_recommendation": (
+                "Prioritizați semnalele în fază pre-licitație: în această etapă puteți influența "
+                "specificațiile tehnice, conform art. 139 din Legea nr. 98/2016 (consultarea pieței)."
+                if any(
+                    s in stage_counts
+                    for s in ("pre_tender_approved_indicators", "pre_tender_documentation_review", "market_consultation")
+                )
+                else "Analizați caietele de sarcini publicate și pregătiți documentația de calificare (DUAE)."
+            ),
         }
 
     async def answer_copilot_query(self, query: str, context_leads: List[Dict[str, Any]]) -> str:
@@ -98,19 +161,47 @@ class ProcurementAICopilot:
                     base_url, model_name = "https://api.groq.com/openai/v1", "llama-3.3-70b-versatile"
 
                 system_prompt = (
-                    "Ești consultantul AI senior de bidding și achiziții publice pentru platforma RO-INTEL România. "
-                    "Răspunzi natural, profesionist, scurt și direct la întrebările utilizatorului. "
-                    "Cunoști legislația achizițiilor publice (Legea 98/2016, Legea 101/2016, HG 395/2016). "
-                    "Dacă utilizatorul pune o întrebare generală sau conversațională, răspunde-i conversațional și plăcut, nu repeta template-uri."
+                    "Ești consultant senior în achiziții publice din România, în cadrul platformei RO-INTEL. "
+                    "Vorbești cu profesioniști care depun oferte pe bani publici; răspunsurile tale au consecințe "
+                    "juridice și financiare reale.\n\n"
+                    "CADRU LEGAL pe care îl stăpânești:\n"
+                    "- Legea nr. 98/2016 (achiziții publice clasice): art. 2 alin. (2) principii; art. 7 praguri "
+                    "și tipuri de proceduri; art. 139 consultarea pieței; art. 160-161 solicitări de clarificări; "
+                    "art. 164/165/167 motive de excludere; art. 193 DUAE; art. 210 preț neobișnuit de scăzut.\n"
+                    "- Legea nr. 99/2016 (achiziții sectoriale: utilități, energie, transport, apă).\n"
+                    "- Legea nr. 101/2016 (remedii și căi de atac): termene de contestare la CNSC, "
+                    "termenul de așteptare (standstill).\n"
+                    "- HG nr. 395/2016 (norme de aplicare), Legea nr. 544/2001 (informații publice), "
+                    "Legea nr. 10/1995 (calitatea în construcții), Legea nr. 346/2004 (IMM).\n\n"
+                    "REGULI DE RĂSPUNS — obligatorii:\n"
+                    "1. Când citezi legislația, indică articolul exact. Dacă nu ești sigur de numărul articolului "
+                    "sau de forma în vigoare, spune explicit acest lucru și recomandă verificarea în Monitorul Oficial. "
+                    "Nu inventa niciodată numere de articole, termene sau praguri.\n"
+                    "2. Termenele și pragurile valorice se modifică prin ordine ANAP. Prezintă-le ca orientative și "
+                    "recomandă confirmarea pentru procedura concretă.\n"
+                    "3. Folosește exclusiv datele din dosarele furnizate în context. Dacă informația cerută nu se "
+                    "află acolo, spune că nu o ai — nu completa din memorie și nu estima valori.\n"
+                    "4. Când o valoare estimată lipsește din dosar, tratează asta ca 'nepublicată', nu ca zero.\n"
+                    "5. Nu oferi consultanță care ar încălca principiile concurenței sau care ar sugera "
+                    "influențarea nelegală a unei proceduri. Poți explica participarea legitimă la consultarea "
+                    "pieței (art. 139), care este permisă și publică.\n"
+                    "6. Ești asistent, nu avocat: pentru contestații și litigii, recomandă consultarea unui "
+                    "specialist înainte de depunere.\n\n"
+                    "STIL: profesionist, direct, în limba română, fără formule inutile. La întrebări "
+                    "conversaționale răspunde firesc și scurt."
                 )
 
                 dossiers_summary = json.dumps([{
                     "titlu": l.get("project_title"),
                     "beneficiar": l.get("entity_name"),
                     "judet": l.get("county"),
-                    "buget_ron": l.get("financial_value_ron"),
+                    # Distinguish "not published" from zero so the model
+                    # cannot report an undisclosed budget as a 0 RON contract.
+                    "buget_ron": l.get("financial_value_ron") if (l.get("financial_value_ron") or 0) > 0 else "nepublicat",
                     "data": l.get("published_date"),
-                    "termen": l.get("action_deadline")
+                    "termen": l.get("action_deadline") or "nepublicat",
+                    "stadiu": l.get("procurement_stage"),
+                    "sursa": l.get("source_url"),
                 } for l in context_leads[:6]], ensure_ascii=False)
 
                 messages = [
@@ -132,33 +223,43 @@ class ProcurementAICopilot:
         # 4. Filtered Contextual Matching (No false substring collisions)
         meaningful_words = [w for w in tokens if len(w) > 3 and w not in ROMANIAN_STOPWORDS]
 
-        # Match County
-        matched_county = [l for l in context_leads if l.get("county", "").lower() in tokens]
+        # Match County — folded so "Iași" in the feed matches "iasi" typed
+        # by the user (and vice versa); a plain .lower() missed both ways.
+        from text_utils import fold, normalize_county
+
+        folded_tokens = {fold(t) for t in tokens}
+        matched_county = [
+            l for l in context_leads
+            if normalize_county(l.get("county", "")) in folded_tokens
+        ]
         if matched_county:
             top_c = matched_county[:3]
             c_name = top_c[0].get("county")
-            summary = "\n".join([f"• {l.get('project_title')} ({l.get('entity_name')} — {l.get('financial_value_ron', 0)/1000000:.1f} Mil. RON)" for l in top_c])
+            summary = "\n".join([
+                f"• {l.get('project_title')} ({l.get('entity_name')} — {_format_budget(l)})"
+                for l in top_c
+            ])
             return f"În județul {c_name} avem următoarele dosare calificate în radar:\n\n{summary}\n\nPuteți deschide oricare dosar pentru analiza completă a cerințelor tehnice."
 
         # Match Project or Entity using whole-word matches
         if meaningful_words:
             matched_leads = []
+            folded_words = [fold(w) for w in meaningful_words]
             for l in context_leads:
-                text_corpus = f"{l.get('project_title', '')} {l.get('entity_name', '')} {l.get('sub_category', '')}".lower()
-                corpus_words = set(re.findall(r"\w+", text_corpus))
-                score = sum(1 for w in meaningful_words if w in corpus_words)
+                text_corpus = f"{l.get('project_title', '')} {l.get('entity_name', '')} {l.get('sub_category', '')}"
+                corpus_words = set(re.findall(r"[a-z0-9]+", fold(text_corpus)))
+                score = sum(1 for w in folded_words if w in corpus_words)
                 if score > 0:
                     matched_leads.append((score, l))
             
             matched_leads.sort(key=lambda x: x[0], reverse=True)
             if matched_leads:
                 top_lead = matched_leads[0][1]
-                val_mil = top_lead.get("financial_value_ron", 0) / 1000000
                 return (
                     f"Dosarul identificat pentru căutarea dumneavoastră este '{top_lead.get('project_title')}':\n\n"
                     f"- Autoritate: {top_lead.get('entity_name')} ({top_lead.get('county')})\n"
-                    f"- Buget estimat: {val_mil:.2f} Mil. RON\n"
-                    f"- Publicat la: {top_lead.get('published_date', 'N/A')} | Termen reacție: {top_lead.get('action_deadline', 'Nespecificat')}\n\n"
+                    f"- Buget estimat: {_format_budget(top_lead)}\n"
+                    f"- Publicat la: {top_lead.get('published_date') or 'N/A'} | Termen reacție: {top_lead.get('action_deadline') or 'nepublicat'}\n\n"
                     f"Recomandare: {top_lead.get('sales_pitch_angle', 'Formulați o solicitare de clarificări pe specificațiile tehnice.')}"
                 )
 

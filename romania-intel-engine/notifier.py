@@ -133,7 +133,9 @@ body {{ font-family: -apple-system, sans-serif; background-color: #060b13; color
         (api.py:background_scraping_job / daemon.py) while it still runs
         alongside the new per-tenant streaming pipeline. New code should use
         dispatch_lead_alert_to_tenant instead."""
-        if lead.get("opportunity_score", 0) >= 9.0:
+        from ai_refinery import HIGH_PRIORITY_SCORE
+
+        if lead.get("opportunity_score", 0) >= HIGH_PRIORITY_SCORE:
             await cls.dispatch_email_alert(lead, recipient_emails)
 
     @classmethod

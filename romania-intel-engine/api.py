@@ -45,8 +45,10 @@ async def background_scraping_job():
         leads = result.get("leads", [])
         newsletter_store.save(leads)
         for lead in leads:
-            if lead.get("opportunity_score", 0) >= 9.2:
-                await LeadAlertDispatcher.dispatch_high_priority_alert(lead)
+            # dispatch_high_priority_alert applies HIGH_PRIORITY_SCORE
+            # itself; the duplicate literal threshold that used to sit here
+            # was stricter than the one inside it and silently overrode it.
+            await LeadAlertDispatcher.dispatch_high_priority_alert(lead)
         global_cache.invalidate()
         logger.info("[24/7 DAEMON] Pipeline synchronized.")
     except Exception as e:
