@@ -229,14 +229,26 @@ async def _load_feed() -> Dict[str, Any]:
     Keeps NewsletterStore's {updated_at, count, leads} shape either way —
     routers/analysis.py and the frontend both read `leads` off this.
     """
+    db_failed = False
     try:
         rows = await db.get_recent_opportunities(limit=500)
     except Exception as e:
         logger.error(f"[Feed] Postgres read failed, falling back to file cache: {e}")
         rows = []
+        db_failed = True
 
     if not rows:
-        return newsletter_store.load()
+        fallback = newsletter_store.load()
+        # An empty feed caused by an unreachable database is not the same
+        # thing as a market with no opportunities, and the caller cannot
+        # tell them apart from the payload alone. Say which it is, so the
+        # UI can show a warning instead of an empty state that looks like
+        # a real (and alarming) result.
+        if db_failed:
+            fallback["degraded"] = True
+            fallback["detail"] = "database unavailable — showing last cached snapshot"
+        fallback.setdefault("source", "file-cache")
+        return fallback
 
     leads = [_row_to_lead(row) for row in rows]
 
