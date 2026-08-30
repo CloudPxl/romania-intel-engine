@@ -154,6 +154,18 @@ class SecurityGuard:
                 # hardcoded guess — pinning the wrong family here is
                 # exactly what reproduces "alg value is not allowed"
                 # against a correctly-signed token.
+                #
+                # A prior direct push to main (a30451a, 88b8119) worked
+                # around that same error with
+                # options={"verify_signature": False, "verify_aud": False}
+                # — accepting any token regardless of who signed it or
+                # what it claims. That was live in production and
+                # confirmed exploitable (a forged token with a fake `sub`
+                # and no valid signature returned real tenant data over
+                # the public API) before this replaced it. Never reduce
+                # this path back to that: the fix for "wrong algorithm
+                # rejected" is verifying against the *correct* key and
+                # algorithm, not skipping verification.
                 signing_key = _get_jwks_client().get_signing_key_from_jwt(token)
                 claims = jwt.decode(
                     token,
