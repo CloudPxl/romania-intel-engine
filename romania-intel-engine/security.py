@@ -70,14 +70,16 @@ class SecurityGuard:
         fixed fake user/role for every request regardless of what (if
         anything) was actually sent — i.e. no request was ever rejected.
 
-        Not yet wired onto any route via Depends(): the frontend
-        (lib/api.ts) does not currently attach an Authorization header to
-        any request (verified — it only calls supabase.auth.getSession()
-        client-side and posts the resulting profile once via
-        syncBackendAuth, never as a bearer token on later calls). Enforcing
-        this on a live route today would 401 every real user until that
-        frontend change ships, so it's implemented and ready but left
-        opt-in per route rather than force-enabled globally.
+        Scope note — this authenticates, it does not authorize per tenant.
+        It proves the caller holds a valid, unexpired Supabase session for
+        *some* account; it cannot prove that account is entitled to the
+        {tenant_id} in the path, because no user->tenant mapping is stored
+        anywhere yet (TENANT_ORGANIZATIONS in matching_engine.py is a
+        hardcoded in-process dict, and desks are per-browser localStorage).
+        A logged-in user can therefore still address another tenant's id.
+        Closing that gap needs a real tenant-membership table; naming the
+        function `verify_tenant_authorization` does not by itself make it
+        one, so the limitation is stated here rather than implied away.
         """
         auth_header = request.headers.get("Authorization", "")
         if not auth_header.startswith("Bearer "):
@@ -113,3 +115,34 @@ class SecurityGuard:
             "email": claims.get("email"),
             "role": user_metadata.get("role") or claims.get("role", "authenticated"),
         }
+
+
+# --- FastAPI dependencies -------------------------------------------------
+#
+# `Depends(require_auth)` is the form routes actually consume. Kept as
+# module-level functions rather than staticmethods because FastAPI inspects
+# the callable's signature to build the dependency, and a bare `Request`
+# parameter is what makes it resolve without polluting the route signature.
+
+
+def require_auth(request: Request) -> Dict:
+    """Hard gate: a valid Supabase bearer token or the request does not
+    proceed. 401 on a missing/forged/expired token, 503 if the server has
+    no SUPABASE_JWT_SECRET configured (fail closed — an unconfigured
+    server must not silently accept everything, which is exactly the
+    behaviour the previous stub had)."""
+    return SecurityGuard.verify_tenant_authorization(request)
+
+
+def optional_auth(request: Request) -> Optional[Dict]:
+    """Soft gate for routes that are public but behave differently for a
+    signed-in caller. Returns the claims when a valid token is present and
+    None otherwise — it never raises, so an anonymous visitor still gets a
+    response. Used to derive entitlement server-side instead of trusting a
+    client-supplied flag."""
+    if not request.headers.get("Authorization", "").startswith("Bearer "):
+        return None
+    try:
+        return SecurityGuard.verify_tenant_authorization(request)
+    except HTTPException:
+        return None

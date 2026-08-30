@@ -1,9 +1,10 @@
 from typing import Optional
 
-from fastapi import APIRouter
+from fastapi import APIRouter, Depends
 from pydantic import BaseModel
 
 from addons.business_eligibility import BusinessEligibilityEngine
+from security import require_auth
 
 router = APIRouter(prefix="/api/v1/business-eligibility", tags=["Eligibility"])
 
@@ -26,7 +27,7 @@ class BusinessScanRequest(BaseModel):
 
 
 @router.post("/evaluate")
-def evaluate_company_eligibility(payload: BusinessScanRequest):
+def evaluate_company_eligibility(payload: BusinessScanRequest, _user: dict = Depends(require_auth)):
     return BusinessEligibilityEngine.evaluate_company(
         company_name=payload.company_name,
         cui_fiscal=payload.cui_fiscal,

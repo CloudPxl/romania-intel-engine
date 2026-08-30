@@ -2,7 +2,9 @@ from collections import defaultdict
 from datetime import date
 from typing import List, Optional
 
-from fastapi import APIRouter, Query
+from fastapi import APIRouter, Depends, Query
+
+from security import optional_auth
 
 router = APIRouter(prefix="/api/v1/analysis", tags=["Market Analysis"])
 
@@ -17,6 +19,7 @@ async def get_market_trends(
     max_value_ron: Optional[float] = Query(None, ge=0),
     limit: int = Query(500, ge=1, le=2000),
     include_ai_report: bool = Query(False, description="Also synthesize an LLM strategic report over this exact slice (adds LLM latency)"),
+    user: Optional[dict] = Depends(optional_auth),
 ):
     """Live market-trends aggregation over a customizable slice of the feed.
 
@@ -115,7 +118,12 @@ async def get_market_trends(
             {"funding_source": fs, "count": v["count"], "value_ron": v["value_ron"]}
             for fs, v in sorted(by_funding_source.items(), key=lambda kv: kv[1]["value_ron"], reverse=True)
         ],
-        "top_opportunities": top_opportunities[:10],
+        # Named projects are the product; the aggregates above are the
+        # public shop window. An anonymous caller gets the totals and the
+        # breakdowns (enough for the landing page's live stat tiles) but
+        # not the identified opportunities themselves.
+        "top_opportunities": top_opportunities[:10] if user else [],
+        "is_authenticated": bool(user),
     }
 
     if store.get("degraded"):
@@ -123,6 +131,10 @@ async def get_market_trends(
         response["detail"] = store.get("detail")
 
     if include_ai_report:
-        response["ai_strategic_report"] = await ProcurementAICopilot.generate_custom_market_report(leads, active_filters)
+        if not user:
+            response["ai_strategic_report"] = None
+            response["ai_report_locked"] = True
+        else:
+            response["ai_strategic_report"] = await ProcurementAICopilot.generate_custom_market_report(leads, active_filters)
 
     return response

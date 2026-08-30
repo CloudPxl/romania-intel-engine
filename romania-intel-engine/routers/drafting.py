@@ -1,13 +1,14 @@
 import io
 from typing import Literal, Optional
 
-from fastapi import APIRouter
+from fastapi import APIRouter, Depends
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 from addons.dossier_generator import TechnicalDossierGenerator
 from addons.foia_generator import LegalClarificationGenerator
 from addons.docx_export import render_docx
+from security import require_auth
 
 router = APIRouter(prefix="/api/v1/addons", tags=["Document Drafting"])
 
@@ -54,7 +55,7 @@ class ClarificationLetterRequest(BaseModel):
 
 
 @router.post("/generate-technical-proposal")
-async def generate_technical_proposal(payload: TechnicalProposalRequest):
+async def generate_technical_proposal(payload: TechnicalProposalRequest, _user: dict = Depends(require_auth)):
     draft = TechnicalDossierGenerator.generate_draft(
         project_title=payload.project_title,
         authority_name=payload.authority_name,
@@ -72,7 +73,7 @@ async def generate_technical_proposal(payload: TechnicalProposalRequest):
 
 
 @router.post("/generate-clarification")
-async def generate_clarification_letter(payload: ClarificationLetterRequest):
+async def generate_clarification_letter(payload: ClarificationLetterRequest, _user: dict = Depends(require_auth)):
     draft = LegalClarificationGenerator.generate_clarification_letter(
         authority_name=payload.authority_name,
         project_title=payload.project_title,
@@ -97,7 +98,7 @@ def _filename_slug(text: str, fallback: str) -> str:
 
 
 @router.post("/export-dossier-docx")
-async def export_dossier_docx(payload: TechnicalProposalRequest):
+async def export_dossier_docx(payload: TechnicalProposalRequest, _user: dict = Depends(require_auth)):
     draft = TechnicalDossierGenerator.generate_draft(
         project_title=payload.project_title,
         authority_name=payload.authority_name,
@@ -133,7 +134,7 @@ async def export_dossier_docx(payload: TechnicalProposalRequest):
 
 
 @router.post("/export-clarification-docx")
-async def export_clarification_docx(payload: ClarificationLetterRequest):
+async def export_clarification_docx(payload: ClarificationLetterRequest, _user: dict = Depends(require_auth)):
     draft = LegalClarificationGenerator.generate_clarification_letter(
         authority_name=payload.authority_name,
         project_title=payload.project_title,

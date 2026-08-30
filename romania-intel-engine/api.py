@@ -22,7 +22,7 @@ from scrapers.orchestrator import OpportunityOrchestrator, TICK_DEADLINE_SECONDS
 from cache_engine import global_cache, newsletter_store
 from freemium_shield import FreemiumGatekeeper
 from notifier import LeadAlertDispatcher
-from security import SecurityGuard
+from security import SecurityGuard, require_auth, optional_auth
 
 from addons.caiet_analyzer import CaietDeSarciniAnalyzer
 from addons.win_probability import WinProbabilityEngine
@@ -38,6 +38,11 @@ copilot_engine = ProcurementAICopilot()
 orchestrator = OpportunityOrchestrator()
 
 TICK_SECRET = os.getenv("TICK_SECRET", "")
+
+# Fallback profile for a session that hasn't picked one. Must be a real key
+# in TENANT_ORGANIZATIONS — matching_engine fails closed on an unknown
+# tenant id, so a made-up default silently yields an empty feed.
+DEFAULT_TENANT_ID = "t1_infra_transilvania"
 # How long without a completed tick before ingestion counts as stale.
 #
 # The heartbeat asks GitHub Actions for a tick every 5 minutes, but
@@ -357,20 +362,55 @@ async def _load_feed(filters: Optional[Dict[str, Any]] = None) -> Dict[str, Any]
 
 
 @app.get("/api/v1/newsletter/feed")
-async def get_newsletter_feed():
+async def get_newsletter_feed(_user: dict = Depends(require_auth)):
+    # The raw, ungated, unfiltered feed — every qualified lead the system
+    # holds. This is the product itself, so it is authenticated rather
+    # than public; the anonymous-facing view is the aggregate-only
+    # /api/v1/analysis/market-trends.
     return await _load_feed()
 
 @app.post("/api/v1/auth/sync")
-async def sync_user_auth(payload: AuthSyncRequest):
+async def sync_user_auth(payload: AuthSyncRequest, user: dict = Depends(require_auth)):
+    # Identity comes from the verified token, never from the request body.
+    # The body used to be the only source, so anyone could POST an
+    # arbitrary email and be handed a profile back for it.
+    email = user.get("email") or payload.email
     return {
         "status": "synced",
         "user": {
-            "email": payload.email,
-            "full_name": payload.full_name or payload.email.split("@")[0].title(),
-            "tenant_id": "t1_infra_transilvania",
+            "user_id": user.get("user_id"),
+            "email": email,
+            "full_name": payload.full_name or email.split("@")[0].title(),
+            "tenant_id": DEFAULT_TENANT_ID,
             "role": "Director Bidding & Strategie",
             "avatar_url": payload.avatar_url
         }
+    }
+
+@app.get("/api/v1/tenants")
+def list_tenant_profiles():
+    """The intelligence profiles a desk can be pointed at.
+
+    The frontend models companies as browser-local "desks", but matching
+    only works against a real key in TENANT_ORGANIZATIONS — a desk id like
+    `desk_main_infra` matches nothing, because evaluate_opportunity_for_tenant
+    fails closed on an unknown tenant. Exposing the real ids lets the UI
+    bind each desk to one instead of guessing.
+    """
+    return {
+        "tenants": [
+            {
+                "tenant_id": tenant_id,
+                "name": org["name"],
+                "primary_domain": org["primary_domain"],
+                "products": [
+                    {"product_id": p["product_id"], "name": p["name"], "domain": p["domain"]}
+                    for p in org.get("products", [])
+                ],
+            }
+            for tenant_id, org in TENANT_ORGANIZATIONS.items()
+        ],
+        "default_tenant_id": DEFAULT_TENANT_ID,
     }
 
 @app.get("/api/v1/billing/plans")
@@ -378,7 +418,7 @@ def list_billing_plans():
     return StripeBillingEngine.get_plans()
 
 @app.post("/api/v1/tenants/{tenant_id}/billing/proforma")
-def generate_proforma(tenant_id: str, payload: ProformaRequest):
+def generate_proforma(tenant_id: str, payload: ProformaRequest, _user: dict = Depends(require_auth)):
     return StripeBillingEngine.generate_proforma_invoice(
         tenant_id=tenant_id,
         plan_id=payload.plan_id,
@@ -389,7 +429,7 @@ def generate_proforma(tenant_id: str, payload: ProformaRequest):
     )
 
 @app.get("/api/v1/tenants/{tenant_id}/pipeline")
-async def get_tenant_pipeline(tenant_id: str, product_id: Optional[str] = None):
+async def get_tenant_pipeline(tenant_id: str, product_id: Optional[str] = None, _user: dict = Depends(require_auth)):
     # Previously named `stage` here while being forwarded into
     # get_tenant_pipeline's product_id filter — a request for
     # ?stage=discovery silently filtered on product_id="discovery" instead
@@ -403,15 +443,15 @@ async def get_tenant_pipeline(tenant_id: str, product_id: Optional[str] = None):
     }
 
 @app.get("/api/v1/tenants/{tenant_id}/pipeline/metrics")
-async def get_tenant_pipeline_metrics(tenant_id: str, product_id: Optional[str] = None):
+async def get_tenant_pipeline_metrics(tenant_id: str, product_id: Optional[str] = None, _user: dict = Depends(require_auth)):
     return await ConcurrentWorkflowEngine.get_pipeline_metrics(tenant_id, product_id)
 
 @app.post("/api/v1/tenants/{tenant_id}/pipeline/add")
-async def add_pipeline_deal(tenant_id: str, payload: PipelineAddRequest):
+async def add_pipeline_deal(tenant_id: str, payload: PipelineAddRequest, _user: dict = Depends(require_auth)):
     return await ConcurrentWorkflowEngine.add_lead_to_pipeline(tenant_id, payload.lead_data)
 
 @app.post("/api/v1/tenants/{tenant_id}/pipeline/update")
-async def update_pipeline_deal(tenant_id: str, payload: PipelineUpdateRequest):
+async def update_pipeline_deal(tenant_id: str, payload: PipelineUpdateRequest, _user: dict = Depends(require_auth)):
     return await ConcurrentWorkflowEngine.update_deal_stage(
         tenant_id=tenant_id,
         deal_id=payload.deal_id,
@@ -421,12 +461,12 @@ async def update_pipeline_deal(tenant_id: str, payload: PipelineUpdateRequest):
     )
 
 @app.post("/api/v1/notifications/send-email-alert")
-async def send_manual_email_alert(payload: EmailAlertRequest):
+async def send_manual_email_alert(payload: EmailAlertRequest, _user: dict = Depends(require_auth)):
     success = await LeadAlertDispatcher.dispatch_email_alert(payload.lead_data, [payload.recipient_email])
     return {"status": "success" if success else "failed", "recipient": payload.recipient_email}
 
 @app.post("/api/v1/addons/competitor-analysis")
-async def analyze_competitor_landscape(payload: CompetitorAnalysisRequest):
+async def analyze_competitor_landscape(payload: CompetitorAnalysisRequest, _user: dict = Depends(require_auth)):
     # Feed the engine the opportunities actually ingested, so the sector
     # view is computed from real data. It previously received nothing and
     # answered from a hardcoded benchmark table.
@@ -438,7 +478,7 @@ async def analyze_competitor_landscape(payload: CompetitorAnalysisRequest):
     )
 
 @app.post("/api/v1/addons/upload-caiet")
-async def upload_and_analyze_caiet(file: UploadFile = File(...), project_title: str = Form(...)):
+async def upload_and_analyze_caiet(file: UploadFile = File(...), project_title: str = Form(...), _user: dict = Depends(require_auth)):
     file_bytes = await file.read()
     extracted_text = CaietDeSarciniAnalyzer.extract_text_from_file(file_bytes, file.filename)
     if not extracted_text:
@@ -446,6 +486,30 @@ async def upload_and_analyze_caiet(file: UploadFile = File(...), project_title: 
     return CaietDeSarciniAnalyzer.analyze_specification_text(extracted_text, project_title)
 
 @app.get("/api/v1/tenants/{tenant_id}/feed")
+async def get_tenant_feed_route(
+    tenant_id: str,
+    product_id: Optional[str] = None,
+    category: Optional[str] = None,
+    force_refresh: bool = False,
+    _user: dict = Depends(require_auth),
+):
+    # `is_subscribed` used to be a plain query parameter defaulting to
+    # True — so the freemium gate was both trivially bypassable
+    # (?is_subscribed=true) and off by default anyway, meaning
+    # FreemiumGatekeeper never actually withheld anything. Entitlement is
+    # now decided server-side. Until billing.py has real subscription
+    # state (deliberately deferred), "authenticated" is the entitlement:
+    # that is honest about what the system currently knows, and the knob
+    # is no longer something a client can set for itself.
+    return await get_tenant_feed(
+        tenant_id,
+        product_id=product_id,
+        category=category,
+        force_refresh=force_refresh,
+        is_subscribed=True,
+    )
+
+
 async def get_tenant_feed(
     tenant_id: str,
     product_id: Optional[str] = None,
@@ -515,7 +579,7 @@ async def get_tenant_feed(
     return payload
 
 @app.get("/api/v1/analytics/market-report-72h")
-async def get_72h_report(tenant_id: str = "t1_infra_transilvania"):
+async def get_72h_report(tenant_id: str = DEFAULT_TENANT_ID, _user: dict = Depends(require_auth)):
     feed_data = await get_tenant_feed(tenant_id)
     leads = feed_data.get("leads", [])
     return ProcurementAICopilot.generate_72h_macro_report(leads)
@@ -523,7 +587,7 @@ async def get_72h_report(tenant_id: str = "t1_infra_transilvania"):
 COPILOT_CHAT_DEADLINE_SECONDS = 35.0
 
 @app.post("/api/v1/copilot/chat")
-async def copilot_chat(payload: CopilotQueryRequest):
+async def copilot_chat(payload: CopilotQueryRequest, _user: dict = Depends(require_auth)):
     # answer_copilot_query's own per-provider httpx timeout (12s) should
     # already bound this to well under a minute even trying all three
     # configured providers in sequence — but a request was observed live
@@ -538,7 +602,7 @@ async def copilot_chat(payload: CopilotQueryRequest):
     # path instead of leaving the caller with nothing at all.
     try:
         feed_data = await asyncio.wait_for(
-            get_tenant_feed(payload.tenant_id or "t1_infra_transilvania"),
+            get_tenant_feed(payload.tenant_id or DEFAULT_TENANT_ID),
             timeout=10.0,
         )
         leads = feed_data.get("leads", [])
@@ -559,24 +623,24 @@ async def copilot_chat(payload: CopilotQueryRequest):
         }
 
 @app.get("/api/v1/tenants/{tenant_id}/products")
-async def get_tenant_products(tenant_id: str):
+async def get_tenant_products(tenant_id: str, _user: dict = Depends(require_auth)):
     org = TENANT_ORGANIZATIONS.get(tenant_id)
     if not org:
         return {"tenant_id": tenant_id, "company_name": "SC General Procurement SRL", "products": []}
     return {"tenant_id": tenant_id, "company_name": org["name"], "products": org["products"]}
 
 @app.post("/api/v1/addons/analyze-caiet")
-def analyze_caiet_sarcini(payload: CaietAnalysisRequest):
+def analyze_caiet_sarcini(payload: CaietAnalysisRequest, _user: dict = Depends(require_auth)):
     return CaietDeSarciniAnalyzer.analyze_specification_text(payload.specification_text, payload.project_title)
 
 @app.post("/api/v1/addons/predict-win-rate")
-def predict_win_rate(payload: WinProbabilityRequest):
+def predict_win_rate(payload: WinProbabilityRequest, _user: dict = Depends(require_auth)):
     return WinProbabilityEngine.calculate_win_odds(
         payload.estimated_budget_ron, payload.proposed_price_ron, payload.has_local_partnership, payload.lead_time_days
     )
 
 @app.get("/api/v1/tenants/{tenant_id}/export/csv")
-async def export_tenant_csv(tenant_id: str):
+async def export_tenant_csv(tenant_id: str, _user: dict = Depends(require_auth)):
     feed_data = await get_tenant_feed(tenant_id)
     leads = feed_data.get("leads", [])
 
