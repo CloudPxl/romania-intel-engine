@@ -92,12 +92,14 @@ class SecurityGuard:
             logger.error("[SecurityGuard] SUPABASE_JWT_SECRET not configured — cannot verify tokens.")
             raise HTTPException(status_code=503, detail="Autentificarea nu este configurată pe server.")
 
-        try:
-            # TEMPORARY BYPASS: Supabase upgraded to RS256/Asymmetric keys.
+       try:
+            # TEMPORARY BYPASS: Allow RS256 tokens and bypass signature check
             claims = jwt.decode(
                 token,
-                options={"verify_signature": False, "verify_aud": False}
+                options={"verify_signature": False, "verify_aud": False},
+                algorithms=["HS256", "RS256"]
             )
+           
         except jwt.ExpiredSignatureError:
             raise HTTPException(status_code=401, detail="Token expirat. Reautentificați-vă.")
         except jwt.PyJWTError as e:
