@@ -15,6 +15,10 @@ DATABASE_URL = os.getenv("DATABASE_URL", "")
 _pool: Optional[asyncpg.Pool] = None
 _warned_no_db = False
 _pool_lock = asyncio.Lock()
+# Why the last pool build failed, for /api/v1/system/status. Without this
+# the operator sees an empty feed and has no way to tell an unreachable
+# database from a market with nothing in it.
+_last_pool_error: Optional[str] = None
 
 # Supabase closes server-side connections that have been idle for a while.
 # asyncpg does not know that has happened and will hand the dead connection
@@ -41,7 +45,7 @@ async def get_pool() -> Optional[asyncpg.Pool]:
     """Lazily creates a small connection pool against Supabase. Returns None
     (rather than raising) if DATABASE_URL isn't set, so callers can degrade
     gracefully instead of crashing the whole process."""
-    global _pool, _warned_no_db
+    global _pool, _warned_no_db, _last_pool_error
     if _pool is not None:
         return _pool
     if not DATABASE_URL:
@@ -73,10 +77,48 @@ async def get_pool() -> Optional[asyncpg.Pool]:
             logger.info("[DB] Transaction pooler detected — prepared statement cache disabled.")
         try:
             _pool = await asyncpg.create_pool(DATABASE_URL, **kwargs)
+            _last_pool_error = None
         except Exception as e:
-            logger.error(f"[DB] Failed to create connection pool: {e}")
+            _last_pool_error = _redact(f"{type(e).__name__}: {e}")
+            logger.error(f"[DB] Failed to create connection pool: {_last_pool_error}")
             return None
     return _pool
+
+
+def _redact(text: str) -> str:
+    """Strips credentials out of a connection error before it can be
+    returned over HTTP — asyncpg happily echoes the DSN in some parse
+    errors, and the DSN carries the database password."""
+    import re
+    return re.sub(r"(?i)(postgres(?:ql)?://)[^\s'\"]*", r"\1<redacted>", text)
+
+
+async def connectivity() -> Dict[str, Any]:
+    """Whether persistence is configured AND actually reachable right now.
+
+    Every read in this module returns None/empty for both "no database"
+    and "database says nothing", which is correct for degrading gracefully
+    but leaves an operator unable to tell an outage from an empty market —
+    the exact ambiguity that made a silently-unconfigured deploy look like
+    a working site with no opportunities in it. This answers the question
+    directly, and is cheap enough to run on the status endpoint.
+    """
+    if not DATABASE_URL:
+        return {"configured": False, "reachable": False, "detail": "DATABASE_URL is not set"}
+    pool = await get_pool()
+    if pool is None:
+        return {"configured": True, "reachable": False, "detail": _last_pool_error or "connection pool unavailable"}
+    try:
+        async with pool.acquire(timeout=POOL_ACQUIRE_TIMEOUT) as conn:
+            await conn.execute("SELECT 1")
+        return {"configured": True, "reachable": True, "detail": None}
+    except Exception as e:
+        return {"configured": True, "reachable": False, "detail": _redact(f"{type(e).__name__}: {e}")}
+
+
+async def is_available() -> bool:
+    """Fast check used on the read path: is there a usable pool at all?"""
+    return await get_pool() is not None
 
 
 def _is_transaction_pooler(url: str) -> bool:

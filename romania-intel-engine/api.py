@@ -227,10 +227,23 @@ async def system_status():
             "detail": "database unavailable",
         }
     minutes_since = (datetime.now(timezone.utc) - last).total_seconds() / 60 if last else None
+
+    # `last` is None both when no tick has ever succeeded and when there is
+    # no reachable database to have recorded one — and the heartbeat's
+    # freshness check fails identically either way, which is how an
+    # unconfigured DATABASE_URL presented as "ingestion is stale" with no
+    # hint that the real problem was one layer down. Report which it is.
+    database = await db.connectivity()
     return {
         "last_tick_completed_at": last.isoformat() if last else None,
         "minutes_since_last_tick": minutes_since,
         "is_stale": minutes_since is None or minutes_since > STALENESS_THRESHOLD_MINUTES,
+        "database": database,
+        **(
+            {"detail": "no tick recorded because persistence is unavailable — check DATABASE_URL"}
+            if last is None and not database["reachable"]
+            else {}
+        ),
     }
 
 def _row_to_lead(row: Dict[str, Any]) -> Dict[str, Any]:
@@ -329,6 +342,13 @@ async def _load_feed(filters: Optional[Dict[str, Any]] = None) -> Dict[str, Any]
     db_failed = False
     try:
         rows = await db.get_recent_opportunities(limit=limit, **filters)
+        # An unset or unreachable DATABASE_URL is not an exception here —
+        # db.py degrades by returning nothing — so without this check a
+        # total persistence outage reached the UI as a perfectly calm
+        # "0 opportunities", indistinguishable from a quiet market. That
+        # is precisely the distinction `degraded` exists to carry.
+        if not rows and not await db.is_available():
+            db_failed = True
     except Exception as e:
         logger.error(f"[Feed] Postgres read failed, falling back to file cache: {e}")
         rows = []
