@@ -3,6 +3,7 @@ import os
 import logging
 from contextlib import asynccontextmanager
 from datetime import date, datetime, timezone
+from decimal import Decimal
 from typing import Any, Dict, List, Optional
 
 import asyncpg
@@ -414,3 +415,171 @@ async def get_last_successful_tick() -> Optional[datetime]:
             "SELECT completed_at FROM system_ticks WHERE errors = 0 AND completed_at IS NOT NULL ORDER BY completed_at DESC LIMIT 1"
         )
     return row["completed_at"] if row else None
+
+
+# ---------------------------------------------------------------------------
+# Deal pipeline persistence (pipeline_schema.sql). workflow_engine.py falls
+# back to its in-memory dict whenever a function here returns the "not
+# available" sentinel (None for reads, False for the write) — either because
+# DATABASE_URL isn't set, or because pipeline_schema.sql hasn't been applied
+# yet (asyncpg.exceptions.UndefinedTableError), so a fresh deploy degrades to
+# ephemeral tracking instead of 500ing.
+# ---------------------------------------------------------------------------
+
+def _deal_row_to_dict(row: Any) -> Dict[str, Any]:
+    d = dict(row)
+    for key in ("estimated_value_ron", "target_margin_pct", "proposed_price"):
+        if isinstance(d.get(key), Decimal):
+            d[key] = float(d[key])
+    for key in ("created_at", "updated_at"):
+        if isinstance(d.get(key), datetime):
+            d[key] = d[key].isoformat()
+    return d
+
+
+async def _fetch_stage_history(conn, deal_ids: List[str]) -> Dict[str, List[Dict[str, Any]]]:
+    if not deal_ids:
+        return {}
+    rows = await conn.fetch(
+        "SELECT deal_id, from_stage, to_stage, changed_at FROM deal_stage_history "
+        "WHERE deal_id = ANY($1::text[]) ORDER BY changed_at ASC",
+        deal_ids,
+    )
+    history: Dict[str, List[Dict[str, Any]]] = {}
+    for row in rows:
+        at = row["changed_at"]
+        history.setdefault(row["deal_id"], []).append({
+            "from": row["from_stage"],
+            "to": row["to_stage"],
+            "at": at.isoformat() if isinstance(at, datetime) else at,
+        })
+    return history
+
+
+async def get_deals_for_tenant(tenant_id: str, product_id: Optional[str] = None) -> Optional[List[Dict[str, Any]]]:
+    """None means "couldn't read from Postgres" (caller should fall back to
+    the in-memory dict) — a real, empty pipeline is returned as []."""
+    async with with_connection() as conn:
+        if conn is None:
+            return None
+        try:
+            if product_id:
+                rows = await conn.fetch(
+                    "SELECT * FROM product_bidding_deals WHERE tenant_id = $1 AND product_id = $2 ORDER BY created_at",
+                    tenant_id, product_id,
+                )
+            else:
+                rows = await conn.fetch(
+                    "SELECT * FROM product_bidding_deals WHERE tenant_id = $1 ORDER BY created_at",
+                    tenant_id,
+                )
+            deals = [_deal_row_to_dict(r) for r in rows]
+            history = await _fetch_stage_history(conn, [d["deal_id"] for d in deals])
+            for d in deals:
+                d["stage_history"] = history.get(d["deal_id"], [])
+            return deals
+        except asyncpg.exceptions.UndefinedTableError:
+            logger.warning("[DB] product_bidding_deals not found — run pipeline_schema.sql. Falling back to in-memory pipeline.")
+            return None
+
+
+async def add_deal(deal: Dict[str, Any]) -> bool:
+    async with with_connection() as conn:
+        if conn is None:
+            return False
+        try:
+            await conn.execute(
+                """
+                INSERT INTO product_bidding_deals (
+                    deal_id, tenant_id, product_id, opportunity_id, project_title, stage,
+                    assigned_to, target_margin_pct, estimated_value_ron, notes, created_at
+                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+                """,
+                deal["deal_id"], deal["tenant_id"], deal.get("product_id"), deal.get("opportunity_id"),
+                deal.get("project_title", ""), deal.get("stage", "discovery"), deal.get("assigned_to"),
+                deal.get("target_margin_pct"), deal.get("estimated_value_ron") or 0.0, deal.get("notes", ""),
+                _parse_timestamp(deal.get("created_at")),
+            )
+            return True
+        except asyncpg.exceptions.UndefinedTableError:
+            logger.warning("[DB] product_bidding_deals not found — run pipeline_schema.sql. Falling back to in-memory pipeline.")
+            return False
+
+
+async def get_deal(tenant_id: str, deal_id: str) -> Optional[Dict[str, Any]]:
+    async with with_connection() as conn:
+        if conn is None:
+            return None
+        try:
+            row = await conn.fetchrow(
+                "SELECT * FROM product_bidding_deals WHERE tenant_id = $1 AND deal_id = $2",
+                tenant_id, deal_id,
+            )
+        except asyncpg.exceptions.UndefinedTableError:
+            return None
+    if row is None:
+        return None
+    deal = _deal_row_to_dict(row)
+    async with with_connection() as conn:
+        if conn is not None:
+            deal["stage_history"] = (await _fetch_stage_history(conn, [deal_id])).get(deal_id, [])
+    return deal
+
+
+async def update_deal(
+    tenant_id: str,
+    deal_id: str,
+    new_stage: str,
+    notes: Optional[str],
+    proposed_price: Optional[float],
+    updated_at: str,
+) -> Optional[Dict[str, Any]]:
+    async with with_connection() as conn:
+        if conn is None:
+            return None
+        try:
+            row = await conn.fetchrow(
+                """
+                UPDATE product_bidding_deals
+                SET stage = $3,
+                    notes = COALESCE($4, notes),
+                    proposed_price = COALESCE($5, proposed_price),
+                    updated_at = $6
+                WHERE tenant_id = $1 AND deal_id = $2
+                RETURNING *
+                """,
+                tenant_id, deal_id, new_stage, notes, proposed_price, _parse_timestamp(updated_at),
+            )
+        except asyncpg.exceptions.UndefinedTableError:
+            logger.warning("[DB] product_bidding_deals not found — run pipeline_schema.sql. Falling back to in-memory pipeline.")
+            return None
+    if row is None:
+        return None
+    return _deal_row_to_dict(row)
+
+
+async def record_stage_transition(deal_id: str, from_stage: Optional[str], to_stage: str, at: str) -> None:
+    async with with_connection() as conn:
+        if conn is None:
+            return
+        try:
+            await conn.execute(
+                "INSERT INTO deal_stage_history (deal_id, from_stage, to_stage, changed_at) VALUES ($1, $2, $3, $4)",
+                deal_id, from_stage, to_stage, _parse_timestamp(at),
+            )
+        except asyncpg.exceptions.UndefinedTableError:
+            pass
+
+
+def _parse_timestamp(value: Any) -> Optional[datetime]:
+    """Deal timestamps are generated as datetime.now().isoformat() strings
+    in workflow_engine.py; asyncpg needs real datetime objects for
+    TIMESTAMPTZ columns, same reasoning as _parse_date() above."""
+    if not value:
+        return None
+    if isinstance(value, datetime):
+        return value
+    try:
+        return datetime.fromisoformat(str(value))
+    except ValueError:
+        return None

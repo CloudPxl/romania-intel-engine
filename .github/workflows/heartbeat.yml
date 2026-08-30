@@ -19,16 +19,26 @@ jobs:
     steps:
       - name: Trigger ingestion tick
         run: |
-          # Retries matter more than they look: GitHub delivers this
-          # schedule only a few times a day in practice, so a single
-          # transient failure (a Render deploy in progress, a free-tier
-          # dyno waking from sleep) costs hours of ingestion. --retry-all-errors
-          # also covers connection resets, which plain --retry ignores.
+          # /api/v1/system/tick now dispatches the ingestion run as a
+          # background task and acks immediately (see api.py:system_tick) —
+          # it used to block until the whole run finished, which was
+          # observed live taking anywhere from ~1s (nothing due) to 373s
+          # (real scraping work), well past this call's old 280s
+          # --max-time. curl's own retries on that timeout re-POSTed here,
+          # starting a *second* full tick on top of the still-running
+          # first one — competing for the same rate-limited scrapers and
+          # DB connections and making both slower, which is why failures
+          # kept compounding rather than clearing on retry. A fast ack
+          # needs none of that headroom; --max-time is now just a backstop
+          # against a genuinely wedged connection, and retries here now
+          # only matter for real transient network failures (a Render
+          # deploy in progress, a free-tier dyno waking from sleep), not
+          # for waiting out a slow tick.
           curl -sfL --post301 --post302 --post303 -X POST "${{ secrets.RENDER_APP_URL }}/api/v1/system/tick" \
             -A "$BROWSER_UA" \
             -H "X-Tick-Secret: ${{ secrets.TICK_SECRET }}" \
             --retry 5 --retry-delay 15 --retry-all-errors --connect-timeout 30 \
-            --max-time 280
+            --max-time 30
 
       - name: Verify freshness
         run: |

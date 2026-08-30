@@ -11,6 +11,15 @@ services:
         value: 8080
       - key: DATABASE_URL
         sync: false
+      # Project Settings -> API -> JWT Settings -> JWT Secret in the
+      # Supabase dashboard. NOT the anon/publishable key (NEXT_PUBLIC_
+      # SUPABASE_ANON_KEY) — that key is itself a JWT signed by this
+      # secret, so it can't also serve as the verification key for other
+      # tokens. Required for security.py:SecurityGuard.verify_tenant_
+      # authorization to validate a user's session token; unset, that
+      # function returns 503 rather than silently accepting every request.
+      - key: SUPABASE_JWT_SECRET
+        sync: false
       - key: GROK_API_KEY
         sync: false
       # Groq and Gemini both have genuinely free tiers (console.groq.com,

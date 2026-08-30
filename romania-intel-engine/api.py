@@ -9,7 +9,7 @@ from datetime import date, datetime, timezone
 from decimal import Decimal
 from fastapi import FastAPI, HTTPException, Depends, Request, Response, UploadFile, File, Form, Header
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, JSONResponse
 from pydantic import BaseModel, EmailStr
 from typing import Any, Dict, List, Optional
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -22,6 +22,7 @@ from scrapers.orchestrator import OpportunityOrchestrator, TICK_DEADLINE_SECONDS
 from cache_engine import global_cache, newsletter_store
 from freemium_shield import FreemiumGatekeeper
 from notifier import LeadAlertDispatcher
+from security import SecurityGuard
 
 from addons.caiet_analyzer import CaietDeSarciniAnalyzer
 from addons.win_probability import WinProbabilityEngine
@@ -90,6 +91,22 @@ app.include_router(eligibility.router)
 app.include_router(drafting.router)
 app.include_router(analysis.router)
 
+
+@app.middleware("http")
+async def rate_limit_middleware(request: Request, call_next):
+    # Global, IP-based — safe to enable unconditionally since it requires
+    # no client-side change (unlike SecurityGuard.verify_tenant_authorization,
+    # which needs the frontend to start sending a bearer token before it can
+    # be enforced on any route without breaking it). Exempted from itself:
+    # the GitHub Actions heartbeat and health checks should never be able to
+    # lock themselves out.
+    if request.url.path not in ("/health", "/api/v1/system/status"):
+        try:
+            SecurityGuard.enforce_rate_limit(request)
+        except HTTPException as e:
+            return JSONResponse(status_code=e.status_code, content={"detail": e.detail})
+    return await call_next(request)
+
 class AuthSyncRequest(BaseModel):
     email: EmailStr
     full_name: Optional[str] = None
@@ -142,22 +159,51 @@ def root_index():
 def health_check():
     return {"status": "healthy", "cache": "online"}
 
+_tick_lock = asyncio.Lock()
+
+
+async def _run_tick_locked() -> None:
+    async with _tick_lock:
+        try:
+            # run_tick enforces its own soft deadline (TICK_DEADLINE_SECONDS)
+            # and records the tick before returning. This outer timeout is
+            # only a backstop for a hang below that layer, so it must stay
+            # comfortably above the soft deadline — if it fired first it
+            # would cancel the tick mid-write and leave the run unrecorded,
+            # which is the failure mode the soft deadline exists to prevent.
+            result = await asyncio.wait_for(orchestrator.run_tick(), timeout=TICK_DEADLINE_SECONDS + 60)
+            logger.info(f"[Tick] Background run complete: {result}")
+        except Exception as e:
+            logger.error(f"[Tick] Background run failed: {e}")
+
+
 @app.post("/api/v1/system/tick")
 async def system_tick(x_tick_secret: Optional[str] = Header(None)):
     """Driven by the free GitHub Actions heartbeat (and any external pinger)
     instead of relying on the Render dyno's own uptime — see
     .github/workflows/heartbeat.yml. Runs only scrapers whose own polling
     interval has elapsed (db.is_source_due) and streams matches/alerts per
-    signal (scrapers/orchestrator.py:run_tick)."""
+    signal (scrapers/orchestrator.py:run_tick).
+
+    Dispatches the tick as a background task and returns immediately
+    rather than awaiting it, instead of the previous behavior of blocking
+    for the full run (observed live: 100-370+ seconds). The heartbeat's
+    curl call has to declare some finite timeout, and a genuinely slow
+    tick blowing past it doesn't cancel the run server-side (it keeps
+    executing) — it just makes curl retry, which re-POSTs here and starts
+    a *second* full tick on top of the first, competing for the same
+    rate-limited scrapers and DB connections and making both slower. The
+    lock below ensures a retry (or an overlapping cron firing) gets an
+    instant "already running" instead of piling on a concurrent run.
+    """
     if not TICK_SECRET or x_tick_secret != TICK_SECRET:
         raise HTTPException(status_code=401, detail="unauthorized")
-    # run_tick enforces its own soft deadline (TICK_DEADLINE_SECONDS) and
-    # records the tick before returning. This outer timeout is only a
-    # backstop for a hang below that layer, so it must stay comfortably
-    # above the soft deadline — if it fired first it would cancel the tick
-    # mid-write and leave the run unrecorded, which is the failure mode
-    # the soft deadline exists to prevent.
-    return await asyncio.wait_for(orchestrator.run_tick(), timeout=TICK_DEADLINE_SECONDS + 60)
+
+    if _tick_lock.locked():
+        return {"status": "already_running", "detail": "A tick is already in progress; this request was a no-op."}
+
+    asyncio.create_task(_run_tick_locked())
+    return {"status": "started", "detail": "Tick dispatched in the background."}
 
 @app.get("/api/v1/system/status")
 async def system_status():
@@ -343,24 +389,30 @@ def generate_proforma(tenant_id: str, payload: ProformaRequest):
     )
 
 @app.get("/api/v1/tenants/{tenant_id}/pipeline")
-def get_tenant_pipeline(tenant_id: str, stage: Optional[str] = None):
+async def get_tenant_pipeline(tenant_id: str, product_id: Optional[str] = None):
+    # Previously named `stage` here while being forwarded into
+    # get_tenant_pipeline's product_id filter — a request for
+    # ?stage=discovery silently filtered on product_id="discovery" instead
+    # (always empty) rather than actually filtering by stage. Renamed to
+    # match what the parameter actually does; the frontend never sent this
+    # param, so nothing depended on the old (wrong) name.
     return {
         "tenant_id": tenant_id,
         "stages": ConcurrentWorkflowEngine.get_stages(),
-        "deals": ConcurrentWorkflowEngine.get_tenant_pipeline(tenant_id, stage)
+        "deals": await ConcurrentWorkflowEngine.get_tenant_pipeline(tenant_id, product_id)
     }
 
 @app.get("/api/v1/tenants/{tenant_id}/pipeline/metrics")
-def get_tenant_pipeline_metrics(tenant_id: str, product_id: Optional[str] = None):
-    return ConcurrentWorkflowEngine.get_pipeline_metrics(tenant_id, product_id)
+async def get_tenant_pipeline_metrics(tenant_id: str, product_id: Optional[str] = None):
+    return await ConcurrentWorkflowEngine.get_pipeline_metrics(tenant_id, product_id)
 
 @app.post("/api/v1/tenants/{tenant_id}/pipeline/add")
-def add_pipeline_deal(tenant_id: str, payload: PipelineAddRequest):
-    return ConcurrentWorkflowEngine.add_lead_to_pipeline(tenant_id, payload.lead_data)
+async def add_pipeline_deal(tenant_id: str, payload: PipelineAddRequest):
+    return await ConcurrentWorkflowEngine.add_lead_to_pipeline(tenant_id, payload.lead_data)
 
 @app.post("/api/v1/tenants/{tenant_id}/pipeline/update")
-def update_pipeline_deal(tenant_id: str, payload: PipelineUpdateRequest):
-    return ConcurrentWorkflowEngine.update_deal_stage(
+async def update_pipeline_deal(tenant_id: str, payload: PipelineUpdateRequest):
+    return await ConcurrentWorkflowEngine.update_deal_stage(
         tenant_id=tenant_id,
         deal_id=payload.deal_id,
         new_stage=payload.new_stage,
