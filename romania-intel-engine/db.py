@@ -1,5 +1,6 @@
 import asyncio
 import os
+import time
 import logging
 from contextlib import asynccontextmanager
 from datetime import date, datetime, timezone
@@ -19,6 +20,20 @@ _pool_lock = asyncio.Lock()
 # the operator sees an empty feed and has no way to tell an unreachable
 # database from a market with nothing in it.
 _last_pool_error: Optional[str] = None
+
+# A failed pool build leaves _pool as None, so without a cooldown the very
+# next caller tries to connect again — meaning one connection attempt per
+# HTTP request, per scraper, per status check, indefinitely. Against
+# rejected credentials that is a sustained authentication-failure storm,
+# and Supabase's pooler answers it by tripping a circuit breaker
+# ("ECIRCUITBREAKER: too many authentication failures, new connections are
+# temporarily blocked") — which then keeps the database unreachable even
+# once the password is corrected, because the storm never pauses long
+# enough for the breaker to reset. Observed in production. Short enough to
+# recover within a few seconds of a real fix; long enough that a bad
+# credential costs ~2 attempts a minute instead of thousands.
+POOL_RETRY_COOLDOWN_SECONDS = 30.0
+_pool_retry_after = 0.0
 
 # Supabase closes server-side connections that have been idle for a while.
 # asyncpg does not know that has happened and will hand the dead connection
@@ -45,7 +60,7 @@ async def get_pool() -> Optional[asyncpg.Pool]:
     """Lazily creates a small connection pool against Supabase. Returns None
     (rather than raising) if DATABASE_URL isn't set, so callers can degrade
     gracefully instead of crashing the whole process."""
-    global _pool, _warned_no_db, _last_pool_error
+    global _pool, _warned_no_db, _last_pool_error, _pool_retry_after
     if _pool is not None:
         return _pool
     if not DATABASE_URL:
@@ -53,11 +68,17 @@ async def get_pool() -> Optional[asyncpg.Pool]:
             logger.warning("[DB] DATABASE_URL not set — persistence disabled.")
             _warned_no_db = True
         return None
+    if time.monotonic() < _pool_retry_after:
+        return None
     async with _pool_lock:
         # Re-check inside the lock: several concurrent scrapers hit this on
         # a cold start and would otherwise each build their own pool.
         if _pool is not None:
             return _pool
+        # Re-check the cooldown too — callers that queued on the lock while
+        # another one was failing must not each fire their own attempt.
+        if time.monotonic() < _pool_retry_after:
+            return None
         kwargs: Dict[str, Any] = {
             "min_size": 1,
             "max_size": 5,
@@ -78,9 +99,14 @@ async def get_pool() -> Optional[asyncpg.Pool]:
         try:
             _pool = await asyncpg.create_pool(DATABASE_URL, **kwargs)
             _last_pool_error = None
+            _pool_retry_after = 0.0
         except Exception as e:
             _last_pool_error = _redact(f"{type(e).__name__}: {e}")
-            logger.error(f"[DB] Failed to create connection pool: {_last_pool_error}")
+            _pool_retry_after = time.monotonic() + POOL_RETRY_COOLDOWN_SECONDS
+            logger.error(
+                f"[DB] Failed to create connection pool ({_last_pool_error}); "
+                f"backing off {POOL_RETRY_COOLDOWN_SECONDS:.0f}s before retrying."
+            )
             return None
     return _pool
 
@@ -105,6 +131,13 @@ async def connectivity() -> Dict[str, Any]:
     """
     if not DATABASE_URL:
         return {"configured": False, "reachable": False, "detail": "DATABASE_URL is not set"}
+    if time.monotonic() < _pool_retry_after and _pool is None:
+        retry_in = round(_pool_retry_after - time.monotonic())
+        return {
+            "configured": True,
+            "reachable": False,
+            "detail": f"{_last_pool_error or 'connection failed'} (backing off, retrying in ~{retry_in}s)",
+        }
     pool = await get_pool()
     if pool is None:
         return {"configured": True, "reachable": False, "detail": _last_pool_error or "connection pool unavailable"}
@@ -129,7 +162,12 @@ def _is_transaction_pooler(url: str) -> bool:
 
 
 async def _reset_pool() -> None:
-    global _pool
+    global _pool, _pool_retry_after
+    # Clearing the cooldown is deliberate: this path means we *had* a
+    # working pool whose connection went stale, which is a different
+    # failure from credentials being refused, and deserves one immediate
+    # rebuild. If that rebuild also fails, get_pool() arms a fresh cooldown.
+    _pool_retry_after = 0.0
     async with _pool_lock:
         if _pool is not None:
             try:
