@@ -4,6 +4,8 @@ import logging
 from typing import Dict, Optional, Tuple
 
 import jwt
+from jwt import PyJWKClient
+from jwt.exceptions import PyJWKClientConnectionError, PyJWKClientError, PyJWKSetError
 from fastapi import Request, HTTPException
 
 logger = logging.getLogger("SecurityGuard")
@@ -21,14 +23,46 @@ RATE_LIMIT_WINDOW = 60
 CLEANUP_INTERVAL_SECONDS = 300
 _last_cleanup_at = 0.0
 
-# Supabase JWTs are signed with the project's JWT Secret (Project Settings
-# -> API -> JWT Settings in the Supabase dashboard) — a distinct, private
-# value, NOT the anon/publishable key. The anon key is itself a JWT (signed
-# BY that secret), so it cannot also serve as the HMAC key to verify other
-# tokens; a JWT's own string value never doubles as the secret used to sign
-# it or its siblings. Configure the real secret as SUPABASE_JWT_SECRET.
+# Supabase rolled this project onto asymmetric JWT signing keys (verified
+# live against this project's own JWKS endpoint below — its two active
+# keys are both ES256/EC, not RS256; the algorithm actually in use is read
+# from each key itself rather than assumed, since Supabase lets a project
+# pick either an EC or RSA key pair and guessing wrong reproduces exactly
+# the "alg value is not allowed" failure this replaces). New sessions are
+# therefore verified against Supabase's public signing keys — nothing
+# secret is needed for them, so this is not a credential to protect.
+#
+# SUPABASE_JWT_SECRET (the legacy shared HS256 secret, from Project
+# Settings -> API -> JWT Settings in the Supabase dashboard) is kept only
+# as a fallback for a token minted in the short window before the project
+# switched — Supabase access tokens are short-lived (default ~1h), so any
+# still-valid HS256 token naturally ages out on its own; this just avoids
+# forcing an immediate re-login for whoever was signed in at the moment of
+# the switch. It is read from the token's own `alg` header, never assumed.
+SUPABASE_URL = os.getenv("SUPABASE_URL", "https://upzyczsfizenlogkfvsa.supabase.co").rstrip("/")
+SUPABASE_JWKS_URL = f"{SUPABASE_URL}/auth/v1/.well-known/jwks.json"
 SUPABASE_JWT_SECRET = os.getenv("SUPABASE_JWT_SECRET", "")
 SUPABASE_JWT_AUDIENCE = "authenticated"
+
+# Built once per process, not per request: PyJWKClient caches the fetched
+# keyset for `lifespan` seconds (below) and the individual keys by `kid`,
+# so re-verifying a token a moment later costs no network round trip to
+# Supabase. Constructing a fresh client per call would defeat that cache
+# and put Supabase's JWKS endpoint on the hot path of every authenticated
+# request — this mirrors db.py's lazy, module-level connection pool.
+_jwks_client: Optional[PyJWKClient] = None
+
+
+def _get_jwks_client() -> PyJWKClient:
+    global _jwks_client
+    if _jwks_client is None:
+        _jwks_client = PyJWKClient(
+            SUPABASE_JWKS_URL,
+            cache_keys=True,
+            cache_jwk_set=True,
+            lifespan=300,
+        )
+    return _jwks_client
 
 
 class SecurityGuard:
@@ -88,19 +122,58 @@ class SecurityGuard:
         if not token:
             raise HTTPException(status_code=401, detail="Token de autentificare gol.")
 
-        if not SUPABASE_JWT_SECRET:
-            logger.error("[SecurityGuard] SUPABASE_JWT_SECRET not configured — cannot verify tokens.")
-            raise HTTPException(status_code=503, detail="Autentificarea nu este configurată pe server.")
+        try:
+            # The header alone decides the path — it is unsigned data at
+            # this point, so nothing here has been trusted yet. It only
+            # picks which key material to verify the signature against;
+            # jwt.decode() below still does the actual cryptographic check
+            # and is what would raise on a forged or tampered token.
+            unverified_alg = jwt.get_unverified_header(token).get("alg")
+        except jwt.PyJWTError as e:
+            raise HTTPException(status_code=401, detail="Token de autentificare malformat.") from e
 
         try:
-            claims = jwt.decode(
-                token,
-                SUPABASE_JWT_SECRET,
-                algorithms=["HS256"],
-                audience=SUPABASE_JWT_AUDIENCE,
-            )
+            if unverified_alg == "HS256":
+                # Legacy path — see the SUPABASE_JWT_SECRET comment above.
+                if not SUPABASE_JWT_SECRET:
+                    raise HTTPException(
+                        status_code=401,
+                        detail="Token semnat cu un algoritm expirat. Reautentificați-vă.",
+                    )
+                claims = jwt.decode(
+                    token,
+                    SUPABASE_JWT_SECRET,
+                    algorithms=["HS256"],
+                    audience=SUPABASE_JWT_AUDIENCE,
+                )
+            else:
+                # Current path: verify against Supabase's own public
+                # signing keys. algorithms=[signing_key.algorithm_name]
+                # uses whatever algorithm that specific key actually
+                # declares (this project's are ES256) instead of a
+                # hardcoded guess — pinning the wrong family here is
+                # exactly what reproduces "alg value is not allowed"
+                # against a correctly-signed token.
+                signing_key = _get_jwks_client().get_signing_key_from_jwt(token)
+                claims = jwt.decode(
+                    token,
+                    signing_key.key,
+                    algorithms=[signing_key.algorithm_name],
+                    audience=SUPABASE_JWT_AUDIENCE,
+                )
         except jwt.ExpiredSignatureError:
             raise HTTPException(status_code=401, detail="Token expirat. Reautentificați-vă.")
+        except PyJWKClientConnectionError as e:
+            # Supabase's JWKS endpoint itself is unreachable — a server/
+            # upstream problem, not evidence the caller's token is bad.
+            logger.error(f"[SecurityGuard] Could not reach Supabase JWKS endpoint: {e}")
+            raise HTTPException(status_code=503, detail="Serviciul de autentificare este temporar indisponibil.")
+        except (PyJWKClientError, PyJWKSetError) as e:
+            # Keyset fetched fine but no key matches this token's `kid` —
+            # a forged token, one from a different Supabase project, or a
+            # signing key that has since been rotated out.
+            logger.warning(f"[SecurityGuard] No matching signing key for token: {e}")
+            raise HTTPException(status_code=401, detail="Token de autentificare invalid.")
         except jwt.PyJWTError as e:
             logger.warning(f"[SecurityGuard] JWT verification failed: {e}")
             raise HTTPException(status_code=401, detail="Token de autentificare invalid.")
@@ -127,10 +200,11 @@ class SecurityGuard:
 
 def require_auth(request: Request) -> Dict:
     """Hard gate: a valid Supabase bearer token or the request does not
-    proceed. 401 on a missing/forged/expired token, 503 if the server has
-    no SUPABASE_JWT_SECRET configured (fail closed — an unconfigured
-    server must not silently accept everything, which is exactly the
-    behaviour the previous stub had)."""
+    proceed. 401 on a missing/forged/expired token or one signed by a key
+    this project doesn't recognise; 503 only if Supabase's own JWKS
+    endpoint is unreachable. Fails closed either way — an unconfigured or
+    unreachable auth backend must not silently accept everything, which is
+    exactly the behaviour the previous stub had."""
     return SecurityGuard.verify_tenant_authorization(request)
 
 

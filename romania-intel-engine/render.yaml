@@ -11,13 +11,24 @@ services:
         value: 8080
       - key: DATABASE_URL
         sync: false
-      # Project Settings -> API -> JWT Settings -> JWT Secret in the
-      # Supabase dashboard. NOT the anon/publishable key (NEXT_PUBLIC_
-      # SUPABASE_ANON_KEY) — that key is itself a JWT signed by this
-      # secret, so it can't also serve as the verification key for other
-      # tokens. Required for security.py:SecurityGuard.verify_tenant_
-      # authorization to validate a user's session token; unset, that
-      # function returns 503 rather than silently accepting every request.
+      # The project's public base URL — security.py derives the JWKS
+      # endpoint from it (.../auth/v1/.well-known/jwks.json) to verify
+      # session tokens against Supabase's own asymmetric signing keys.
+      # Not a secret (the same value is already public in the frontend's
+      # NEXT_PUBLIC_SUPABASE_URL); listed with a value so it doesn't need
+      # a manual dashboard step, unlike the sync:false secrets below.
+      - key: SUPABASE_URL
+        value: https://upzyczsfizenlogkfvsa.supabase.co
+      # Legacy fallback only — Project Settings -> API -> JWT Settings ->
+      # JWT Secret in the Supabase dashboard. NOT the anon/publishable key
+      # (NEXT_PUBLIC_SUPABASE_ANON_KEY), which is itself a JWT and can't
+      # double as another token's verification key. The project has since
+      # moved to asymmetric signing keys (verified: its JWKS advertises
+      # ES256, not the RS256 some guides assume), so this is read only
+      # when a presented token's own header still says HS256 — a session
+      # minted in the short window before the switch, which ages out on
+      # its own since Supabase access tokens are short-lived. Safe to
+      # leave unset once no such token can still be valid.
       - key: SUPABASE_JWT_SECRET
         sync: false
       - key: GROK_API_KEY
