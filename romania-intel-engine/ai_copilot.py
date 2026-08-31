@@ -434,7 +434,7 @@ class ProcurementAICopilot:
             )
 
         return (
-            f"Am înțeles solicitarea dumneavoastră legată de achiziții publice. "
-            f"Vă pot asista cu detalii despre dosarele pre-SEAP active, verificarea clauzelor din caiete de sarcini sau generarea de adrese oficiale. "
-            f"Puteți specifica județul, domeniul sau denumirea autorității contractante pentru detalii exacte."
+            "Am înțeles solicitarea dumneavoastră legată de achiziții publice. "
+            "Vă pot asista cu detalii despre dosarele pre-SEAP active, verificarea clauzelor din caiete de sarcini sau generarea de adrese oficiale. "
+            "Puteți specifica județul, domeniul sau denumirea autorității contractante pentru detalii exacte."
         )

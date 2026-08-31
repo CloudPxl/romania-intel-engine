@@ -193,6 +193,19 @@ class _BaseDirectAcqScraper(BaseScraper):
             self.logger.error(f"[{self.name}] fetch_market_consultations failed: {e}")
             raise
 
+        # This records that a sync happened and the highest id it saw. It is
+        # deliberately NOT read back to resume from (procurement_notices.
+        # get_ingest_state has no callers): verified live against
+        # GetDirectAcquisitionList, this endpoint returns items in no order
+        # at all — neither by id nor by publication date. A single page came
+        # back 2019-04-08, 04-04, 04-02, 03-27, 03-22, then 04-10, with
+        # uniqueIdentificationCode jumping the same way. So "stop paginating
+        # once we reach an id we already have" would skip notices that sit
+        # after an already-seen one, silently losing tenders — much worse
+        # than the re-fetching it would save. Dedup is handled where it
+        # actually works, by the UPSERT on (notice_id, notice_type).
+        # Resuming incrementally needs a server-side sort or date filter
+        # this endpoint has not been confirmed to support, not a checkpoint.
         if max_id_seen is not None:
             try:
                 await procurement_notices.update_ingest_state(self.NOTICE_TYPE, datetime.now(timezone.utc), max_id_seen)

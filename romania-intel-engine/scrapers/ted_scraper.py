@@ -4,9 +4,11 @@ infrastructure/defence/health/energy procurement naming Romania as buyer
 country — the tenders that legally must publish on TED (above the EU's
 Article 4 thresholds, ~€5.5M for works) before or alongside SEAP.
 
-Placed at the top level of `scrapers/` (not `scrapers/matrix/`), same as
-`elicitatie_scraper.py`: TED is a single national-relevance cross-border
-feed, not a per-institution matrix entry.
+Placed at the top level of `scrapers/` (not `scrapers/matrix/`): TED is a
+single national-relevance cross-border feed, not a per-institution matrix
+entry. (`elicitatie_scraper.py` is a comparable single national feed but
+does live under `scrapers/matrix/` — don't read its placement as the
+precedent for this one.)
 
 Everything below was verified against production on 2026-08-31 with real
 httpx requests — nothing here is inferred from the spec's description

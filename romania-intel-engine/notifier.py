@@ -97,7 +97,6 @@ class LeadAlertDispatcher:
         source = lead.get("source_type", "Pre-SEAP")
         sub_cat = lead.get("sub_category", lead.get("category", "General"))
         deadline = lead.get("action_deadline", "Nespecificat")
-        pub_date = lead.get("published_date", "2026-08-25")
         summary = lead.get("executive_summary", "")
         pitch = lead.get("sales_pitch_angle", "")
         source_url = lead.get("source_url", "https://ro-intel.xyz")

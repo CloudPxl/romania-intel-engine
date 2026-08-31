@@ -16,7 +16,7 @@ within one page, so both are folded here.
 
 import re
 import unicodedata
-from typing import Iterable, List, Set
+from typing import Iterable, List
 
 # Explicit map first: NFKD alone does not decompose the legacy cedilla
 # forms consistently across platforms, and Romanian â/î both fold to
@@ -42,14 +42,6 @@ def fold(text: str) -> str:
     folded = unicodedata.normalize("NFKD", folded)
     folded = "".join(ch for ch in folded if not unicodedata.combining(ch))
     return folded.lower()
-
-
-def tokenize(text: str) -> List[str]:
-    return _WORD_RE.findall(fold(text))
-
-
-def token_set(text: str) -> Set[str]:
-    return set(tokenize(text))
 
 
 def contains_term(text: str, term: str) -> bool:

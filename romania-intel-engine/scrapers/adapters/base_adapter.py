@@ -56,8 +56,6 @@ from scrapers.rate_limiter import DomainRateLimiter
 
 USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
 
-SOURCE_TYPES = frozenset({"HCL_LOCAL", "PAAP_LOCAL", "CONSULTARE_LOCALA", "DISPOZITIE_PRIMAR"})
-
 
 class NonRetryableHTTPError(Exception):
     """4xx response — tenacity shouldn't burn attempts on something that

@@ -1,6 +1,6 @@
 import logging
-from datetime import date, datetime, timedelta
-from typing import Any, Dict, List, Optional
+from datetime import date, timedelta
+from typing import Any, Dict, Optional
 
 from ai_copilot import complete_text, list_llm_providers
 

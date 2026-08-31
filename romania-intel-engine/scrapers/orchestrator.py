@@ -2,7 +2,7 @@ import asyncio
 import logging
 import os
 import time
-from typing import List, Dict, Any
+from typing import Dict, Any
 
 import db
 from scrapers import circuit_breaker

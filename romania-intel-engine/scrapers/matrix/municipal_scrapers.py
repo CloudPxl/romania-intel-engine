@@ -25,7 +25,7 @@ actual JS bundle / rendered HTML), not assumed from documentation:
 import json
 import re
 from datetime import datetime
-from typing import List, Optional
+from typing import List
 
 from bs4 import BeautifulSoup
 

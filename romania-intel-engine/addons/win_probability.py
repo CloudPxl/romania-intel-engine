@@ -1,5 +1,5 @@
 import logging
-from typing import Any, Dict, Optional
+from typing import Any, Dict
 
 logger = logging.getLogger("WinProbabilityEngine")
 
@@ -18,7 +18,6 @@ logger = logging.getLogger("WinProbabilityEngine")
 
 # Discount bands, in percent off the published estimate.
 BAND_TOO_THIN = 3.0      # below this, price is rarely the differentiator
-BAND_COMPETITIVE_LOW = 5.0
 BAND_COMPETITIVE_HIGH = 14.0
 BAND_AGGRESSIVE = 20.0   # above this, expect a price justification request
 

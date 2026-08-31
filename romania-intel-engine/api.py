@@ -8,7 +8,7 @@ import uuid
 from contextlib import asynccontextmanager
 from datetime import date, datetime, timezone
 from decimal import Decimal
-from fastapi import FastAPI, HTTPException, Depends, Request, Response, UploadFile, File, Form, Header
+from fastapi import FastAPI, HTTPException, Depends, Request, UploadFile, File, Form, Header
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, JSONResponse
 from pydantic import BaseModel, EmailStr
@@ -26,7 +26,7 @@ from scrapers.orchestrator import OpportunityOrchestrator, TICK_DEADLINE_SECONDS
 from cache_engine import global_cache, newsletter_store
 from freemium_shield import FreemiumGatekeeper
 from notifier import LeadAlertDispatcher
-from security import SecurityGuard, require_auth, optional_auth, require_tenant_membership
+from security import SecurityGuard, require_auth, require_tenant_membership
 
 from addons.caiet_analyzer import CaietDeSarciniAnalyzer, TextExtractionError
 from addons.win_probability import WinProbabilityEngine
@@ -60,21 +60,51 @@ DEFAULT_TENANT_ID = "t1_infra_transilvania"
 STALENESS_THRESHOLD_MINUTES = float(os.getenv("STALENESS_THRESHOLD_MINUTES", "180"))
 
 async def background_scraping_job():
+    """The in-process 6-hourly ingestion run (plus one at startup).
+
+    Goes through the same locked tick path as /api/v1/system/tick rather
+    than orchestrator.run_pipeline(), which it used to call. run_pipeline
+    differs in four ways that all turned out to matter here:
+
+      - it never calls db.finish_tick(), so this job could do a full
+        ingestion run and /api/v1/system/status would still report
+        is_stale — the health signal simply did not see it;
+      - it ignores each scraper's own poll_interval_minutes, so every
+        6-hour cycle (and every restart) re-scraped all ~20 live sources
+        whether or not they were due;
+      - it has no soft deadline, unlike run_tick's TICK_DEADLINE_SECONDS;
+      - it is not covered by _tick_lock, so it could run concurrently with
+        a heartbeat-triggered tick, both competing for the same
+        rate-limited sources and the same connection pool — the exact
+        pile-up _tick_lock was introduced to prevent, reached by a
+        different door.
+
+    run_tick also alerts per tenant (dispatch_lead_alert_to_tenant, deduped
+    via db.has_alert_been_dispatched) instead of the legacy non-tenant-aware
+    dispatch_high_priority_alert this used to call.
+    """
+    if _tick_lock.locked():
+        # A heartbeat tick is already running; a second concurrent pass
+        # would just contend for the same sources. Same no-op the
+        # /api/v1/system/tick route applies.
+        logger.info("[24/7 DAEMON] Tick already in progress — skipping this cycle.")
+        return
+
     logger.info("[24/7 DAEMON] Ingesting and qualifying pre-SEAP signals...")
+    await _run_tick_locked()
+
+    # Refresh the degraded-mode file snapshot from Postgres (the
+    # authoritative store) rather than from one run's in-memory leads, so
+    # it reflects everything ingested, not just what this tick touched.
     try:
-        orchestrator = OpportunityOrchestrator()
-        result = await orchestrator.run_pipeline()
-        leads = result.get("leads", [])
-        newsletter_store.save(leads)
-        for lead in leads:
-            # dispatch_high_priority_alert applies HIGH_PRIORITY_SCORE
-            # itself; the duplicate literal threshold that used to sit here
-            # was stricter than the one inside it and silently overrode it.
-            await LeadAlertDispatcher.dispatch_high_priority_alert(lead)
+        feed = await _load_feed()
+        leads = feed.get("leads", [])
+        if leads:
+            newsletter_store.save(leads)
         global_cache.invalidate()
-        logger.info("[24/7 DAEMON] Pipeline synchronized.")
+        logger.info(f"[24/7 DAEMON] Pipeline synchronized ({len(leads)} leads cached).")
     except Exception as e:
-        logger.error(f"[24/7 DAEMON] Error: {e}")
+        logger.error(f"[24/7 DAEMON] Post-tick cache refresh failed: {e}")
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):

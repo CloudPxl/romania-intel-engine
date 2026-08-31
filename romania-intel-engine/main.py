@@ -1,5 +1,4 @@
 import asyncio
-import sqlite3
 from rich.console import Console
 from rich.table import Table
 

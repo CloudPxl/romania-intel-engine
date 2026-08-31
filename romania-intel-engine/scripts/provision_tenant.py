@@ -4,9 +4,9 @@ Part B of the tenant-isolation fix relies on instead of a self-serve
 signup flow (deliberately not built: unnecessary for 10-20 hand-picked
 companies, and out of scope for a $0-investment fix).
 
-Unlike scripts/seed_tenants.py (confirmed dead: targets a `user_profiles`
-table with no CREATE TABLE anywhere in this repo, using synthetic user
-ids that aren't real Supabase Auth UUIDs), this writes through db.py's
+Unlike the since-deleted scripts/seed_tenants.py (confirmed dead, and
+unsafe to run: it inserted synthetic user ids that aren't real Supabase
+Auth UUIDs straight into `user_profiles`), this writes through db.py's
 real asyncpg pool against the actual tenants/tenant_products/user_profiles
 tables (tenants_schema.sql) — the same connection path the live API uses,
 not a disconnected raw psycopg2 script.
@@ -116,7 +116,7 @@ async def provision(args: argparse.Namespace) -> None:
                 print(f"  user '{args.user_email}' ({args.user_id}) linked to tenant '{args.tenant_id}'.")
 
     print("Done. Reload the live server's tenant cache with:")
-    print(f'  curl -X POST "$RENDER_APP_URL/api/v1/admin/reload-tenants" -H "X-Admin-Secret: $TICK_SECRET"')
+    print('  curl -X POST "$RENDER_APP_URL/api/v1/admin/reload-tenants" -H "X-Admin-Secret: $TICK_SECRET"')
     print("(or restart the service — it reloads once at every startup regardless).")
 
 

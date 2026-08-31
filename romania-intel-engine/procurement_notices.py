@@ -155,6 +155,15 @@ async def upsert_procurement_notice(notice: ProcurementNotice) -> bool:
 
 
 async def get_ingest_state(notice_type: NoticeType) -> Optional[Dict[str, Any]]:
+    """Read counterpart to update_ingest_state. Intentionally has no callers.
+
+    Do not wire this into the scrapers as a "resume from last_item_id"
+    checkpoint: SEAP's list endpoints were verified live to return items in
+    no order (see the comment above the update_ingest_state call in
+    scrapers/matrix/direct_acquisition_scraper.py), so stopping at the first
+    already-seen id would silently skip notices published after it. The row
+    is a record of when a sync last ran, not a resumption cursor.
+    """
     async with db.with_connection() as conn:
         if conn is None:
             return None

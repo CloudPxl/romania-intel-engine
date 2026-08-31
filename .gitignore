@@ -10,3 +10,5 @@ __pycache__/
 .next/
 dist/
 build/
+# Snapshot archives produced by create_clean_zip.sh (and any ad-hoc export)
+*.zip
