@@ -320,18 +320,28 @@ def match_seap_candidate(
 
 async def find_seap_cross_reference(
     cpv_code: Optional[str], value_ron: float, entity_name: str,
+    candidates: Optional[List[Dict[str, Any]]] = None,
 ) -> Optional[Dict[str, Any]]:
     """Best-effort heuristic cross-reference against the existing
     `opportunities` table — see module docstring for why there's no real
     field to join on. Returns None (not an error) whenever persistence
     isn't configured, no candidates are found, or nothing clears the
     match bar; a TED signal is always ingested as its own row regardless
-    of this result."""
-    try:
-        candidates = await db.get_recent_opportunities(limit=CROSS_REFERENCE_CANDIDATE_LIMIT)
-    except Exception as e:
-        logger.warning(f"[TedRomania] cross-reference lookup failed, skipping: {e}")
-        return None
+    of this result.
+
+    `candidates` is optional: fetch_market_consultations() fetches the
+    candidate list once per tick and passes it in, since the same ~500
+    opportunities rows would otherwise be re-queried from Postgres once
+    per TED signal (up to ~100/tick) for no benefit — the candidate set
+    can't change mid-tick. Left as None here (fetching fresh) so this
+    function stays independently callable/testable without needing a
+    caller to fetch candidates first."""
+    if candidates is None:
+        try:
+            candidates = await db.get_recent_opportunities(limit=CROSS_REFERENCE_CANDIDATE_LIMIT)
+        except Exception as e:
+            logger.warning(f"[TedRomania] cross-reference lookup failed, skipping: {e}")
+            return None
 
     for candidate in candidates:
         match = match_seap_candidate(cpv_code, value_ron, entity_name, candidate)
@@ -365,6 +375,16 @@ class TedRomaniaScraper(BaseScraper):
         signals: List[RawInstitutionalSignal] = []
         rates = await bnr_currency.get_rates()
         query = self._build_query()
+        # Fetched once per tick and threaded through to every signal below
+        # instead of each signal's find_seap_cross_reference() call
+        # re-querying the same ~500 opportunities rows from Postgres —
+        # the candidate set can't change mid-tick, so up to ~100 identical
+        # queries collapses to exactly one.
+        try:
+            cross_reference_candidates = await db.get_recent_opportunities(limit=CROSS_REFERENCE_CANDIDATE_LIMIT)
+        except Exception as e:
+            logger.warning(f"[{self.name}] cross-reference candidate lookup failed for this tick, skipping: {e}")
+            cross_reference_candidates = []
 
         try:
             async with httpx.AsyncClient(timeout=20.0, follow_redirects=True) as client:
@@ -383,7 +403,7 @@ class TedRomaniaScraper(BaseScraper):
                         break
 
                     for item in items:
-                        signal = await self._build_signal(item, rates)
+                        signal = await self._build_signal(item, rates, cross_reference_candidates)
                         if signal:
                             signals.append(signal)
 
@@ -425,7 +445,10 @@ class TedRomaniaScraper(BaseScraper):
         logger.warning(f"[{self.name}] unhandled currency '{currency}' for amount {amount_f}; leaving value unconverted at 0.0")
         return 0.0, {"original_amount": amount_f, "original_currency": currency, "conversion": "unsupported_currency"}
 
-    async def _build_signal(self, item: Dict[str, Any], rates: Dict[str, Any]) -> Optional[RawInstitutionalSignal]:
+    async def _build_signal(
+        self, item: Dict[str, Any], rates: Dict[str, Any],
+        cross_reference_candidates: Optional[List[Dict[str, Any]]] = None,
+    ) -> Optional[RawInstitutionalSignal]:
         nd = item.get("ND") or item.get("publication-number")
         title = _i18n_text(item.get("notice-title"))
         if not nd or not title:
@@ -457,7 +480,9 @@ class TedRomaniaScraper(BaseScraper):
 
         cross_reference = None
         if estimated_value_ron > 0:
-            cross_reference = await find_seap_cross_reference(cpv_code, estimated_value_ron, buyer_name)
+            cross_reference = await find_seap_cross_reference(
+                cpv_code, estimated_value_ron, buyer_name, cross_reference_candidates,
+            )
 
         return RawInstitutionalSignal(
             source_id=f"TED-{nd}",

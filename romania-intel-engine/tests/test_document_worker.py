@@ -18,7 +18,6 @@ Run with `pytest` from romania-intel-engine/.
 """
 
 import asyncio
-import shutil
 
 import pymupdf
 import pytest
