@@ -28,7 +28,7 @@ from freemium_shield import FreemiumGatekeeper
 from notifier import LeadAlertDispatcher
 from security import SecurityGuard, require_auth, optional_auth, require_tenant_membership
 
-from addons.caiet_analyzer import CaietDeSarciniAnalyzer
+from addons.caiet_analyzer import CaietDeSarciniAnalyzer, TextExtractionError
 from addons.win_probability import WinProbabilityEngine
 from addons.competitor_tracker import CompetitorTrackerEngine
 from ai_copilot import ProcurementAICopilot
@@ -566,9 +566,27 @@ async def analyze_competitor_landscape(payload: CompetitorAnalysisRequest, _user
 @app.post("/api/v1/addons/upload-caiet")
 async def upload_and_analyze_caiet(file: UploadFile = File(...), project_title: str = Form(...), _user: dict = Depends(require_auth)):
     file_bytes = await file.read()
-    extracted_text = CaietDeSarciniAnalyzer.extract_text_from_file(file_bytes, file.filename)
+    if not file_bytes:
+        raise HTTPException(status_code=400, detail="Fișierul încărcat este gol.")
+    try:
+        extracted_text = CaietDeSarciniAnalyzer.extract_text_from_file(file_bytes, file.filename or "document")
+    except TextExtractionError as e:
+        # Deliberately an error rather than an analysis of whatever bytes we
+        # could salvage: a scan that never read the document would otherwise
+        # come back "no restrictive clauses found", which is worse than no
+        # answer for someone deciding whether to bid.
+        raise HTTPException(status_code=422, detail=str(e))
     if not extracted_text:
-        raise HTTPException(status_code=400, detail="Nu s-a putut extrage text din fisier.")
+        # Parsed fine, but carries no text layer — a scanned document. That
+        # is exactly what the async OCR pipeline exists for, so point at it
+        # instead of reporting a generic failure.
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "Documentul nu conține text digital (probabil este scanat). "
+                "Încărcați-l prin /api/v1/addons/upload-caiet-async pentru procesare OCR."
+            ),
+        )
     return CaietDeSarciniAnalyzer.analyze_specification_text(extracted_text, project_title)
 
 @app.post("/api/v1/addons/upload-caiet-async")

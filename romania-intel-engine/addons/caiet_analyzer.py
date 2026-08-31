@@ -97,29 +97,81 @@ RESTRICTIVE_PATTERNS = [
     },
 ]
 
+class TextExtractionError(Exception):
+    """The document could not be parsed at all (corrupt, encrypted, or not
+    actually the format its extension claims).
+
+    This exists because the alternative — what this module used to do —
+    is actively dangerous here. On a parse failure it fell back to
+    `file_bytes.decode("utf-8", errors="ignore")` on the raw binary, which
+    yields near-garbage that still *looks* like text. analyze_specification_text
+    then found none of its patterns in that garbage and returned
+    "Scazut (Specificatii Deschise)" with no red flags — presenting a
+    document that was never actually read as if it had been verified clean,
+    to a user deciding whether to bid. Failing loudly is the only honest
+    option: the same "report nothing rather than fabricate something"
+    convention the scrapers follow.
+    """
+
+
 class CaietDeSarciniAnalyzer:
     @staticmethod
     def extract_text_from_file(file_bytes: bytes, filename: str) -> str:
-        filename_lower = filename.lower()
-        extracted_text = ""
-        try:
-            if filename_lower.endswith(".pdf"):
-                reader = PdfReader(io.BytesIO(file_bytes))
-                for page in reader.pages:
-                    text = page.extract_text()
-                    if text:
-                        extracted_text += text + "\n"
-            elif filename_lower.endswith(".docx"):
-                doc = docx.Document(io.BytesIO(file_bytes))
-                for para in doc.paragraphs:
-                    extracted_text += para.text + "\n"
-            else:
-                extracted_text = file_bytes.decode("utf-8", errors="ignore")
-        except Exception as e:
-            logger.error(f"[CaietAnalyzer] Error extracting text: {e}")
-            extracted_text = file_bytes.decode("utf-8", errors="ignore")
+        """Returns the document's text, or raises TextExtractionError if the
+        file cannot be parsed.
 
-        return extracted_text.strip()
+        An empty return is meaningful and distinct from an error: it means the
+        file parsed correctly but carries no text layer (a scanned PDF), which
+        the caller should route to the async OCR pipeline rather than treat as
+        a failure.
+        """
+        filename_lower = filename.lower()
+
+        if filename_lower.endswith(".pdf"):
+            try:
+                reader = PdfReader(io.BytesIO(file_bytes))
+                pages = reader.pages
+            except Exception as e:
+                logger.error(f"[CaietAnalyzer] Unreadable PDF '{filename}': {e}")
+                raise TextExtractionError(
+                    "Fișierul PDF nu a putut fi citit (posibil corupt, criptat sau protejat cu parolă)."
+                ) from e
+
+            # Per-page, so one malformed page in an otherwise readable
+            # document costs that page rather than the whole analysis.
+            chunks: List[str] = []
+            failed_pages = 0
+            for index, page in enumerate(pages):
+                try:
+                    text = page.extract_text()
+                except Exception as e:
+                    failed_pages += 1
+                    logger.warning(f"[CaietAnalyzer] Page {index + 1} of '{filename}' failed to extract: {e}")
+                    continue
+                if text:
+                    chunks.append(text)
+
+            if failed_pages and not chunks:
+                raise TextExtractionError(
+                    "Nicio pagină din documentul PDF nu a putut fi procesată."
+                )
+            return "\n".join(chunks).strip()
+
+        if filename_lower.endswith(".docx"):
+            try:
+                doc = docx.Document(io.BytesIO(file_bytes))
+                return "\n".join(para.text for para in doc.paragraphs).strip()
+            except Exception as e:
+                logger.error(f"[CaietAnalyzer] Unreadable DOCX '{filename}': {e}")
+                raise TextExtractionError(
+                    "Fișierul DOCX nu a putut fi citit (posibil corupt sau într-un format neacceptat)."
+                ) from e
+
+        # Any other extension is treated as plain text. Decoding with
+        # errors="ignore" is legitimate here (unlike the old PDF/DOCX
+        # fallback): the bytes are genuinely expected to be text, and a few
+        # undecodable characters shouldn't fail an otherwise readable file.
+        return file_bytes.decode("utf-8", errors="ignore").strip()
 
     @staticmethod
     async def load_extracted_text(doc_id: Optional[str] = None, notice_id: Optional[str] = None) -> Optional[str]:
