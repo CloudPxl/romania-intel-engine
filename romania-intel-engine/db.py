@@ -81,7 +81,15 @@ async def get_pool() -> Optional[asyncpg.Pool]:
             return None
         kwargs: Dict[str, Any] = {
             "min_size": 1,
-            "max_size": 5,
+            # Was 5 — shared by every concurrent request, the ingestion
+            # tick, and the document worker at once. Fine for a single
+            # developer; a 6th simultaneous DB-touching request (trivial
+            # once several external tenants' dashboards overlap) just
+            # queued silently behind it instead of erroring. Still the
+            # same free Supabase project — this only raises the client-
+            # side ceiling, so it's worth confirming Supabase's own
+            # connection cap for this project isn't lower than this.
+            "max_size": 20,
             "max_inactive_connection_lifetime": POOL_MAX_INACTIVE_SECONDS,
             "command_timeout": COMMAND_TIMEOUT,
         }
@@ -663,3 +671,109 @@ def _parse_timestamp(value: Any) -> Optional[datetime]:
         return datetime.fromisoformat(str(value))
     except ValueError:
         return None
+
+
+# ---------------------------------------------------------------------------
+# Real tenant config + user->tenant membership (tenants_schema.sql).
+#
+# Replaces matching_engine.py's hardcoded TENANT_ORGANIZATIONS dict and
+# closes the "any authenticated user can address any tenant_id" gap. See
+# tenants_schema.sql's header for why this is a from-scratch design rather
+# than a resumption of the dead multi_tenancy_schema.sql / seed_tenants.py
+# artifacts.
+#
+# get_tenant_organizations() is deliberately NOT called on the read-request
+# hot path: matching_engine.TenantMatchingEngine.evaluate_opportunity_for_
+# tenant() runs synchronously, once per (signal, tenant) pair, inside
+# orchestrator.py's tick loop — up to several thousand calls per tick. A
+# Postgres round-trip per call there would reintroduce exactly the pool-
+# pressure problem the max_size increase above exists to relieve. Instead
+# matching_engine.py loads this once (at API startup, and whenever an
+# operator re-runs scripts/provision_tenant.py) into its own in-process
+# dict, the same way it already worked before this table existed — this
+# function is the loader, not a per-lookup query.
+# ---------------------------------------------------------------------------
+
+async def get_tenant_organizations() -> Optional[Dict[str, Any]]:
+    """Returns the TENANT_ORGANIZATIONS-shaped dict built from Postgres, or
+    None if there's no database or the migration hasn't been applied yet —
+    callers should keep their own hardcoded fallback in that case, same
+    convention as get_deals_for_tenant()."""
+    async with with_connection() as conn:
+        if conn is None:
+            return None
+        try:
+            tenant_rows = await conn.fetch("SELECT * FROM tenants ORDER BY id")
+            product_rows = await conn.fetch("SELECT * FROM tenant_products ORDER BY tenant_id, id")
+        except asyncpg.exceptions.UndefinedTableError:
+            logger.warning("[DB] tenants/tenant_products not found — run tenants_schema.sql. Using hardcoded fallback.")
+            return None
+
+    products_by_tenant: Dict[str, List[Dict[str, Any]]] = {}
+    for row in product_rows:
+        products_by_tenant.setdefault(row["tenant_id"], []).append({
+            "product_id": row["id"],
+            "name": row["name"],
+            "domain": row["domain"],
+            "target_counties": list(row["target_counties"] or []),
+            "min_value_ron": float(row["min_value_ron"] or 0.0),
+            "keywords": list(row["keywords"] or []),
+            "exclude_keywords": list(row["exclude_keywords"] or []),
+        })
+
+    return {
+        row["id"]: {
+            "name": row["company_name"],
+            "primary_domain": row["primary_domain"],
+            "alert_emails": list(row["alert_emails"] or []),
+            "telegram_chat_id": row["telegram_chat_id"],
+            "min_alert_score": float(row["min_alert_score"]) if row["min_alert_score"] is not None else None,
+            "products": products_by_tenant.get(row["id"], []),
+        }
+        for row in tenant_rows
+    }
+
+
+async def get_user_profile(user_id: str) -> Optional[Dict[str, Any]]:
+    """None means "no row for this user" OR "couldn't reach Postgres" —
+    both are treated as "not provisioned" by security.py's tenant-
+    membership check, which fails closed either way. This is a security
+    boundary, not a feed read: unlike every other degrade-gracefully path
+    in this module, an unreachable database here must not be treated as
+    "let the request through"."""
+    async with with_connection() as conn:
+        if conn is None:
+            return None
+        try:
+            row = await conn.fetchrow("SELECT id, email, tenant_id, role FROM user_profiles WHERE id = $1", user_id)
+        except asyncpg.exceptions.UndefinedTableError:
+            logger.warning("[DB] user_profiles not found — run tenants_schema.sql.")
+            return None
+    return dict(row) if row else None
+
+
+async def upsert_user_profile_email(user_id: str, email: str) -> Optional[Dict[str, Any]]:
+    """Called from /api/v1/auth/sync on every login. Only ever touches
+    `email` — tenant_id/role are assigned exclusively by
+    scripts/provision_tenant.py, never by the sync endpoint itself, so a
+    brand-new user lands with tenant_id NULL (reported honestly as "not
+    provisioned yet") instead of being silently defaulted into any
+    tenant's data. Returns the current row (post-upsert) so the caller can
+    read back whatever tenant_id already exists, if any."""
+    async with with_connection() as conn:
+        if conn is None:
+            return None
+        try:
+            row = await conn.fetchrow(
+                """
+                INSERT INTO user_profiles (id, email)
+                VALUES ($1, $2)
+                ON CONFLICT (id) DO UPDATE SET email = EXCLUDED.email, updated_at = now()
+                RETURNING id, email, tenant_id, role
+                """,
+                user_id, email,
+            )
+        except asyncpg.exceptions.UndefinedTableError:
+            logger.warning("[DB] user_profiles not found — run tenants_schema.sql.")
+            return None
+    return dict(row) if row else None

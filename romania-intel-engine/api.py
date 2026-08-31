@@ -18,6 +18,7 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 import db
 import document_extractions
 from workers import document_tasks
+import matching_engine
 from matching_engine import TenantMatchingEngine, TENANT_ORGANIZATIONS
 from workflow_engine import ConcurrentWorkflowEngine
 from billing import StripeBillingEngine
@@ -25,7 +26,7 @@ from scrapers.orchestrator import OpportunityOrchestrator, TICK_DEADLINE_SECONDS
 from cache_engine import global_cache, newsletter_store
 from freemium_shield import FreemiumGatekeeper
 from notifier import LeadAlertDispatcher
-from security import SecurityGuard, require_auth, optional_auth
+from security import SecurityGuard, require_auth, optional_auth, require_tenant_membership
 
 from addons.caiet_analyzer import CaietDeSarciniAnalyzer
 from addons.win_probability import WinProbabilityEngine
@@ -80,6 +81,7 @@ async def lifespan(app: FastAPI):
     scheduler.add_job(background_scraping_job, "interval", hours=6)
     scheduler.start()
     document_tasks.start_workers()
+    await matching_engine.refresh_tenant_organizations()
     asyncio.create_task(background_scraping_job())
     logger.info("[SYSTEM] RO-INTEL Enterprise API active.")
     yield
@@ -221,6 +223,22 @@ async def system_tick(x_tick_secret: Optional[str] = Header(None)):
 
     asyncio.create_task(_run_tick_locked())
     return {"status": "started", "detail": "Tick dispatched in the background."}
+
+@app.post("/api/v1/admin/reload-tenants")
+async def reload_tenants(x_admin_secret: Optional[str] = Header(None)):
+    """Called by scripts/provision_tenant.py right after it writes a new
+    tenant/product/user_profiles row, so a freshly provisioned client's
+    config is live in the running process without a redeploy — otherwise
+    matching_engine.TENANT_ORGANIZATIONS (loaded once at startup, see
+    api.py's lifespan) would only pick up the new tenant on the next
+    natural restart. Reuses TICK_SECRET rather than adding a second admin
+    secret env var — this is the same class of internal-operator-only
+    endpoint as /api/v1/system/tick, not a user-facing route.
+    """
+    if not TICK_SECRET or x_admin_secret != TICK_SECRET:
+        raise HTTPException(status_code=401, detail="unauthorized")
+    loaded = await matching_engine.refresh_tenant_organizations()
+    return {"status": "reloaded" if loaded else "unavailable", "tenant_count": len(TENANT_ORGANIZATIONS)}
 
 @app.get("/api/v1/system/status")
 async def system_status():
@@ -407,14 +425,43 @@ async def sync_user_auth(payload: AuthSyncRequest, user: dict = Depends(require_
     # The body used to be the only source, so anyone could POST an
     # arbitrary email and be handed a profile back for it.
     email = user.get("email") or payload.email
+
+    # Upserts (email only — tenant_id/role are assigned exclusively by
+    # scripts/provision_tenant.py, see db.upsert_user_profile_email's
+    # docstring) and reads back whatever tenant_id already exists for this
+    # user, if any. This used to return a hardcoded DEFAULT_TENANT_ID for
+    # every user and write nothing anywhere — a brand-new, unprovisioned
+    # user was silently handed tenant #1's data on every login.
+    profile = await db.upsert_user_profile_email(user["user_id"], email)
+    if profile is not None:
+        tenant_id = profile.get("tenant_id")
+    elif not db.DATABASE_URL:
+        # No database configured at all — local/dev, same fallback
+        # condition security.require_tenant_membership uses. There's
+        # nothing to check a real membership against, so this preserves
+        # today's "just works against the 3 hardcoded tenants" local dev
+        # ergonomics rather than locking a developer with no DB out of
+        # every tenant-scoped page.
+        tenant_id = DEFAULT_TENANT_ID
+    else:
+        # A database IS configured but this specific call failed (e.g. the
+        # migration hasn't been applied yet) — report honestly rather than
+        # guessing a tenant.
+        tenant_id = None
+    role = (profile.get("role") if profile else None) or "Membru"
+
     return {
         "status": "synced",
         "user": {
             "user_id": user.get("user_id"),
             "email": email,
             "full_name": payload.full_name or email.split("@")[0].title(),
-            "tenant_id": DEFAULT_TENANT_ID,
-            "role": "Director Bidding & Strategie",
+            # None when the user hasn't been provisioned to a tenant yet
+            # (no db.upsert_user_profile_email row, or no database
+            # configured at all) — the frontend must treat this as "no
+            # access yet", never fall back to a default tenant.
+            "tenant_id": tenant_id,
+            "role": role,
             "avatar_url": payload.avatar_url
         }
     }
@@ -450,7 +497,7 @@ def list_billing_plans():
     return StripeBillingEngine.get_plans()
 
 @app.post("/api/v1/tenants/{tenant_id}/billing/proforma")
-def generate_proforma(tenant_id: str, payload: ProformaRequest, _user: dict = Depends(require_auth)):
+def generate_proforma(tenant_id: str, payload: ProformaRequest, _user: dict = Depends(require_tenant_membership)):
     return StripeBillingEngine.generate_proforma_invoice(
         tenant_id=tenant_id,
         plan_id=payload.plan_id,
@@ -461,7 +508,7 @@ def generate_proforma(tenant_id: str, payload: ProformaRequest, _user: dict = De
     )
 
 @app.get("/api/v1/tenants/{tenant_id}/pipeline")
-async def get_tenant_pipeline(tenant_id: str, product_id: Optional[str] = None, _user: dict = Depends(require_auth)):
+async def get_tenant_pipeline(tenant_id: str, product_id: Optional[str] = None, _user: dict = Depends(require_tenant_membership)):
     # Previously named `stage` here while being forwarded into
     # get_tenant_pipeline's product_id filter — a request for
     # ?stage=discovery silently filtered on product_id="discovery" instead
@@ -475,15 +522,15 @@ async def get_tenant_pipeline(tenant_id: str, product_id: Optional[str] = None, 
     }
 
 @app.get("/api/v1/tenants/{tenant_id}/pipeline/metrics")
-async def get_tenant_pipeline_metrics(tenant_id: str, product_id: Optional[str] = None, _user: dict = Depends(require_auth)):
+async def get_tenant_pipeline_metrics(tenant_id: str, product_id: Optional[str] = None, _user: dict = Depends(require_tenant_membership)):
     return await ConcurrentWorkflowEngine.get_pipeline_metrics(tenant_id, product_id)
 
 @app.post("/api/v1/tenants/{tenant_id}/pipeline/add")
-async def add_pipeline_deal(tenant_id: str, payload: PipelineAddRequest, _user: dict = Depends(require_auth)):
+async def add_pipeline_deal(tenant_id: str, payload: PipelineAddRequest, _user: dict = Depends(require_tenant_membership)):
     return await ConcurrentWorkflowEngine.add_lead_to_pipeline(tenant_id, payload.lead_data)
 
 @app.post("/api/v1/tenants/{tenant_id}/pipeline/update")
-async def update_pipeline_deal(tenant_id: str, payload: PipelineUpdateRequest, _user: dict = Depends(require_auth)):
+async def update_pipeline_deal(tenant_id: str, payload: PipelineUpdateRequest, _user: dict = Depends(require_tenant_membership)):
     return await ConcurrentWorkflowEngine.update_deal_stage(
         tenant_id=tenant_id,
         deal_id=payload.deal_id,
@@ -556,7 +603,7 @@ async def get_tenant_feed_route(
     product_id: Optional[str] = None,
     category: Optional[str] = None,
     force_refresh: bool = False,
-    _user: dict = Depends(require_auth),
+    _user: dict = Depends(require_tenant_membership),
 ):
     # `is_subscribed` used to be a plain query parameter defaulting to
     # True — so the freemium gate was both trivially bypassable
@@ -644,7 +691,16 @@ async def get_tenant_feed(
     return payload
 
 @app.get("/api/v1/analytics/market-report-72h")
-async def get_72h_report(tenant_id: str = DEFAULT_TENANT_ID, _user: dict = Depends(require_auth)):
+async def get_72h_report(tenant_id: str = DEFAULT_TENANT_ID, user: dict = Depends(require_auth)):
+    # tenant_id here is a query param with a default, not a path param, so
+    # it can't be checked via Depends(require_tenant_membership) the way
+    # the /tenants/{tenant_id}/... routes are (FastAPI would resolve that
+    # dependency's own tenant_id as a *required* query param, breaking the
+    # default). Calling the same check function directly instead — it's a
+    # plain async function underneath Depends(), nothing stops calling it
+    # like one. This is the same tenant-scoped /feed data as the path-param
+    # route above, so it needs the same check, not a lesser one.
+    await require_tenant_membership(tenant_id, user)
     feed_data = await get_tenant_feed(tenant_id)
     leads = feed_data.get("leads", [])
     return ProcurementAICopilot.generate_72h_macro_report(leads)
@@ -652,7 +708,7 @@ async def get_72h_report(tenant_id: str = DEFAULT_TENANT_ID, _user: dict = Depen
 COPILOT_CHAT_DEADLINE_SECONDS = 35.0
 
 @app.post("/api/v1/copilot/chat")
-async def copilot_chat(payload: CopilotQueryRequest, _user: dict = Depends(require_auth)):
+async def copilot_chat(payload: CopilotQueryRequest, user: dict = Depends(require_auth)):
     # answer_copilot_query's own per-provider httpx timeout (12s) should
     # already bound this to well under a minute even trying all three
     # configured providers in sequence — but a request was observed live
@@ -665,9 +721,13 @@ async def copilot_chat(payload: CopilotQueryRequest, _user: dict = Depends(requi
     # can no longer hang indefinitely regardless of which layer is at
     # fault, and degrades to a real answer from the template fallback
     # path instead of leaving the caller with nothing at all.
+    tenant_id = payload.tenant_id or DEFAULT_TENANT_ID
+    # Same reasoning as get_72h_report above: tenant_id lives inside the
+    # JSON body here, not a path param, so the check is called directly.
+    await require_tenant_membership(tenant_id, user)
     try:
         feed_data = await asyncio.wait_for(
-            get_tenant_feed(payload.tenant_id or DEFAULT_TENANT_ID),
+            get_tenant_feed(tenant_id),
             timeout=10.0,
         )
         leads = feed_data.get("leads", [])
@@ -688,7 +748,7 @@ async def copilot_chat(payload: CopilotQueryRequest, _user: dict = Depends(requi
         }
 
 @app.get("/api/v1/tenants/{tenant_id}/products")
-async def get_tenant_products(tenant_id: str, _user: dict = Depends(require_auth)):
+async def get_tenant_products(tenant_id: str, _user: dict = Depends(require_tenant_membership)):
     org = TENANT_ORGANIZATIONS.get(tenant_id)
     if not org:
         return {"tenant_id": tenant_id, "company_name": "SC General Procurement SRL", "products": []}
@@ -715,7 +775,7 @@ def predict_win_rate(payload: WinProbabilityRequest, _user: dict = Depends(requi
     )
 
 @app.get("/api/v1/tenants/{tenant_id}/export/csv")
-async def export_tenant_csv(tenant_id: str, _user: dict = Depends(require_auth)):
+async def export_tenant_csv(tenant_id: str, _user: dict = Depends(require_tenant_membership)):
     feed_data = await get_tenant_feed(tenant_id)
     leads = feed_data.get("leads", [])
 

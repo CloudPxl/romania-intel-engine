@@ -1,6 +1,7 @@
 import logging
 from typing import Any, Dict, List, Optional
 
+import db
 from text_utils import counties_match, matching_terms
 
 logger = logging.getLogger("MatchingEngine")
@@ -24,6 +25,16 @@ ALERT_THRESHOLD = 7.5
 #                   a cleaning-services contract is not a roadworks lead).
 # `min_value_ron` — a floor applied only when the value is actually known;
 #                   see UNKNOWN_VALUE handling in the engine.
+#
+# This literal is now a FALLBACK, not the live source of truth: api.py's
+# lifespan calls refresh_tenant_organizations() once at startup, which
+# overwrites the *contents* of this dict (via .clear()/.update(), never
+# reassignment — see that function's docstring for why the distinction
+# matters) from Postgres's tenants/tenant_products tables
+# (tenants_schema.sql) if that migration has been applied. If it hasn't
+# (or no database is configured — e.g. local dev), this hardcoded literal
+# is exactly what keeps running, so existing behaviour for these 3 tenants
+# never regresses either way.
 TENANT_ORGANIZATIONS = {
     "t1_infra_transilvania": {
         "name": "SC Infra Construct Transilvania SRL",
@@ -113,6 +124,36 @@ TENANT_ORGANIZATIONS = {
         ],
     },
 }
+
+async def refresh_tenant_organizations() -> bool:
+    """Reloads TENANT_ORGANIZATIONS from Postgres. Returns True if it did
+    (Postgres reachable and tenants_schema.sql applied), False if it fell
+    through to keeping whatever was already loaded (the hardcoded literal
+    on first startup, or the previous successful refresh's data on a later
+    one — never wiped just because one refresh attempt failed).
+
+    Mutates the dict IN PLACE (.clear() + .update()) rather than rebinding
+    the module-level name to a new dict object. api.py imports this exact
+    dict by reference (`from matching_engine import TENANT_ORGANIZATIONS`)
+    at module load time — reassigning `TENANT_ORGANIZATIONS = new_dict`
+    here would leave api.py's already-bound name pointing at the old
+    object forever, silently undoing every future refresh from api.py's
+    point of view. Mutating the existing object is what makes every
+    importer see the update.
+
+    Called once at API startup (api.py's lifespan) and again by
+    scripts/provision_tenant.py after adding a new tenant, so a freshly
+    provisioned client's config is live without a redeploy — the whole
+    point of moving this out of a hardcoded dict in the first place.
+    """
+    fresh = await db.get_tenant_organizations()
+    if fresh is None:
+        return False
+    TENANT_ORGANIZATIONS.clear()
+    TENANT_ORGANIZATIONS.update(fresh)
+    logger.info(f"[MatchingEngine] Loaded {len(fresh)} tenant(s) from Postgres.")
+    return True
+
 
 # Opportunities whose budget the publisher never states arrive as 0.0.
 # 0.0 means "not disclosed", not "worth nothing" — most CNI register rows,

@@ -6,7 +6,9 @@ from typing import Dict, Optional, Tuple
 import jwt
 from jwt import PyJWKClient
 from jwt.exceptions import PyJWKClientConnectionError, PyJWKClientError, PyJWKSetError
-from fastapi import Request, HTTPException
+from fastapi import Depends, Request, HTTPException
+
+import db
 
 logger = logging.getLogger("SecurityGuard")
 
@@ -106,14 +108,14 @@ class SecurityGuard:
 
         Scope note — this authenticates, it does not authorize per tenant.
         It proves the caller holds a valid, unexpired Supabase session for
-        *some* account; it cannot prove that account is entitled to the
-        {tenant_id} in the path, because no user->tenant mapping is stored
-        anywhere yet (TENANT_ORGANIZATIONS in matching_engine.py is a
-        hardcoded in-process dict, and desks are per-browser localStorage).
-        A logged-in user can therefore still address another tenant's id.
-        Closing that gap needs a real tenant-membership table; naming the
-        function `verify_tenant_authorization` does not by itself make it
-        one, so the limitation is stated here rather than implied away.
+        *some* account; it does not by itself prove that account is
+        entitled to any particular {tenant_id} in a route's path — that
+        check is `require_tenant_membership` below, layered on top of this
+        function via `Depends(require_auth)`, not folded into this one.
+        Naming this function `verify_tenant_authorization` never made it
+        one; every tenant-scoped route in api.py now depends on
+        `require_tenant_membership` instead of `require_auth` directly for
+        exactly this reason — see tenants_schema.sql / db.get_user_profile.
         """
         auth_header = request.headers.get("Authorization", "")
         if not auth_header.startswith("Bearer "):
@@ -232,3 +234,34 @@ def optional_auth(request: Request) -> Optional[Dict]:
         return SecurityGuard.verify_tenant_authorization(request)
     except HTTPException:
         return None
+
+
+async def require_tenant_membership(tenant_id: str, user: Dict = Depends(require_auth)) -> Dict:
+    """The actual per-tenant authorization check `require_auth` alone never
+    did (see its docstring above, and verify_tenant_authorization's).
+    `tenant_id` is resolved by FastAPI from the route's own path parameter
+    of the same name — every tenant-scoped route in api.py depends on this
+    instead of `require_auth` directly, so this composes with it rather
+    than replacing it.
+
+    Fails CLOSED on ambiguity, deliberately unlike almost every other read
+    in this codebase: an unreachable database is not "let the request
+    through", because this is a tenant-isolation boundary, not a feed that
+    degrades gracefully to empty. The one exception is when no database is
+    configured *at all* (`db.DATABASE_URL` unset) — that's the local/dev
+    case (this repo's tests and `python server.py` runs work with no
+    DATABASE_URL by design), where trusting the path param reproduces
+    exactly today's pre-fix behaviour rather than breaking local
+    development for a check that has nothing to check against.
+    """
+    if not db.DATABASE_URL:
+        return user
+
+    profile = await db.get_user_profile(user["user_id"])
+    if profile is None or profile.get("tenant_id") != tenant_id:
+        logger.warning(
+            f"[SecurityGuard] Denied {user.get('email') or user['user_id']} access to tenant '{tenant_id}' "
+            f"(profile {'not found' if profile is None else 'assigned to ' + str(profile.get('tenant_id'))})."
+        )
+        raise HTTPException(status_code=403, detail="Nu aveți acces la acest tenant.")
+    return user
