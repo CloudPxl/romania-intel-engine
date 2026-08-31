@@ -67,7 +67,7 @@ class WinProbabilityEngine:
             assessment = "Favorabil"
             factors.append(
                 f"Discount de {discount_pct:.2f}%, în intervalul uzual de "
-                f"{BAND_COMPETITIVE_LOW:.0f}-{BAND_COMPETITIVE_HIGH:.0f}% pentru proceduri competitive."
+                f"{BAND_TOO_THIN:.0f}-{BAND_COMPETITIVE_HIGH:.0f}% pentru proceduri competitive."
             )
         elif discount_pct <= BAND_AGGRESSIVE:
             band = "agresiv"

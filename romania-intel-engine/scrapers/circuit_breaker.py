@@ -26,10 +26,9 @@ async def record_result(source_name: str, success: bool, error: Optional[str], r
         await db.close_circuit(source_name)
         return
 
-    pool = await db.get_pool()
-    if pool is None:
-        return
-    async with pool.acquire() as conn:
+    async with db.with_connection() as conn:
+        if conn is None:
+            return
         row = await conn.fetchrow(
             "SELECT consecutive_failures FROM source_run_log WHERE source_name = $1", source_name
         )

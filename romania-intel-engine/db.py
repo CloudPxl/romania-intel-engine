@@ -195,20 +195,32 @@ async def with_connection():
     if pool is None:
         yield None
         return
+
+    # The retry deliberately wraps only `acquire()`, never the caller's own
+    # query. An @asynccontextmanager may yield exactly once: when the body
+    # raises, contextlib throws that exception back in at the `yield`, and
+    # yielding a second time makes contextlib raise
+    # `RuntimeError: generator didn't stop after athrow()` — masking the real
+    # error rather than retrying it. Wrapping the yield in try/except (as this
+    # did before) therefore turned an ordinary stale-connection error into an
+    # unhandled RuntimeError at every call site, including
+    # security.require_tenant_membership, which has no broad except of its own
+    # and would 500 instead of cleanly allowing or denying.
     try:
-        async with pool.acquire(timeout=POOL_ACQUIRE_TIMEOUT) as conn:
-            yield conn
-        return
+        conn = await pool.acquire(timeout=POOL_ACQUIRE_TIMEOUT)
     except _CONNECTION_ERRORS as e:
         logger.warning(f"[DB] Stale/failed connection ({type(e).__name__}); rebuilding pool and retrying once.")
+        await _reset_pool()
+        pool = await get_pool()
+        if pool is None:
+            yield None
+            return
+        conn = await pool.acquire(timeout=POOL_ACQUIRE_TIMEOUT)
 
-    await _reset_pool()
-    pool = await get_pool()
-    if pool is None:
-        yield None
-        return
-    async with pool.acquire(timeout=POOL_ACQUIRE_TIMEOUT) as conn:
+    try:
         yield conn
+    finally:
+        await pool.release(conn)
 
 
 async def upsert_opportunity(record: Dict[str, Any]) -> bool:

@@ -150,7 +150,17 @@ body {{ font-family: -apple-system, sans-serif; background-color: #060b13; color
         from matching_engine import TENANT_ORGANIZATIONS
 
         tenant = TENANT_ORGANIZATIONS.get(tenant_id, {})
-        min_score = tenant.get("min_alert_score", 9.0)
+        # `.get(..., 9.0)` only falls back when the key is absent — but
+        # db.get_tenant_organizations() stores an explicit None for a
+        # tenant whose min_alert_score column is NULL (nullable, no DB
+        # default), so the key is always present. That made this compare a
+        # float against None for any such tenant, raising TypeError on
+        # every match (caught by orchestrator.py's per-alert try/except,
+        # so it silently dropped every alert for that tenant instead of
+        # crashing the tick).
+        min_score = tenant.get("min_alert_score")
+        if min_score is None:
+            min_score = 9.0
         if match_info.get("tenant_opportunity_score", 0) < min_score:
             return {"telegram": False, "email": False}
 

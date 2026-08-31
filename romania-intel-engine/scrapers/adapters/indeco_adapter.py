@@ -136,7 +136,7 @@ def _next_postback(soup: BeautifulSoup, seen_targets: set) -> Optional[tuple]:
         if key in seen_targets:
             continue
         text = a.get_text(strip=True)
-        if text in ("»", "...", "Next", "Urmatoare", ">") or text.isdigit():
+        if fold(text) in ("»", "...", "next", "urmatoare", ">") or text.isdigit():
             return key
     return None
 

@@ -114,10 +114,16 @@ class OpportunityOrchestrator:
         for scraper, res in zip(active_scrapers, results_nested):
             if isinstance(res, list):
                 raw_signals.extend(res)
-                await circuit_breaker.record_result(scraper.name, success=True, error=None, records=len(res))
+                try:
+                    await circuit_breaker.record_result(scraper.name, success=True, error=None, records=len(res))
+                except Exception as e:
+                    logger.error(f"[Orchestrator] circuit_breaker record failed for {scraper.name}: {e}")
             elif isinstance(res, Exception):
                 logger.error(f"[Orchestrator] Scraper failure: {res}")
-                await circuit_breaker.record_result(scraper.name, success=False, error=str(res), records=0)
+                try:
+                    await circuit_breaker.record_result(scraper.name, success=False, error=str(res), records=0)
+                except Exception as e:
+                    logger.error(f"[Orchestrator] circuit_breaker record failed for {scraper.name}: {e}")
 
         logger.info(f"⚡ [REFINERY] Refining and scoring {len(raw_signals)} deep bureaucratic signals...")
 
@@ -125,7 +131,10 @@ class OpportunityOrchestrator:
         for sig in raw_signals:
             refined_lead = IntelligenceRefineryEngine.refine_signal(sig)
             refined_leads.append(refined_lead)
-            await db.upsert_opportunity(refined_lead)
+            try:
+                await db.upsert_opportunity(refined_lead)
+            except Exception as e:
+                logger.error(f"[Orchestrator] Failed to persist opportunity {refined_lead.get('source_id')}: {e}")
 
         refined_leads.sort(key=lambda x: x.get("opportunity_score", 0), reverse=True)
         logger.info(f"✅ [SUCCESS] Pipeline complete. {len(refined_leads)} verified dossiers ready.")
@@ -189,16 +198,22 @@ class OpportunityOrchestrator:
                 if error is not None:
                     errors += 1
                     logger.error(f"[Tick] Scraper failure for {scraper.name}: {error}")
-                    await circuit_breaker.record_result(
-                        scraper.name, success=False, error=str(error), records=0,
-                        poll_interval_minutes=scraper.poll_interval_minutes,
-                    )
+                    try:
+                        await circuit_breaker.record_result(
+                            scraper.name, success=False, error=str(error), records=0,
+                            poll_interval_minutes=scraper.poll_interval_minutes,
+                        )
+                    except Exception as e:
+                        logger.error(f"[Tick] circuit_breaker record failed for {scraper.name}: {e}")
                     continue
 
-                await circuit_breaker.record_result(
-                    scraper.name, success=True, error=None, records=len(signals),
-                    poll_interval_minutes=scraper.poll_interval_minutes,
-                )
+                try:
+                    await circuit_breaker.record_result(
+                        scraper.name, success=True, error=None, records=len(signals),
+                        poll_interval_minutes=scraper.poll_interval_minutes,
+                    )
+                except Exception as e:
+                    logger.error(f"[Tick] circuit_breaker record failed for {scraper.name}: {e}")
                 completed_sources += 1
 
                 for sig in signals:

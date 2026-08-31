@@ -384,7 +384,15 @@ async def _load_feed(filters: Optional[Dict[str, Any]] = None) -> Dict[str, Any]
         rows = []
         db_failed = True
 
-    if not rows:
+    if not rows and db_failed:
+        # Only fall back to the (possibly stale) file cache when Postgres
+        # itself was unreachable. Previously this triggered on `not rows`
+        # alone, so a perfectly healthy query that legitimately matched
+        # zero opportunities (a narrow market-analysis filter, or a fresh
+        # database with nothing ingested yet) silently returned whatever
+        # was sitting in the on-disk cache instead — violating the "market
+        # analysis always reflects the current database" guarantee
+        # routers/analysis.py's docstring makes for this exact function.
         fallback = newsletter_store.load()
         if filters:
             fallback["leads"] = _apply_feed_filters(fallback.get("leads", []), filters)[:limit]
@@ -394,9 +402,8 @@ async def _load_feed(filters: Optional[Dict[str, Any]] = None) -> Dict[str, Any]
         # tell them apart from the payload alone. Say which it is, so the
         # UI can show a warning instead of an empty state that looks like
         # a real (and alarming) result.
-        if db_failed:
-            fallback["degraded"] = True
-            fallback["detail"] = "database unavailable — showing last cached snapshot"
+        fallback["degraded"] = True
+        fallback["detail"] = "database unavailable — showing last cached snapshot"
         fallback.setdefault("source", "file-cache")
         return fallback
 

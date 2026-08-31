@@ -27,6 +27,7 @@ county_registries.json's generation) and matches almost anything
 reachable — that's the point of a fallback, not a bug.
 """
 
+import hashlib
 import json
 import re
 from datetime import datetime
@@ -161,7 +162,7 @@ class GenericPortalAdapter(BaseCMSAdapter):
                 parent_text = a.find_parent().get_text(" ", strip=True) if a.find_parent() else text
                 cpv_match = _CPV_RE.search(parent_text)
                 notices.append({
-                    "source_id": f"{source_prefix}-{county.upper()}-{abs(hash(href)) % 10**8}",
+                    "source_id": f"{source_prefix}-{county.upper()}-{hashlib.sha1(href.encode('utf-8')).hexdigest()[:10]}",
                     "source_type": source_type,
                     "county": county,
                     "locality": county,
