@@ -136,6 +136,49 @@ def resolve_region(county: str) -> Optional[str]:
     return None
 
 
+def _remediation_for(
+    caen_match: Optional[Dict[str, Any]],
+    turnover_ok: bool,
+    size_ok: bool,
+    region_ok: bool,
+    county: str,
+    region: Optional[str],
+) -> str:
+    """One actionable instruction for the single hardest blocker.
+
+    Ordered the same way `blockers` is built, so the advice always names
+    the most fundamental obstacle. The region arm sits last deliberately:
+    it must not shadow a CAEN/turnover/size failure, but it must be
+    reachable — before it existed a company blocked *only* by region fell
+    through to the IMM-classification message, which had nothing to do
+    with the actual reason it was rejected.
+    """
+    if not caen_match:
+        return "Verificați posibilitatea autorizării unui cod CAEN secundar eligibil."
+    if not turnover_ok:
+        return "Reevaluați după depunerea bilanțului următor."
+    if not size_ok:
+        return "Consultați AM pentru încadrarea corectă a întreprinderii."
+    if not region_ok:
+        # A county we cannot map to a development region is a data problem
+        # on the request, not a substantive ineligibility — say so rather
+        # than advising a relocation the company may not need.
+        if region is None:
+            return (
+                f"Județul '{county or 'nespecificat'}' nu a putut fi încadrat într-una dintre cele 8 regiuni "
+                "de dezvoltare; corectați județul sediului social și reluați verificarea."
+            )
+        return (
+            f"Apelul este alocat regional, iar eligibilitatea se stabilește după locul de implementare, nu după "
+            f"obiectul de activitate. Regiunea '{region}' nu este acoperită: verificați apelul lansat de ADR "
+            f"pentru '{region}' sau, dacă proiectul o permite, implementarea printr-un punct de lucru autorizat "
+            "într-o regiune eligibilă."
+        )
+    # Unreachable while this chain covers every condition that can add a
+    # blocker; kept so a future blocker still returns advice rather than None.
+    return "Consultați AM pentru condițiile specifice ale apelului."
+
+
 class BusinessEligibilityEngine:
     @staticmethod
     def evaluate_company(
@@ -186,12 +229,8 @@ class BusinessEligibilityEngine:
                     # What the company would have to change — actionable
                     # advice was entirely absent before; a failing company
                     # simply got a 5.0 and no explanation.
-                    "remediation": (
-                        "Verificați posibilitatea autorizării unui cod CAEN secundar eligibil."
-                        if not caen_match else
-                        "Reevaluați după depunerea bilanțului următor."
-                        if not turnover_ok else
-                        "Consultați AM pentru încadrarea corectă a întreprinderii."
+                    "remediation": _remediation_for(
+                        caen_match, turnover_ok, size_ok, region_ok, county, region
                     ),
                 })
                 continue

@@ -328,10 +328,21 @@ async def get_recent_opportunities(
         _add("COALESCE(published_date, last_seen_at::date) >= ${n}", start_date)
     if end_date is not None:
         _add("COALESCE(published_date, last_seen_at::date) <= ${n}", end_date)
+    # Case-insensitive on both sides, because api.py:_apply_feed_filters —
+    # the same filters re-applied in Python against the file cache when
+    # Postgres is down — lower-cases both sides too. With an exact-case
+    # comparison here, `?counties=cluj` matched nothing while the database
+    # was healthy and started matching the moment it degraded, which reads
+    # as an intermittently broken filter. County values are written by the
+    # scrapers in whatever case the source published ("Cluj", "CLUJ"), so
+    # the forgiving comparison is also the correct one.
+    # scraper_matrix_schema.sql carries lower(county)/lower(category)
+    # expression indexes for these predicates; a plain btree on the bare
+    # column cannot serve them.
     if counties:
-        _add("county = ANY(${n}::text[])", list(counties))
+        _add("lower(county) = ANY(${n}::text[])", [str(c).lower() for c in counties])
     if categories:
-        _add("category = ANY(${n}::text[])", list(categories))
+        _add("lower(category) = ANY(${n}::text[])", [str(c).lower() for c in categories])
     if min_value_ron is not None:
         _add("estimated_value_ron >= ${n}", min_value_ron)
     if max_value_ron is not None:
@@ -691,8 +702,8 @@ def _parse_timestamp(value: Any) -> Optional[datetime]:
 # Replaces matching_engine.py's hardcoded TENANT_ORGANIZATIONS dict and
 # closes the "any authenticated user can address any tenant_id" gap. See
 # tenants_schema.sql's header for why this is a from-scratch design rather
-# than a resumption of the dead multi_tenancy_schema.sql / seed_tenants.py
-# artifacts.
+# than a resumption of the dead multi_tenancy_schema.sql artifact (and of
+# scripts/seed_tenants.py, since deleted).
 #
 # get_tenant_organizations() is deliberately NOT called on the read-request
 # hot path: matching_engine.TenantMatchingEngine.evaluate_opportunity_for_

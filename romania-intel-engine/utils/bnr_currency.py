@@ -55,7 +55,9 @@ of an exception. The fallback is the exact pair captured live above
 BNR rate, not an invented one — and every use of it is logged as a
 warning and labelled `"source": "fallback_offline_2026-08-28"` in the
 returned rates dict, so nothing downstream can mistake it for a live
-quote.
+quote. A fallback result is cached for only 15 minutes rather than the
+full 24h — see `_FALLBACK_CACHE_TTL_SECONDS`: it is a retry window, so a
+short BNR outage does not pin conversions to the offline rate for a day.
 """
 
 import asyncio
@@ -80,6 +82,13 @@ FALLBACK_USD_RON = 4.5171
 _FALLBACK_SOURCE_LABEL = f"fallback_offline_{FALLBACK_RATE_DATE}"
 
 _CACHE_TTL_SECONDS = 24 * 60 * 60
+# A fallback result is cached far more briefly than a live one: it is not a
+# quote, it is the absence of one. At the full 24h TTL a single failed fetch
+# pinned every conversion to the offline rate for a whole day even if BNR
+# came back a minute later. Not caching it at all would swing the other way
+# and pay the 15s HTTP timeout on every single call for the duration of an
+# outage, so this is a retry window, not a cache lifetime.
+_FALLBACK_CACHE_TTL_SECONDS = 15 * 60
 _cache_rates: Optional[Dict[str, Any]] = None
 _cache_at: float = 0.0
 _cache_lock = asyncio.Lock()
@@ -138,13 +147,18 @@ def _fallback_rates() -> Dict[str, Any]:
 async def get_rates(force_refresh: bool = False) -> Dict[str, Any]:
     """Returns {"eur_ron": float, "usd_ron": float, "rate_date": "YYYY-MM-DD",
     "source": "live" | "fallback_offline_<date>"} — cached in-process for
-    up to 24h, same TTL-cache idiom as cni_common.py's `_fetch_all_rows`.
+    up to 24h, same TTL-cache idiom as cni_common.py's `_fetch_all_rows`,
+    except that a fallback result is only held for
+    `_FALLBACK_CACHE_TTL_SECONDS` so the first caller after a brief BNR
+    outage gets a live rate again instead of the offline one.
     Never raises: a live-fetch failure degrades to the hardcoded fallback
     rather than propagating, since every caller just needs a number."""
     global _cache_rates, _cache_at
     async with _cache_lock:
-        if not force_refresh and _cache_rates is not None and (time.monotonic() - _cache_at) < _CACHE_TTL_SECONDS:
-            return _cache_rates
+        if not force_refresh and _cache_rates is not None:
+            ttl = _CACHE_TTL_SECONDS if _cache_rates.get("source") == "live" else _FALLBACK_CACHE_TTL_SECONDS
+            if (time.monotonic() - _cache_at) < ttl:
+                return _cache_rates
 
         try:
             rates = await _fetch_live_rates()

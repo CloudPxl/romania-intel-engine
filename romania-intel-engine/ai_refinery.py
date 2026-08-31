@@ -185,6 +185,22 @@ class IntelligenceRefineryEngine:
     @staticmethod
     def refine_signal(signal: RawInstitutionalSignal) -> Dict[str, Any]:
         value = signal.estimated_value_ron or 0.0
+        if value < 0:
+            # No live parser can currently produce this (they all read
+            # digit-only regex captures or non-negative JSON fields), so a
+            # negative here means a parser has started reading the wrong
+            # field. It is loud on purpose — clamping without the warning
+            # would let that bug ride silently — but it is still clamped,
+            # because the alternative is persisting a negative
+            # `financial_value_ron` that then subtracts from
+            # routers/analysis.py's total_market_value_ron and renders as a
+            # negative RON figure in the feed. Treating it as unpublished is
+            # the honest reading: we do not have a usable value.
+            logger.warning(
+                f"[AIRefinery] Negative estimated_value_ron ({value}) from {signal.source_type}/"
+                f"{signal.source_id} — treating as unpublished; check that scraper's value parser."
+            )
+            value = 0.0
         stage = IntelligenceRefineryEngine._infer_stage(signal)
         stage_profile = STAGE_PROFILES.get(stage, STAGE_PROFILES["unknown"])
 

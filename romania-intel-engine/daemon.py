@@ -16,8 +16,12 @@ async def run_scheduled_job():
         leads = result.get("leads", [])
         newsletter_store.save(leads)
         for lead in leads:
-            if lead.get("opportunity_score", 0) >= 9.2:
-                await LeadAlertDispatcher.dispatch_high_priority_alert(lead)
+            # dispatch_high_priority_alert applies HIGH_PRIORITY_SCORE (7.0)
+            # itself. The duplicate literal 9.2 that used to gate this call
+            # was stricter than that, so it silently suppressed every alert
+            # scoring 7.0-9.19 — the same bug already fixed in api.py's
+            # background_scraping_job, which this loop was copied from.
+            await LeadAlertDispatcher.dispatch_high_priority_alert(lead)
         logger.info(f"✅ Ingestion cycle complete. Ingested: {len(leads)} signals.")
     except Exception as e:
         logger.error(f"❌ Scheduled scraping job encountered an error: {e}")

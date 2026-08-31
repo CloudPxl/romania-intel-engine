@@ -36,6 +36,16 @@ CREATE INDEX IF NOT EXISTS idx_opportunities_category ON opportunities(category)
 CREATE INDEX IF NOT EXISTS idx_opportunities_county ON opportunities(county);
 CREATE INDEX IF NOT EXISTS idx_opportunities_last_seen ON opportunities(last_seen_at DESC);
 
+-- Expression indexes, not duplicates of the two above: the market-analysis
+-- filters in db.py:get_recent_opportunities compare
+-- `lower(county) = ANY(...)` / `lower(category) = ANY(...)` so they agree
+-- with api.py:_apply_feed_filters' case-insensitive fallback, and Postgres
+-- cannot use a btree on the bare column for a lower() predicate. Apply
+-- these by hand alongside the rest of this file; until they exist the
+-- filtered query still returns correct rows, just via a sequential scan.
+CREATE INDEX IF NOT EXISTS idx_opportunities_county_lower ON opportunities(lower(county));
+CREATE INDEX IF NOT EXISTS idx_opportunities_category_lower ON opportunities(lower(category));
+
 -- 2. Per-source polling cadence, staleness, and circuit-breaker state
 CREATE TABLE IF NOT EXISTS source_run_log (
     source_name TEXT PRIMARY KEY,
