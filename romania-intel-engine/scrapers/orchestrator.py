@@ -21,6 +21,7 @@ from scrapers.matrix.municipal_scrapers import (
     PmbAchizitiiScraper, TimisoaraHclScraper, ConstantaAchizitiiScraper
 )
 from scrapers.matrix.municipal_matrix import CountyRegistryScraper
+from scrapers.ted_scraper import TedRomaniaScraper
 from ai_refinery import IntelligenceRefineryEngine
 from matching_engine import TENANT_ORGANIZATIONS, TenantMatchingEngine
 from notifier import LeadAlertDispatcher
@@ -86,6 +87,15 @@ class OpportunityOrchestrator:
             # to run. Same live-verified-before-shipping rollout gate as
             # the two flags above.
             self.scrapers.append(CountyRegistryScraper())
+        if os.getenv("ENABLE_LIVE_TED", "false").lower() == "true":
+            # Real, live TED/OJEU (EU Official Journal) cross-border
+            # infra/defence/health/energy notices naming Romania as buyer
+            # country — see scrapers/ted_scraper.py's module docstring for
+            # the full live-verification trail (endpoint/query DSL/field
+            # names) and the honest gap it documents around SEAP
+            # cross-referencing. Same live-verified-before-shipping
+            # rollout gate as the flags above.
+            self.scrapers.append(TedRomaniaScraper())
 
     async def run_pipeline(self) -> Dict[str, Any]:
         active_scrapers = []

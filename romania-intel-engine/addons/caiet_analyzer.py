@@ -1,7 +1,7 @@
 import io
 import logging
 import re
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Optional
 from pypdf import PdfReader
 import docx
 
@@ -120,6 +120,37 @@ class CaietDeSarciniAnalyzer:
             extracted_text = file_bytes.decode("utf-8", errors="ignore")
 
         return extracted_text.strip()
+
+    @staticmethod
+    async def load_extracted_text(doc_id: Optional[str] = None, notice_id: Optional[str] = None) -> Optional[str]:
+        """Additive path alongside extract_text_from_file(): pulls text
+        already produced by workers/document_tasks.py's async ingestion
+        pipeline (workers/pdf_preprocessor.py + workers/ocr_engine.py) out of
+        the document_extractions table, instead of asking the caller to
+        re-upload and re-parse the same bytes inline. This is what lets a
+        100+ page scanned HCL/CNAIR PDF — too slow to parse inline, which is
+        exactly why that async pipeline exists — reach this analyzer's
+        keyword/risk scan at all.
+
+        Returns None when the row doesn't exist, hasn't finished processing
+        yet (status != "done"), or no database is configured — callers
+        should treat that as "not ready", not as "no text". The existing
+        inline-upload code path (extract_text_from_file, called directly
+        from api.py's synchronous /upload-caiet route) is completely
+        unaffected by this method's existence.
+        """
+        import document_extractions
+
+        row = None
+        if doc_id:
+            row = await document_extractions.get_extraction(doc_id)
+        elif notice_id:
+            row = await document_extractions.get_latest_extraction_for_notice(notice_id)
+        else:
+            return None
+        if not row or row.get("status") != "done":
+            return None
+        return row.get("raw_text") or None
 
     @staticmethod
     def extract_qualification_criteria(text: str) -> Dict[str, Any]:

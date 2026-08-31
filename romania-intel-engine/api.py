@@ -4,6 +4,7 @@ import io
 import asyncio
 import json
 import logging
+import uuid
 from contextlib import asynccontextmanager
 from datetime import date, datetime, timezone
 from decimal import Decimal
@@ -15,6 +16,8 @@ from typing import Any, Dict, List, Optional
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 import db
+import document_extractions
+from workers import document_tasks
 from matching_engine import TenantMatchingEngine, TENANT_ORGANIZATIONS
 from workflow_engine import ConcurrentWorkflowEngine
 from billing import StripeBillingEngine
@@ -76,6 +79,7 @@ async def background_scraping_job():
 async def lifespan(app: FastAPI):
     scheduler.add_job(background_scraping_job, "interval", hours=6)
     scheduler.start()
+    document_tasks.start_workers()
     asyncio.create_task(background_scraping_job())
     logger.info("[SYSTEM] RO-INTEL Enterprise API active.")
     yield
@@ -148,7 +152,15 @@ class CompetitorAnalysisRequest(BaseModel):
 
 class CaietAnalysisRequest(BaseModel):
     project_title: str
-    specification_text: str
+    # specification_text stays the primary field so every existing caller
+    # (the frontend's synchronous caiet scanner) keeps working unchanged.
+    # doc_id/notice_id are additive: when specification_text is omitted, the
+    # route instead pulls already-extracted text out of document_extractions
+    # (workers/document_tasks.py's async ingestion result) via
+    # CaietDeSarciniAnalyzer.load_extracted_text().
+    specification_text: Optional[str] = None
+    doc_id: Optional[str] = None
+    notice_id: Optional[str] = None
 
 class WinProbabilityRequest(BaseModel):
     estimated_budget_ron: float
@@ -505,6 +517,39 @@ async def upload_and_analyze_caiet(file: UploadFile = File(...), project_title: 
         raise HTTPException(status_code=400, detail="Nu s-a putut extrage text din fisier.")
     return CaietDeSarciniAnalyzer.analyze_specification_text(extracted_text, project_title)
 
+@app.post("/api/v1/addons/upload-caiet-async")
+async def upload_caiet_async(
+    file: UploadFile = File(...),
+    notice_id: Optional[str] = Form(None),
+    _user: dict = Depends(require_auth),
+):
+    """Async counterpart to /upload-caiet for heavy scans (100+ page HCL
+    municipal budget annexes, CNAIR technical annexes) that risk a request
+    timeout if parsed inline. Accepts the upload, records a 'queued'
+    document_extractions row, and dispatches the real work (PDF
+    classification, then either instant text extraction or full
+    render->OCR) via asyncio.create_task — the same fire-and-forget
+    dispatch /api/v1/system/tick already uses — so this request thread never
+    blocks on it. Poll GET /api/v1/addons/document-extractions/{doc_id} for
+    the result, then feed doc_id into /api/v1/addons/analyze-caiet to run
+    the actual risk/qualification scan once it's done.
+    """
+    file_bytes = await file.read()
+    if not file_bytes:
+        raise HTTPException(status_code=400, detail="Fisierul incarcat este gol.")
+    doc_id = str(uuid.uuid4())
+    filename = file.filename or "document.pdf"
+    await document_extractions.create_queued_extraction(doc_id, notice_id, filename)
+    asyncio.create_task(document_tasks.enqueue_document(doc_id, notice_id, filename, file_bytes))
+    return {"doc_id": doc_id, "status": "queued"}
+
+@app.get("/api/v1/addons/document-extractions/{doc_id}")
+async def get_document_extraction_route(doc_id: str, _user: dict = Depends(require_auth)):
+    row = await document_extractions.get_extraction(doc_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="Extragerea documentului nu a fost gasita.")
+    return row
+
 @app.get("/api/v1/tenants/{tenant_id}/feed")
 async def get_tenant_feed_route(
     tenant_id: str,
@@ -650,8 +695,18 @@ async def get_tenant_products(tenant_id: str, _user: dict = Depends(require_auth
     return {"tenant_id": tenant_id, "company_name": org["name"], "products": org["products"]}
 
 @app.post("/api/v1/addons/analyze-caiet")
-def analyze_caiet_sarcini(payload: CaietAnalysisRequest, _user: dict = Depends(require_auth)):
-    return CaietDeSarciniAnalyzer.analyze_specification_text(payload.specification_text, payload.project_title)
+async def analyze_caiet_sarcini(payload: CaietAnalysisRequest, _user: dict = Depends(require_auth)):
+    text = payload.specification_text
+    if not text and (payload.doc_id or payload.notice_id):
+        text = await CaietDeSarciniAnalyzer.load_extracted_text(doc_id=payload.doc_id, notice_id=payload.notice_id)
+        if text is None:
+            raise HTTPException(
+                status_code=404,
+                detail="Extragerea documentului nu a fost gasita sau nu s-a finalizat inca.",
+            )
+    if not text:
+        raise HTTPException(status_code=400, detail="Trebuie furnizat specification_text sau doc_id/notice_id.")
+    return CaietDeSarciniAnalyzer.analyze_specification_text(text, payload.project_title)
 
 @app.post("/api/v1/addons/predict-win-rate")
 def predict_win_rate(payload: WinProbabilityRequest, _user: dict = Depends(require_auth)):

@@ -67,3 +67,9 @@ services:
       # before-default-on treatment as the two flags above.
       - key: ENABLE_LIVE_COUNTY_REGISTRY
         value: "true"
+      # Real, live TED/OJEU cross-border infra/defence/health/energy
+      # notices naming Romania as buyer country — see
+      # scrapers/ted_scraper.py's module docstring. Same live-verified-
+      # before-shipping rollout gate as the flags above.
+      - key: ENABLE_LIVE_TED
+        value: "true"
