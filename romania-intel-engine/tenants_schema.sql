@@ -72,6 +72,49 @@ ALTER TABLE user_profiles ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAUL
 
 CREATE INDEX IF NOT EXISTS idx_user_profiles_tenant_id ON user_profiles(tenant_id);
 
+-- Live re-run of this file hit a second layer of the same root cause: the
+-- pre-existing multi_tenancy_schema.sql table also carries columns this
+-- file has never heard of (confirmed live: `contact_email` NOT NULL with
+-- no default — the seed INSERT below doesn't set it because no code in
+-- this repo ever reads or writes it). Enumerating every such legacy
+-- column by name would mean fixing this file once per column, one live
+-- error at a time. Instead, drop NOT NULL from anything on these three
+-- tables that isn't one of the columns this schema actually defines and
+-- populates — safe, because every one of those extra columns is by
+-- definition dead (unreferenced by db.py/matching_engine.py/api.py), so
+-- leaving it nullable can't break anything this codebase does with it.
+DO $$
+DECLARE
+    r RECORD;
+BEGIN
+    FOR r IN
+        SELECT column_name FROM information_schema.columns
+        WHERE table_schema = 'public' AND table_name = 'tenants'
+          AND is_nullable = 'NO'
+          AND column_name NOT IN ('id', 'company_name')
+    LOOP
+        EXECUTE format('ALTER TABLE tenants ALTER COLUMN %I DROP NOT NULL', r.column_name);
+    END LOOP;
+
+    FOR r IN
+        SELECT column_name FROM information_schema.columns
+        WHERE table_schema = 'public' AND table_name = 'tenant_products'
+          AND is_nullable = 'NO'
+          AND column_name NOT IN ('id', 'tenant_id')
+    LOOP
+        EXECUTE format('ALTER TABLE tenant_products ALTER COLUMN %I DROP NOT NULL', r.column_name);
+    END LOOP;
+
+    FOR r IN
+        SELECT column_name FROM information_schema.columns
+        WHERE table_schema = 'public' AND table_name = 'user_profiles'
+          AND is_nullable = 'NO'
+          AND column_name NOT IN ('id')
+    LOOP
+        EXECUTE format('ALTER TABLE user_profiles ALTER COLUMN %I DROP NOT NULL', r.column_name);
+    END LOOP;
+END $$;
+
 -- One-time seed: the 3 tenants/products matching_engine.py hardcodes
 -- today, so enabling this schema does not change day-one matching
 -- behaviour. Safe to re-run (ON CONFLICT DO UPDATE) if applied twice —
