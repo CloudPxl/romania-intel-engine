@@ -7,6 +7,7 @@ from typing import List, Dict, Any
 import db
 from scrapers import circuit_breaker
 from scrapers.matrix.elicitatie_scraper import ElicitatieLiveScraper
+from scrapers.matrix.direct_acquisition_scraper import DirectAcquisitionScraper, DaAwardNoticeScraper
 from scrapers.matrix.infra_scrapers import (
     CniInfraScraper, CnairCfrScraper, UrbanismAcScraper, CountyHclScraper
 )
@@ -66,6 +67,15 @@ class OpportunityOrchestrator:
             # replacing) the fixture Sicap*Scraper classes above during
             # rollout; verified against the production API before shipping.
             self.scrapers.append(ElicitatieLiveScraper())
+        if os.getenv("ENABLE_LIVE_DIRECT_ACQUISITION", "false").lower() == "true":
+            # Real, live SEAP direct-purchase (DA) + direct-purchase award
+            # (CAN) feeds — same live-verified-before-shipping rollout
+            # pattern as ElicitatieLiveScraper above. See
+            # scrapers/matrix/direct_acquisition_scraper.py's module
+            # docstring for exactly which endpoints were confirmed and
+            # which SEAP notice types (CN/SC) are still unimplemented.
+            self.scrapers.append(DirectAcquisitionScraper())
+            self.scrapers.append(DaAwardNoticeScraper())
 
     async def run_pipeline(self) -> Dict[str, Any]:
         active_scrapers = []

@@ -5,6 +5,7 @@ venv/
 __pycache__/
 *.pyc
 *.db
+data/newsletter_cache.json
 .DS_Store
 .next/
 dist/

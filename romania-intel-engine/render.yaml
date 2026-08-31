@@ -55,3 +55,8 @@ services:
         sync: false
       - key: ENABLE_LIVE_ELICITATIE
         value: "true"
+      # Real, live SEAP direct-purchase (DA) + direct-purchase-award (CAN)
+      # feeds — see scrapers/matrix/direct_acquisition_scraper.py. Same
+      # live-verified-before-default-on treatment as ENABLE_LIVE_ELICITATIE.
+      - key: ENABLE_LIVE_DIRECT_ACQUISITION
+        value: "true"
