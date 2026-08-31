@@ -1,0 +1,724 @@
+{
+  "counties": [
+    {
+      "county": "Alba",
+      "county_code": "AB",
+      "entity_name": "Consiliul Județean Alba",
+      "base_url": "https://cjalba.ro",
+      "platform": "wordpress",
+      "detection_evidence": "https://cjalba.ro/wp-json/ returned JSON with 'namespaces' key",
+      "verified_at": "2026-08-31",
+      "verification_method": "live_http_probe",
+      "probed_urls": [
+        "https://cjalba.ro/",
+        "https://cjalba.ro/monitorul-oficial-local/",
+        "https://cjalba.ro/achizitii-publice/",
+        "https://cjalba.ro/api/public/anunturi",
+        "https://cjalba.ro/wp-json/"
+      ]
+    },
+    {
+      "county": "Arad",
+      "county_code": "AR",
+      "entity_name": "Consiliul Județean Arad",
+      "base_url": "https://cjarad.ro",
+      "platform": "wordpress",
+      "detection_evidence": "https://cjarad.ro/wp-json/ returned JSON with 'namespaces' key",
+      "verified_at": "2026-08-31",
+      "verification_method": "live_http_probe",
+      "probed_urls": [
+        "https://cjarad.ro/",
+        "https://cjarad.ro/monitorul-oficial-local/",
+        "https://cjarad.ro/achizitii-publice/",
+        "https://cjarad.ro/api/public/anunturi",
+        "https://cjarad.ro/wp-json/"
+      ]
+    },
+    {
+      "county": "Argeș",
+      "county_code": "AG",
+      "entity_name": "Consiliul Județean Argeș",
+      "base_url": "https://cjarges.ro",
+      "platform": "generic_html",
+      "detection_evidence": "homepage responded; no wordpress/drupal/sobis/indeco signature confirmed",
+      "verified_at": "2026-08-31",
+      "verification_method": "live_http_probe",
+      "probed_urls": [
+        "https://cjarges.ro/",
+        "https://cjarges.ro/monitorul-oficial-local/",
+        "https://cjarges.ro/achizitii-publice/",
+        "https://cjarges.ro/api/public/anunturi",
+        "https://cjarges.ro/wp-json/",
+        "https://cjarges.ro/jsonapi/"
+      ]
+    },
+    {
+      "county": "Bacău",
+      "county_code": "BC",
+      "entity_name": "Consiliul Județean Bacău",
+      "base_url": "https://csjbacau.ro",
+      "platform": "domino_nsf",
+      "detection_evidence": "Originally probed as generic_html (no wordpress/drupal/sobis/indeco signature); a follow-up homepage check found \".nsf\" in the HTML, indicating this is also an IBM/HCL Domino portal — reclassified accordingly. No adapter targets this platform yet.",
+      "verified_at": "2026-08-31",
+      "verification_method": "live_http_probe_corrected_after_extraction_dry_run",
+      "probed_urls": [
+        "https://csjbacau.ro/",
+        "https://csjbacau.ro/monitorul-oficial-local/",
+        "https://csjbacau.ro/achizitii-publice/",
+        "https://csjbacau.ro/api/public/anunturi",
+        "https://csjbacau.ro/wp-json/",
+        "https://csjbacau.ro/jsonapi/"
+      ]
+    },
+    {
+      "county": "Bihor",
+      "county_code": "BH",
+      "entity_name": "Consiliul Județean Bihor",
+      "base_url": "https://cjbihor.ro",
+      "platform": "wordpress",
+      "detection_evidence": "https://cjbihor.ro/wp-json/ returned JSON with 'namespaces' key",
+      "verified_at": "2026-08-31",
+      "verification_method": "live_http_probe",
+      "probed_urls": [
+        "https://cjbihor.ro/",
+        "https://cjbihor.ro/monitorul-oficial-local/",
+        "https://cjbihor.ro/achizitii-publice/",
+        "https://cjbihor.ro/api/public/anunturi",
+        "https://cjbihor.ro/wp-json/"
+      ]
+    },
+    {
+      "county": "Bistrița-Năsăud",
+      "county_code": "BN",
+      "entity_name": "Consiliul Județean Bistrița-Năsăud",
+      "base_url": "http://cjbn.ro",
+      "platform": "generic_html",
+      "detection_evidence": "homepage responded; no wordpress/drupal/sobis/indeco signature confirmed",
+      "verified_at": "2026-08-31",
+      "verification_method": "live_http_probe",
+      "probed_urls": [
+        "https://cjbn.ro/",
+        "http://cjbn.ro/",
+        "http://cjbn.ro/monitorul-oficial-local/",
+        "http://cjbn.ro/achizitii-publice/",
+        "http://cjbn.ro/api/public/anunturi",
+        "http://cjbn.ro/wp-json/",
+        "http://cjbn.ro/jsonapi/"
+      ]
+    },
+    {
+      "county": "Botoșani",
+      "county_code": "BT",
+      "entity_name": "Consiliul Județean Botoșani",
+      "base_url": "https://cjbotosani.ro",
+      "platform": "wordpress",
+      "detection_evidence": "https://cjbotosani.ro/wp-json/ returned JSON with 'namespaces' key",
+      "verified_at": "2026-08-31",
+      "verification_method": "live_http_probe",
+      "probed_urls": [
+        "https://cjbotosani.ro/",
+        "https://cjbotosani.ro/monitorul-oficial-local/",
+        "https://cjbotosani.ro/achizitii-publice/",
+        "https://cjbotosani.ro/api/public/anunturi",
+        "https://cjbotosani.ro/wp-json/"
+      ]
+    },
+    {
+      "county": "Brăila",
+      "county_code": "BR",
+      "entity_name": "Consiliul Județean Brăila",
+      "base_url": "https://cjbraila.ro",
+      "platform": "domino_nsf",
+      "detection_evidence": "Originally probed as generic_html; a follow-up homepage check found \".nsf\" in the HTML, indicating an IBM/HCL Domino portal — reclassified accordingly. No adapter targets this platform yet.",
+      "verified_at": "2026-08-31",
+      "verification_method": "live_http_probe_corrected_after_extraction_dry_run",
+      "probed_urls": [
+        "https://cjbraila.ro/",
+        "https://cjbraila.ro/monitorul-oficial-local/",
+        "https://cjbraila.ro/achizitii-publice/",
+        "https://cjbraila.ro/api/public/anunturi",
+        "https://cjbraila.ro/wp-json/",
+        "https://cjbraila.ro/jsonapi/"
+      ]
+    },
+    {
+      "county": "Brașov",
+      "county_code": "BV",
+      "entity_name": "Consiliul Județean Brașov",
+      "base_url": "https://cjbrasov.ro",
+      "platform": "wordpress",
+      "detection_evidence": "https://cjbrasov.ro/wp-json/ returned JSON with 'namespaces' key",
+      "verified_at": "2026-08-31",
+      "verification_method": "live_http_probe",
+      "probed_urls": [
+        "https://cjbrasov.ro/",
+        "https://cjbrasov.ro/monitorul-oficial-local/",
+        "https://cjbrasov.ro/achizitii-publice/",
+        "https://cjbrasov.ro/api/public/anunturi",
+        "https://cjbrasov.ro/wp-json/"
+      ]
+    },
+    {
+      "county": "Buzău",
+      "county_code": "BZ",
+      "entity_name": "Consiliul Județean Buzău",
+      "base_url": "https://cjbuzau.ro",
+      "platform": "wordpress",
+      "detection_evidence": "https://cjbuzau.ro/wp-json/ returned JSON with 'namespaces' key",
+      "verified_at": "2026-08-31",
+      "verification_method": "live_http_probe",
+      "probed_urls": [
+        "https://cjbuzau.ro/",
+        "https://cjbuzau.ro/monitorul-oficial-local/",
+        "https://cjbuzau.ro/achizitii-publice/",
+        "https://cjbuzau.ro/api/public/anunturi",
+        "https://cjbuzau.ro/wp-json/"
+      ]
+    },
+    {
+      "county": "Caraș-Severin",
+      "county_code": "CS",
+      "entity_name": "Consiliul Județean Caraș-Severin",
+      "base_url": "https://cjcs.ro",
+      "platform": "domino_nsf",
+      "detection_evidence": "The \"Sobis\" string found on the homepage is a CSS theme name (site.sobis.ro.js, a citygov skin), not the JSON-API \"Sobis Public Administration Suite\" assumed in the original spec. Live-verified: this site is actually an IBM/HCL Domino \".nsf\" portal (real paths found: /dm_cjcs/portal.nsf/pagini/achizitii+publice-000024DE, .../hotararile+consiliului+judetean+carasseverin-000021D6) — the same underlying platform as this codebase's existing scrapers/matrix/infra_scrapers.py:CountyHclScraper (Iași, dm_iasi/portal.nsf). SobisAdapter's JSON-API + regex-HTML strategy does not match this shape, so it is left unpolled rather than silently returning 0 while claiming coverage.",
+      "verified_at": "2026-08-31",
+      "verification_method": "live_http_probe_corrected_after_extraction_dry_run",
+      "probed_urls": [
+        "https://cjcs.ro/",
+        "https://cjcs.ro/monitorul-oficial-local/",
+        "https://cjcs.ro/achizitii-publice/",
+        "https://cjcs.ro/api/public/anunturi"
+      ]
+    },
+    {
+      "county": "Călărași",
+      "county_code": "CL",
+      "entity_name": "Consiliul Județean Călărași",
+      "base_url": "https://calarasi.ro",
+      "platform": "wordpress",
+      "detection_evidence": "https://calarasi.ro/wp-json/ returned JSON with 'namespaces' key",
+      "verified_at": "2026-08-31",
+      "verification_method": "live_http_probe",
+      "probed_urls": [
+        "https://calarasi.ro/",
+        "https://calarasi.ro/monitorul-oficial-local/",
+        "https://calarasi.ro/achizitii-publice/",
+        "https://calarasi.ro/api/public/anunturi",
+        "https://calarasi.ro/wp-json/"
+      ]
+    },
+    {
+      "county": "Cluj",
+      "county_code": "CJ",
+      "entity_name": "Consiliul Județean Cluj",
+      "base_url": "https://cjcluj.ro",
+      "platform": "wordpress",
+      "detection_evidence": "https://cjcluj.ro/wp-json/ returned JSON with 'namespaces' key",
+      "verified_at": "2026-08-31",
+      "verification_method": "live_http_probe",
+      "probed_urls": [
+        "https://cjcluj.ro/",
+        "https://cjcluj.ro/monitorul-oficial-local/",
+        "https://cjcluj.ro/achizitii-publice/",
+        "https://cjcluj.ro/api/public/anunturi",
+        "https://cjcluj.ro/wp-json/"
+      ]
+    },
+    {
+      "county": "Constanța",
+      "county_code": "CT",
+      "entity_name": "Consiliul Județean Constanța",
+      "base_url": "https://www.cjc.ro",
+      "platform": "generic_html",
+      "detection_evidence": "homepage responded; no wordpress/drupal/sobis/indeco signature confirmed",
+      "verified_at": "2026-08-31",
+      "verification_method": "live_http_probe",
+      "probed_urls": [
+        "https://cjc.ro/",
+        "http://cjc.ro/",
+        "https://www.cjc.ro/",
+        "https://www.cjc.ro/monitorul-oficial-local/",
+        "https://www.cjc.ro/achizitii-publice/",
+        "https://www.cjc.ro/api/public/anunturi",
+        "https://www.cjc.ro/wp-json/",
+        "https://www.cjc.ro/jsonapi/"
+      ]
+    },
+    {
+      "county": "Covasna",
+      "county_code": "CV",
+      "entity_name": "Consiliul Județean Covasna",
+      "base_url": "https://cjcv.ro",
+      "platform": "generic_html",
+      "detection_evidence": "homepage responded; no wordpress/drupal/sobis/indeco signature confirmed",
+      "verified_at": "2026-08-31",
+      "verification_method": "live_http_probe",
+      "probed_urls": [
+        "https://cjcv.ro/",
+        "https://cjcv.ro/monitorul-oficial-local/",
+        "https://cjcv.ro/achizitii-publice/",
+        "https://cjcv.ro/api/public/anunturi",
+        "https://cjcv.ro/wp-json/",
+        "https://cjcv.ro/jsonapi/"
+      ]
+    },
+    {
+      "county": "Dâmbovița",
+      "county_code": "DB",
+      "entity_name": "Consiliul Județean Dâmbovița",
+      "base_url": "https://cjd.ro",
+      "platform": "generic_html",
+      "detection_evidence": "homepage responded; no wordpress/drupal/sobis/indeco signature confirmed",
+      "verified_at": "2026-08-31",
+      "verification_method": "live_http_probe",
+      "probed_urls": [
+        "https://cjd.ro/",
+        "https://cjd.ro/monitorul-oficial-local/",
+        "https://cjd.ro/achizitii-publice/",
+        "https://cjd.ro/api/public/anunturi",
+        "https://cjd.ro/wp-json/",
+        "https://cjd.ro/jsonapi/"
+      ]
+    },
+    {
+      "county": "Dolj",
+      "county_code": "DJ",
+      "entity_name": "Consiliul Județean Dolj",
+      "base_url": "https://cjdolj.ro",
+      "platform": "domino_nsf",
+      "detection_evidence": "Same finding as Caraș-Severin: \"Sobis\" is a CSS theme (dm_dolj/site.nsf/sobis.citygov.css) on an IBM/HCL Domino \".nsf\" portal (dm_dolj/site.nsf/atasament/... confirmed live), not a JSON-API Sobis deployment. Left unpolled — no adapter targets Domino .nsf yet.",
+      "verified_at": "2026-08-31",
+      "verification_method": "live_http_probe_corrected_after_extraction_dry_run",
+      "probed_urls": [
+        "https://cjdolj.ro/",
+        "https://cjdolj.ro/monitorul-oficial-local/",
+        "https://cjdolj.ro/achizitii-publice/",
+        "https://cjdolj.ro/api/public/anunturi"
+      ]
+    },
+    {
+      "county": "Galați",
+      "county_code": "GL",
+      "entity_name": "Consiliul Județean Galați",
+      "base_url": "https://cjgalati.ro",
+      "platform": "wordpress",
+      "detection_evidence": "https://cjgalati.ro/wp-json/ returned JSON with 'namespaces' key",
+      "verified_at": "2026-08-31",
+      "verification_method": "live_http_probe",
+      "probed_urls": [
+        "https://cjgalati.ro/",
+        "https://cjgalati.ro/monitorul-oficial-local/",
+        "https://cjgalati.ro/achizitii-publice/",
+        "https://cjgalati.ro/api/public/anunturi",
+        "https://cjgalati.ro/wp-json/"
+      ]
+    },
+    {
+      "county": "Giurgiu",
+      "county_code": "GR",
+      "entity_name": "Consiliul Județean Giurgiu",
+      "base_url": "https://cjgiurgiu.ro",
+      "platform": "wordpress",
+      "detection_evidence": "https://cjgiurgiu.ro/wp-json/ returned JSON with 'namespaces' key",
+      "verified_at": "2026-08-31",
+      "verification_method": "live_http_probe",
+      "probed_urls": [
+        "https://cjgiurgiu.ro/",
+        "https://cjgiurgiu.ro/monitorul-oficial-local/",
+        "https://cjgiurgiu.ro/achizitii-publice/",
+        "https://cjgiurgiu.ro/api/public/anunturi",
+        "https://cjgiurgiu.ro/wp-json/"
+      ]
+    },
+    {
+      "county": "Gorj",
+      "county_code": "GJ",
+      "entity_name": "Consiliul Județean Gorj",
+      "base_url": "https://www.cjgorj.ro",
+      "platform": "wordpress",
+      "detection_evidence": "https://www.cjgorj.ro/wp-json/ returned JSON with 'namespaces' key",
+      "verified_at": "2026-08-31",
+      "verification_method": "live_http_probe",
+      "probed_urls": [
+        "https://cjgorj.ro/",
+        "http://cjgorj.ro/",
+        "https://www.cjgorj.ro/",
+        "https://www.cjgorj.ro/monitorul-oficial-local/",
+        "https://www.cjgorj.ro/achizitii-publice/",
+        "https://www.cjgorj.ro/api/public/anunturi",
+        "https://www.cjgorj.ro/wp-json/"
+      ]
+    },
+    {
+      "county": "Harghita",
+      "county_code": "HR",
+      "entity_name": "Consiliul Județean Harghita",
+      "base_url": "https://hargitamegye.ro",
+      "platform": "wordpress",
+      "detection_evidence": "https://hargitamegye.ro/wp-json/ returned JSON with 'namespaces' key",
+      "verified_at": "2026-08-31",
+      "verification_method": "live_http_probe",
+      "probed_urls": [
+        "https://cjharghita.ro/",
+        "http://cjharghita.ro/",
+        "https://www.cjharghita.ro/",
+        "http://www.cjharghita.ro/",
+        "https://hargitamegye.ro/",
+        "https://hargitamegye.ro/monitorul-oficial-local/",
+        "https://hargitamegye.ro/achizitii-publice/",
+        "https://hargitamegye.ro/api/public/anunturi",
+        "https://hargitamegye.ro/wp-json/"
+      ]
+    },
+    {
+      "county": "Hunedoara",
+      "county_code": "HD",
+      "entity_name": "Consiliul Județean Hunedoara",
+      "base_url": "https://cjhunedoara.ro",
+      "platform": "generic_html",
+      "detection_evidence": "homepage responded; no wordpress/drupal/sobis/indeco signature confirmed",
+      "verified_at": "2026-08-31",
+      "verification_method": "live_http_probe",
+      "probed_urls": [
+        "https://cjhunedoara.ro/",
+        "https://cjhunedoara.ro/monitorul-oficial-local/",
+        "https://cjhunedoara.ro/achizitii-publice/",
+        "https://cjhunedoara.ro/api/public/anunturi",
+        "https://cjhunedoara.ro/wp-json/",
+        "https://cjhunedoara.ro/jsonapi/"
+      ]
+    },
+    {
+      "county": "Ialomița",
+      "county_code": "IL",
+      "entity_name": "Consiliul Județean Ialomița",
+      "base_url": "https://cjialomita.ro",
+      "platform": "wordpress",
+      "detection_evidence": "https://cjialomita.ro/wp-json/ returned JSON with 'namespaces' key",
+      "verified_at": "2026-08-31",
+      "verification_method": "live_http_probe",
+      "probed_urls": [
+        "https://cjialomita.ro/",
+        "https://cjialomita.ro/monitorul-oficial-local/",
+        "https://cjialomita.ro/achizitii-publice/",
+        "https://cjialomita.ro/api/public/anunturi",
+        "https://cjialomita.ro/wp-json/"
+      ]
+    },
+    {
+      "county": "Iași",
+      "county_code": "IS",
+      "entity_name": "Consiliul Județean Iași",
+      "base_url": "https://www.cjiasi.ro",
+      "platform": "generic_html",
+      "detection_evidence": "homepage responded; no wordpress/drupal/sobis/indeco signature confirmed",
+      "verified_at": "2026-08-31",
+      "verification_method": "live_http_probe",
+      "probed_urls": [
+        "https://cjiasi.ro/",
+        "http://cjiasi.ro/",
+        "https://www.cjiasi.ro/",
+        "https://www.cjiasi.ro/monitorul-oficial-local/",
+        "https://www.cjiasi.ro/achizitii-publice/",
+        "https://www.cjiasi.ro/api/public/anunturi",
+        "https://www.cjiasi.ro/wp-json/",
+        "https://www.cjiasi.ro/jsonapi/"
+      ]
+    },
+    {
+      "county": "Ilfov",
+      "county_code": "IF",
+      "entity_name": "Consiliul Județean Ilfov",
+      "base_url": "https://cjilfov.ro",
+      "platform": "wordpress",
+      "detection_evidence": "https://cjilfov.ro/wp-json/ returned JSON with 'namespaces' key",
+      "verified_at": "2026-08-31",
+      "verification_method": "live_http_probe",
+      "probed_urls": [
+        "https://cjilfov.ro/",
+        "https://cjilfov.ro/monitorul-oficial-local/",
+        "https://cjilfov.ro/achizitii-publice/",
+        "https://cjilfov.ro/api/public/anunturi",
+        "https://cjilfov.ro/wp-json/"
+      ]
+    },
+    {
+      "county": "Maramureș",
+      "county_code": "MM",
+      "entity_name": "Consiliul Județean Maramureș",
+      "base_url": "https://cjmaramures.ro",
+      "platform": "generic_html",
+      "detection_evidence": "homepage responded; no wordpress/drupal/sobis/indeco signature confirmed",
+      "verified_at": "2026-08-31",
+      "verification_method": "live_http_probe",
+      "probed_urls": [
+        "https://cjmaramures.ro/",
+        "https://cjmaramures.ro/monitorul-oficial-local/",
+        "https://cjmaramures.ro/achizitii-publice/",
+        "https://cjmaramures.ro/api/public/anunturi",
+        "https://cjmaramures.ro/wp-json/",
+        "https://cjmaramures.ro/jsonapi/"
+      ]
+    },
+    {
+      "county": "Mehedinți",
+      "county_code": "MH",
+      "entity_name": "Consiliul Județean Mehedinți",
+      "base_url": "https://cjmehedinti.ro",
+      "platform": "generic_html",
+      "detection_evidence": "homepage responded; no wordpress/drupal/sobis/indeco signature confirmed",
+      "verified_at": "2026-08-31",
+      "verification_method": "live_http_probe",
+      "probed_urls": [
+        "https://cjmehedinti.ro/",
+        "https://cjmehedinti.ro/monitorul-oficial-local/",
+        "https://cjmehedinti.ro/achizitii-publice/",
+        "https://cjmehedinti.ro/api/public/anunturi",
+        "https://cjmehedinti.ro/wp-json/",
+        "https://cjmehedinti.ro/jsonapi/"
+      ]
+    },
+    {
+      "county": "Mureș",
+      "county_code": "MS",
+      "entity_name": "Consiliul Județean Mureș",
+      "base_url": "https://cjmures.ro",
+      "platform": "generic_html",
+      "detection_evidence": "homepage responded; no wordpress/drupal/sobis/indeco signature confirmed",
+      "verified_at": "2026-08-31",
+      "verification_method": "live_http_probe",
+      "probed_urls": [
+        "https://cjmures.ro/",
+        "https://cjmures.ro/monitorul-oficial-local/",
+        "https://cjmures.ro/achizitii-publice/",
+        "https://cjmures.ro/api/public/anunturi",
+        "https://cjmures.ro/wp-json/",
+        "https://cjmures.ro/jsonapi/"
+      ]
+    },
+    {
+      "county": "Neamț",
+      "county_code": "NT",
+      "entity_name": "Consiliul Județean Neamț",
+      "base_url": "https://cjneamt.ro",
+      "platform": "wordpress",
+      "detection_evidence": "https://cjneamt.ro/wp-json/ returned JSON with 'namespaces' key",
+      "verified_at": "2026-08-31",
+      "verification_method": "live_http_probe",
+      "probed_urls": [
+        "https://cjneamt.ro/",
+        "https://cjneamt.ro/monitorul-oficial-local/",
+        "https://cjneamt.ro/achizitii-publice/",
+        "https://cjneamt.ro/api/public/anunturi",
+        "https://cjneamt.ro/wp-json/"
+      ]
+    },
+    {
+      "county": "Olt",
+      "county_code": "OT",
+      "entity_name": "Consiliul Județean Olt",
+      "base_url": "https://cjolt.ro",
+      "platform": "wordpress",
+      "detection_evidence": "https://cjolt.ro/wp-json/ returned JSON with 'namespaces' key",
+      "verified_at": "2026-08-31",
+      "verification_method": "live_http_probe",
+      "probed_urls": [
+        "https://cjolt.ro/",
+        "https://cjolt.ro/monitorul-oficial-local/",
+        "https://cjolt.ro/achizitii-publice/",
+        "https://cjolt.ro/api/public/anunturi",
+        "https://cjolt.ro/wp-json/"
+      ]
+    },
+    {
+      "county": "Prahova",
+      "county_code": "PH",
+      "entity_name": "Consiliul Județean Prahova",
+      "base_url": "https://cjph.ro",
+      "platform": "wordpress",
+      "detection_evidence": "https://cjph.ro/wp-json/ returned JSON with 'namespaces' key",
+      "verified_at": "2026-08-31",
+      "verification_method": "live_http_probe",
+      "probed_urls": [
+        "https://cjph.ro/",
+        "https://cjph.ro/monitorul-oficial-local/",
+        "https://cjph.ro/achizitii-publice/",
+        "https://cjph.ro/api/public/anunturi",
+        "https://cjph.ro/wp-json/"
+      ]
+    },
+    {
+      "county": "Sălaj",
+      "county_code": "SJ",
+      "entity_name": "Consiliul Județean Sălaj",
+      "base_url": "https://cjsj.ro",
+      "platform": "domino_nsf",
+      "detection_evidence": "Originally probed as generic_html; a follow-up homepage check found \".nsf\" in the HTML, indicating an IBM/HCL Domino portal — reclassified accordingly. No adapter targets this platform yet.",
+      "verified_at": "2026-08-31",
+      "verification_method": "live_http_probe_corrected_after_extraction_dry_run",
+      "probed_urls": [
+        "https://cjsj.ro/",
+        "https://cjsj.ro/monitorul-oficial-local/",
+        "https://cjsj.ro/achizitii-publice/",
+        "https://cjsj.ro/api/public/anunturi",
+        "https://cjsj.ro/wp-json/",
+        "https://cjsj.ro/jsonapi/"
+      ]
+    },
+    {
+      "county": "Satu Mare",
+      "county_code": "SM",
+      "entity_name": "Consiliul Județean Satu Mare",
+      "base_url": "https://cjsm.ro",
+      "platform": "generic_html",
+      "detection_evidence": "homepage responded; no wordpress/drupal/sobis/indeco signature confirmed",
+      "verified_at": "2026-08-31",
+      "verification_method": "live_http_probe",
+      "probed_urls": [
+        "https://cjsm.ro/",
+        "https://cjsm.ro/monitorul-oficial-local/",
+        "https://cjsm.ro/achizitii-publice/",
+        "https://cjsm.ro/api/public/anunturi",
+        "https://cjsm.ro/wp-json/",
+        "https://cjsm.ro/jsonapi/"
+      ]
+    },
+    {
+      "county": "Sibiu",
+      "county_code": "SB",
+      "entity_name": "Consiliul Județean Sibiu",
+      "base_url": "https://cjsibiu.ro",
+      "platform": "wordpress",
+      "detection_evidence": "https://cjsibiu.ro/wp-json/ returned JSON with 'namespaces' key",
+      "verified_at": "2026-08-31",
+      "verification_method": "live_http_probe",
+      "probed_urls": [
+        "https://cjsibiu.ro/",
+        "https://cjsibiu.ro/monitorul-oficial-local/",
+        "https://cjsibiu.ro/achizitii-publice/",
+        "https://cjsibiu.ro/api/public/anunturi",
+        "https://cjsibiu.ro/wp-json/"
+      ]
+    },
+    {
+      "county": "Suceava",
+      "county_code": "SV",
+      "entity_name": "Consiliul Județean Suceava",
+      "base_url": "https://cjsuceava.ro",
+      "platform": "generic_html",
+      "detection_evidence": "homepage responded; no wordpress/drupal/sobis/indeco signature confirmed",
+      "verified_at": "2026-08-31",
+      "verification_method": "live_http_probe",
+      "probed_urls": [
+        "https://cjsuceava.ro/",
+        "https://cjsuceava.ro/monitorul-oficial-local/",
+        "https://cjsuceava.ro/achizitii-publice/",
+        "https://cjsuceava.ro/api/public/anunturi",
+        "https://cjsuceava.ro/wp-json/",
+        "https://cjsuceava.ro/jsonapi/"
+      ]
+    },
+    {
+      "county": "Teleorman",
+      "county_code": "TR",
+      "entity_name": "Consiliul Județean Teleorman",
+      "base_url": "https://cjteleorman.ro",
+      "platform": "generic_html",
+      "detection_evidence": "homepage responded; no wordpress/drupal/sobis/indeco signature confirmed",
+      "verified_at": "2026-08-31",
+      "verification_method": "live_http_probe",
+      "probed_urls": [
+        "https://cjteleorman.ro/",
+        "https://cjteleorman.ro/monitorul-oficial-local/",
+        "https://cjteleorman.ro/achizitii-publice/",
+        "https://cjteleorman.ro/api/public/anunturi",
+        "https://cjteleorman.ro/wp-json/",
+        "https://cjteleorman.ro/jsonapi/"
+      ]
+    },
+    {
+      "county": "Timiș",
+      "county_code": "TM",
+      "entity_name": "Consiliul Județean Timiș",
+      "base_url": "https://cjtimis.ro",
+      "platform": "wordpress",
+      "detection_evidence": "https://cjtimis.ro/wp-json/ returned JSON with 'namespaces' key",
+      "verified_at": "2026-08-31",
+      "verification_method": "live_http_probe",
+      "probed_urls": [
+        "https://cjtimis.ro/",
+        "https://cjtimis.ro/monitorul-oficial-local/",
+        "https://cjtimis.ro/achizitii-publice/",
+        "https://cjtimis.ro/api/public/anunturi",
+        "https://cjtimis.ro/wp-json/"
+      ]
+    },
+    {
+      "county": "Tulcea",
+      "county_code": "TL",
+      "entity_name": "Consiliul Județean Tulcea",
+      "base_url": "https://cjtulcea.ro",
+      "platform": "sharepoint",
+      "detection_evidence": "__VIEWSTATE present, but meta name=\"GENERATOR\" content=\"Microsoft SharePoint\" confirmed live on https://cjtulcea.ro/monitorul-oficial-local/ (200, SharePoint markup, no GridView table) — this site is Microsoft SharePoint, not Indeco Soft; ASP.NET WebForms alone (__VIEWSTATE) is not a reliable Indeco signature since SharePoint emits the same hidden fields. /achizitii-publice/ 404s outright on this site. No adapter targets SharePoint yet — left unpolled rather than misrouted to IndecoAdapter.",
+      "verified_at": "2026-08-31",
+      "verification_method": "live_http_probe_corrected_after_extraction_dry_run",
+      "probed_urls": [
+        "https://cjtulcea.ro/",
+        "https://cjtulcea.ro/monitorul-oficial-local/",
+        "https://cjtulcea.ro/achizitii-publice/"
+      ]
+    },
+    {
+      "county": "Vaslui",
+      "county_code": "VS",
+      "entity_name": "Consiliul Județean Vaslui",
+      "base_url": "https://cjvs.eu",
+      "platform": "wordpress",
+      "detection_evidence": "https://cjvs.eu/wp-json/ returned JSON with 'namespaces' key",
+      "verified_at": "2026-08-31",
+      "verification_method": "live_http_probe",
+      "probed_urls": [
+        "https://cjvs.eu/",
+        "https://cjvs.eu/monitorul-oficial-local/",
+        "https://cjvs.eu/achizitii-publice/",
+        "https://cjvs.eu/api/public/anunturi",
+        "https://cjvs.eu/wp-json/"
+      ]
+    },
+    {
+      "county": "Vâlcea",
+      "county_code": "VL",
+      "entity_name": "Consiliul Județean Vâlcea",
+      "base_url": "https://cjvalcea.ro",
+      "platform": "wordpress",
+      "detection_evidence": "https://cjvalcea.ro/wp-json/ returned JSON with 'namespaces' key",
+      "verified_at": "2026-08-31",
+      "verification_method": "live_http_probe",
+      "probed_urls": [
+        "https://cjvalcea.ro/",
+        "https://cjvalcea.ro/monitorul-oficial-local/",
+        "https://cjvalcea.ro/achizitii-publice/",
+        "https://cjvalcea.ro/api/public/anunturi",
+        "https://cjvalcea.ro/wp-json/"
+      ]
+    },
+    {
+      "county": "Vrancea",
+      "county_code": "VN",
+      "entity_name": "Consiliul Județean Vrancea",
+      "base_url": "https://cjvrancea.ro",
+      "platform": "wordpress",
+      "detection_evidence": "https://cjvrancea.ro/wp-json/ returned JSON with 'namespaces' key",
+      "verified_at": "2026-08-31",
+      "verification_method": "live_http_probe",
+      "probed_urls": [
+        "https://cjvrancea.ro/",
+        "https://cjvrancea.ro/monitorul-oficial-local/",
+        "https://cjvrancea.ro/achizitii-publice/",
+        "https://cjvrancea.ro/api/public/anunturi",
+        "https://cjvrancea.ro/wp-json/"
+      ]
+    }
+  ]
+}

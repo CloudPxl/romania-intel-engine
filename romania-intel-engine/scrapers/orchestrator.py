@@ -20,6 +20,7 @@ from scrapers.matrix.digital_scrapers import AdrNordVestScraper, OradeaAchizitii
 from scrapers.matrix.municipal_scrapers import (
     PmbAchizitiiScraper, TimisoaraHclScraper, ConstantaAchizitiiScraper
 )
+from scrapers.matrix.municipal_matrix import CountyRegistryScraper
 from ai_refinery import IntelligenceRefineryEngine
 from matching_engine import TENANT_ORGANIZATIONS, TenantMatchingEngine
 from notifier import LeadAlertDispatcher
@@ -76,6 +77,15 @@ class OpportunityOrchestrator:
             # which SEAP notice types (CN/SC) are still unimplemented.
             self.scrapers.append(DirectAcquisitionScraper())
             self.scrapers.append(DaAwardNoticeScraper())
+        if os.getenv("ENABLE_LIVE_COUNTY_REGISTRY", "false").lower() == "true":
+            # Polymorphic CMS-adapter coverage of county councils beyond
+            # the 3 hand-integrated municipal sources above — see
+            # scrapers/matrix/municipal_matrix.py and
+            # scrapers/config/county_registries.json for exactly which
+            # counties are live and which CMS platform each was confirmed
+            # to run. Same live-verified-before-shipping rollout gate as
+            # the two flags above.
+            self.scrapers.append(CountyRegistryScraper())
 
     async def run_pipeline(self) -> Dict[str, Any]:
         active_scrapers = []
