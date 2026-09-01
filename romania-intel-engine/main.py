@@ -5,7 +5,7 @@ from rich.table import Table
 from src.database.models import init_db, get_db_connection
 from src.scrapers.registry import registry
 from src.scrapers.sources.seap_consultations import SeapMarketConsultationAdapter
-from src.scrapers.sources.anpm_environment import AnpmEnvironmentAdapter
+from src.scrapers.sources.apm_environment import ApmEnvironmentalAdapter
 from src.scrapers.sources.adr_national import NationalAdrHubAdapter
 
 console = Console()
@@ -18,10 +18,13 @@ async def run_pipeline():
     init_db()
 
     registry.register(SeapMarketConsultationAdapter())
-    registry.register(AnpmEnvironmentAdapter(county="Iasi", domain_code="apm-is"))
+    registry.register(ApmEnvironmentalAdapter(county="Iasi", domain_code="apm-is"))
     registry.register(NationalAdrHubAdapter())
 
-    adapters = registry.get_all()
+    # registry.get_all() returns a {name: adapter} dict, so iterating it
+    # directly yields the string keys — .execute_safe() would raise
+    # AttributeError on every one.
+    adapters = registry.get_all().values()
     console.print(f"[cyan][*] Running {len(adapters)} active multi-source adapters...[/cyan]\n")
 
     total_new_records = 0
