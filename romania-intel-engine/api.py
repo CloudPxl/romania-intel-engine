@@ -4,6 +4,7 @@ import io
 import asyncio
 import json
 import logging
+import re
 import uuid
 from contextlib import asynccontextmanager
 from datetime import date, datetime, timezone
@@ -29,6 +30,10 @@ from notifier import LeadAlertDispatcher
 from security import (
     SecurityGuard, require_auth, require_tenant_membership,
     enforce_onboarding_rate_limit, delete_supabase_auth_identity,
+    # Imported by reference for the /api/v1/system/status diagnostic below.
+    # security.py only ever mutates this dict in place, never rebinds it,
+    # so the reference stays live.
+    RATE_LIMIT_STORE, RATE_LIMIT_REQUESTS,
 )
 
 from addons.caiet_analyzer import CaietDeSarciniAnalyzer, TextExtractionError
@@ -120,47 +125,96 @@ async def lifespan(app: FastAPI):
     yield
     scheduler.shutdown()
 
-app = FastAPI(title="RO-INTEL Enterprise Procurement Engine", version="2.4.0", lifespan=lifespan)
+app = FastAPI(title="RO-INTEL Enterprise Procurement Engine", version="2.4.1", lifespan=lifespan)
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["http://localhost:3000", "https://ro-intel.xyz", "https://www.ro-intel.xyz", "https://romania-intel-frontend.vercel.app"],
-    allow_origin_regex=r"https://.*\.vercel\.app",
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+ALLOWED_ORIGINS = [
+    "http://localhost:3000",
+    "https://ro-intel.xyz",
+    "https://www.ro-intel.xyz",
+    "https://romania-intel-frontend.vercel.app",
+]
+ALLOWED_ORIGIN_REGEX = r"https://.*\.vercel\.app"
 
 app.include_router(eligibility.router)
 app.include_router(drafting.router)
 app.include_router(analysis.router)
 
 
+def _cors_headers(request: Request) -> Dict[str, str]:
+    """Access-Control headers for a response built *outside* CORSMiddleware.
+
+    Only ServerErrorMiddleware's path needs this (see
+    unhandled_exception_handler) — everything else is produced inside the
+    middleware chain and gets these headers added for it.
+    """
+    origin = request.headers.get("origin")
+    if not origin:
+        return {}
+    if origin not in ALLOWED_ORIGINS and not re.fullmatch(ALLOWED_ORIGIN_REGEX, origin):
+        return {}
+    return {
+        "Access-Control-Allow-Origin": origin,
+        "Access-Control-Allow-Credentials": "true",
+        "Vary": "Origin",
+    }
+
+
 @app.exception_handler(Exception)
 async def unhandled_exception_handler(request: Request, exc: Exception):
-    # Starlette's ServerErrorMiddleware (auto-installed, always outermost)
-    # is what catches a truly unhandled exception by default, and it sends
-    # its plain-text 500 using the raw ASGI `send` it was given — which is
-    # OUTSIDE CORSMiddleware below, so that response never gets CORS
-    # headers. A browser then can't read the response at all: fetch()
-    # throws a bare network error, not a readable 500, and the frontend
-    # (which only knows how to decode a JSON `detail` body) falls back to
-    # a generic "server not responding" message — indistinguishable from a
-    # real outage, for what was actually a normal request that hit a bug.
-    #
-    # Registering a handler here runs inside FastAPI's own ExceptionMiddleware
-    # instead, which sits *inside* CORSMiddleware — so this response goes
-    # back out through the normal middleware chain and picks up CORS
-    # headers correctly. This does not shadow any HTTPException handling
-    # (FastAPI/Starlette resolve handlers by the most specific registered
-    # class in the exception's MRO, and HTTPException has its own handler
-    # registered separately), so 401/403/404/etc. are unaffected — this
-    # only ever fires for a genuine unhandled bug.
+    """Last-resort handler for an exception that escaped every middleware.
+
+    Registering a handler for `Exception` does NOT place it inside the
+    normal chain the way a per-status handler would: Starlette pulls it
+    out in build_middleware_stack() and hands it to ServerErrorMiddleware,
+    which is unconditionally the OUTERMOST layer — outside CORSMiddleware.
+    So this response has to carry its own CORS headers or the browser
+    silently discards it (verified empirically: without them, a real 500
+    reaches JS as a bare "Failed to fetch", indistinguishable from the
+    server being down — which is exactly how a routine backend bug got
+    misdiagnosed as an outage). catch_exceptions_middleware below handles
+    the common case from *inside* CORS; this covers what it can't reach.
+    """
     logger.error(f"[UNHANDLED] {request.method} {request.url.path}: {exc}", exc_info=True)
     return JSONResponse(
         status_code=500,
         content={"detail": "A apărut o eroare neașteptată pe server. Reîncercați sau contactați suportul dacă persistă."},
+        headers=_cors_headers(request),
     )
+
+
+# --- Middleware ------------------------------------------------------------
+#
+# ORDER IS LOAD-BEARING and reads bottom-up: add_middleware() inserts at
+# index 0, so the LAST one registered is the OUTERMOST layer. CORSMiddleware
+# must therefore be registered LAST, so that every response produced by the
+# layers below it — including a short-circuited 429 and a caught 500 — passes
+# back out through it and picks up Access-Control-Allow-Origin.
+#
+# This was the actual cause of a total login outage: rate_limit_middleware
+# was registered after CORSMiddleware, which put it OUTSIDE CORS, so its 429
+# went to the browser with no CORS headers. fetch() then rejected with a bare
+# network error instead of a readable 429, AuthContext fell through to its
+# "serverul nu răspunde" fallback, and every user saw an apparent outage while
+# the API was in fact healthy and answering correctly.
+
+
+@app.middleware("http")
+async def catch_exceptions_middleware(request: Request, call_next):
+    """Converts any unhandled route exception into a readable JSON 500.
+
+    Registered FIRST, so it ends up innermost — inside CORSMiddleware —
+    which is the whole point: a response returned from here still flows
+    back out through CORS and stays readable to the browser, unlike the
+    app-level Exception handler above.
+    """
+    try:
+        return await call_next(request)
+    except Exception as e:
+        logger.error(f"[UNHANDLED] {request.method} {request.url.path}: {e}", exc_info=True)
+        return JSONResponse(
+            status_code=500,
+            content={"detail": "A apărut o eroare neașteptată pe server. Reîncercați sau contactați suportul dacă persistă."},
+        )
 
 
 @app.middleware("http")
@@ -176,7 +230,21 @@ async def rate_limit_middleware(request: Request, call_next):
             SecurityGuard.enforce_rate_limit(request)
         except HTTPException as e:
             return JSONResponse(status_code=e.status_code, content={"detail": e.detail})
+        except Exception as e:
+            # The limiter is infrastructure, not the request's purpose —
+            # a bug in it must never take down the API it protects.
+            logger.error(f"[RateLimit] Limiter failed open on {request.url.path}: {e}", exc_info=True)
     return await call_next(request)
+
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=ALLOWED_ORIGINS,
+    allow_origin_regex=ALLOWED_ORIGIN_REGEX,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 class AuthSyncRequest(BaseModel):
     email: EmailStr
@@ -407,6 +475,16 @@ async def system_status():
         "minutes_since_last_tick": minutes_since,
         "is_stale": minutes_since is None or minutes_since > STALENESS_THRESHOLD_MINUTES,
         "database": database,
+        # Distinct callers currently inside the rate-limit window. A count
+        # only — never the addresses themselves, since this route is public.
+        # Worth surfacing because a value pinned at 1 while several people
+        # are using the site is the signature of security.client_ip failing
+        # to see past the proxy, which collapses every visitor into one
+        # shared budget and locks them all out together once it trips.
+        "rate_limit": {
+            "tracked_clients": len(RATE_LIMIT_STORE),
+            "limit_per_window": RATE_LIMIT_REQUESTS,
+        },
         **(
             {"detail": "no tick recorded because persistence is unavailable — check DATABASE_URL"}
             if last is None and not database["reachable"]

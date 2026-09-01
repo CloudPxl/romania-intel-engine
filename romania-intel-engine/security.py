@@ -132,6 +132,35 @@ async def delete_supabase_auth_identity(user_id: str) -> bool:
         return False
 
 
+def client_ip(request: Request) -> str:
+    """The real caller's IP, not the proxy's.
+
+    `request.client.host` is only the true client when the app is reached
+    directly. In production it is not: Render terminates TLS at its edge
+    and proxies to the app, and uvicorn is started via `uvicorn.run()` in
+    server.py, whose `forwarded_allow_ips` default of "127.0.0.1" means it
+    will NOT trust the edge's X-Forwarded-For. `request.client.host` is
+    therefore Render's internal proxy address — THE SAME VALUE FOR EVERY
+    USER — which silently turned the per-IP budgets below into one global
+    budget shared by every visitor, the heartbeat, and every health probe.
+    Once any of them burst past the limit, every user everywhere was
+    locked out at once.
+
+    The leftmost X-Forwarded-For entry is the originating client. It is
+    client-supplied and therefore spoofable, which here only means an
+    attacker can hand themselves a fresh rate-limit bucket — strictly less
+    harmful than the alternative this replaces, where one caller's burst
+    denied service to everyone. Nothing security-sensitive keys off this
+    value; authentication is the JWT, never the address.
+    """
+    forwarded = request.headers.get("x-forwarded-for", "")
+    if forwarded:
+        first = forwarded.split(",")[0].strip()
+        if first:
+            return first
+    return request.client.host if request.client else "127.0.0.1"
+
+
 class SecurityGuard:
     @staticmethod
     def _cleanup_stale_ips(now: float) -> None:
@@ -151,47 +180,50 @@ class SecurityGuard:
 
     @staticmethod
     def enforce_rate_limit(request: Request):
-        client_ip = request.client.host if request.client else "127.0.0.1"
+        ip = client_ip(request)
         now = time.time()
 
         SecurityGuard._cleanup_stale_ips(now)
 
-        if client_ip in RATE_LIMIT_STORE:
-            count, start_time = RATE_LIMIT_STORE[client_ip]
+        if ip in RATE_LIMIT_STORE:
+            count, start_time = RATE_LIMIT_STORE[ip]
             if now - start_time < RATE_LIMIT_WINDOW:
                 if count >= RATE_LIMIT_REQUESTS:
-                    logger.warning(f"Rate limit exceeded for IP: {client_ip}")
-                    raise HTTPException(status_code=429, detail="Too many requests. Please slow down.")
-                RATE_LIMIT_STORE[client_ip] = (count + 1, start_time)
+                    logger.warning(f"Rate limit exceeded for IP: {ip}")
+                    raise HTTPException(
+                        status_code=429,
+                        detail="Prea multe cereri de pe această adresă. Reîncercați în câteva momente.",
+                    )
+                RATE_LIMIT_STORE[ip] = (count + 1, start_time)
             else:
-                RATE_LIMIT_STORE[client_ip] = (1, now)
+                RATE_LIMIT_STORE[ip] = (1, now)
         else:
-            RATE_LIMIT_STORE[client_ip] = (1, now)
+            RATE_LIMIT_STORE[ip] = (1, now)
 
     @staticmethod
     def enforce_onboarding_rate_limit(request: Request):
         """Tighter, route-scoped budget layered on top of the global
         limiter above — see ONBOARDING_RATE_LIMIT_REQUESTS' comment for
         why self-serve tenant creation needs its own, much stricter cap."""
-        client_ip = request.client.host if request.client else "127.0.0.1"
+        ip = client_ip(request)
         now = time.time()
 
         SecurityGuard._cleanup_stale_ips(now)
 
-        if client_ip in ONBOARDING_RATE_LIMIT_STORE:
-            count, start_time = ONBOARDING_RATE_LIMIT_STORE[client_ip]
+        if ip in ONBOARDING_RATE_LIMIT_STORE:
+            count, start_time = ONBOARDING_RATE_LIMIT_STORE[ip]
             if now - start_time < ONBOARDING_RATE_LIMIT_WINDOW:
                 if count >= ONBOARDING_RATE_LIMIT_REQUESTS:
-                    logger.warning(f"[SecurityGuard] Onboarding rate limit exceeded for IP: {client_ip}")
+                    logger.warning(f"[SecurityGuard] Onboarding rate limit exceeded for IP: {ip}")
                     raise HTTPException(
                         status_code=429,
                         detail="Prea multe încercări de înregistrare de pe această adresă. Reîncercați peste o oră.",
                     )
-                ONBOARDING_RATE_LIMIT_STORE[client_ip] = (count + 1, start_time)
+                ONBOARDING_RATE_LIMIT_STORE[ip] = (count + 1, start_time)
             else:
-                ONBOARDING_RATE_LIMIT_STORE[client_ip] = (1, now)
+                ONBOARDING_RATE_LIMIT_STORE[ip] = (1, now)
         else:
-            ONBOARDING_RATE_LIMIT_STORE[client_ip] = (1, now)
+            ONBOARDING_RATE_LIMIT_STORE[ip] = (1, now)
 
     @staticmethod
     def verify_tenant_authorization(request: Request) -> Dict:
