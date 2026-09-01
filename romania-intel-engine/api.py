@@ -136,6 +136,33 @@ app.include_router(drafting.router)
 app.include_router(analysis.router)
 
 
+@app.exception_handler(Exception)
+async def unhandled_exception_handler(request: Request, exc: Exception):
+    # Starlette's ServerErrorMiddleware (auto-installed, always outermost)
+    # is what catches a truly unhandled exception by default, and it sends
+    # its plain-text 500 using the raw ASGI `send` it was given — which is
+    # OUTSIDE CORSMiddleware below, so that response never gets CORS
+    # headers. A browser then can't read the response at all: fetch()
+    # throws a bare network error, not a readable 500, and the frontend
+    # (which only knows how to decode a JSON `detail` body) falls back to
+    # a generic "server not responding" message — indistinguishable from a
+    # real outage, for what was actually a normal request that hit a bug.
+    #
+    # Registering a handler here runs inside FastAPI's own ExceptionMiddleware
+    # instead, which sits *inside* CORSMiddleware — so this response goes
+    # back out through the normal middleware chain and picks up CORS
+    # headers correctly. This does not shadow any HTTPException handling
+    # (FastAPI/Starlette resolve handlers by the most specific registered
+    # class in the exception's MRO, and HTTPException has its own handler
+    # registered separately), so 401/403/404/etc. are unaffected — this
+    # only ever fires for a genuine unhandled bug.
+    logger.error(f"[UNHANDLED] {request.method} {request.url.path}: {exc}", exc_info=True)
+    return JSONResponse(
+        status_code=500,
+        content={"detail": "A apărut o eroare neașteptată pe server. Reîncercați sau contactați suportul dacă persistă."},
+    )
+
+
 @app.middleware("http")
 async def rate_limit_middleware(request: Request, call_next):
     # Global, IP-based — safe to enable unconditionally since it requires
