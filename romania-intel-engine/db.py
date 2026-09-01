@@ -1024,7 +1024,12 @@ async def update_own_tenant_product(
     return True
 
 
-async def update_tenant_alert_settings(tenant_id: str, alert_emails: List[str], min_alert_score: float) -> bool:
+async def update_tenant_alert_settings(
+    tenant_id: str,
+    alert_emails: List[str],
+    min_alert_score: float,
+    telegram_chat_id: Optional[str] = None,
+) -> bool:
     """Lets a tenant change where automated alerts actually go and at what
     score they fire — the real dispatch-side counterpart to
     update_own_tenant_product (which only ever touched matching criteria,
@@ -1033,15 +1038,31 @@ async def update_tenant_alert_settings(tenant_id: str, alert_emails: List[str], 
     frontend's Settings modal wrote a notification email/threshold to
     localStorage only — it looked saved, but automated alerts kept using
     whatever create_self_provisioned_tenant set once at signup ([email],
-    7.5), forever."""
+    7.5), forever.
+
+    telegram_chat_id closes the other half of that gap: the column existed
+    and notifier.py read it, but only scripts/provision_tenant.py's
+    --telegram-chat-id flag could ever set it, so Telegram alerts were
+    unreachable for every self-provisioned individual. None means "leave
+    whatever is stored alone" (the caller didn't submit the field);
+    clearing it is done by submitting an empty string, which is
+    normalised to SQL NULL so notifier.py's `if not chat_id` skip works
+    rather than the dispatcher trying to send to "".
+    """
     async with with_connection() as conn:
         if conn is None:
             return False
         try:
-            await conn.execute(
-                "UPDATE tenants SET alert_emails = $1, min_alert_score = $2 WHERE id = $3",
-                alert_emails, min_alert_score, tenant_id,
-            )
+            if telegram_chat_id is None:
+                await conn.execute(
+                    "UPDATE tenants SET alert_emails = $1, min_alert_score = $2 WHERE id = $3",
+                    alert_emails, min_alert_score, tenant_id,
+                )
+            else:
+                await conn.execute(
+                    "UPDATE tenants SET alert_emails = $1, min_alert_score = $2, telegram_chat_id = $3 WHERE id = $4",
+                    alert_emails, min_alert_score, telegram_chat_id.strip() or None, tenant_id,
+                )
         except asyncpg.exceptions.UndefinedTableError:
             logger.warning("[DB] tenants not found — run tenants_schema.sql.")
             return False

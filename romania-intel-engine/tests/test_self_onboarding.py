@@ -521,22 +521,74 @@ class TestAlertSettingsRoute:
         )
         assert r.status_code == 422
 
-    def test_valid_update_calls_db_layer(self, monkeypatch):
-        monkeypatch.setattr(db, "DATABASE_URL", "")
+    @staticmethod
+    def _capture_update(monkeypatch):
         calls = {}
 
-        async def fake_update(tenant_id, alert_emails, min_alert_score):
-            calls["args"] = (tenant_id, alert_emails, min_alert_score)
+        async def fake_update(tenant_id, alert_emails, min_alert_score, telegram_chat_id=None):
+            calls["args"] = (tenant_id, alert_emails, min_alert_score, telegram_chat_id)
             return True
 
         monkeypatch.setattr(db, "update_tenant_alert_settings", fake_update)
+        return calls
+
+    def test_valid_update_calls_db_layer(self, monkeypatch):
+        monkeypatch.setattr(db, "DATABASE_URL", "")
+        calls = self._capture_update(monkeypatch)
         client = TestClient(api.app)
         r = client.put(
             "/api/v1/tenants/t1_infra_transilvania/alert-settings",
             json={"alert_email": "vlad@test.ro", "min_alert_score": 8.0},
         )
         assert r.status_code == 200
-        assert calls["args"] == ("t1_infra_transilvania", ["vlad@test.ro"], 8.0)
+        # telegram_chat_id omitted -> None -> "leave whatever is stored".
+        assert calls["args"] == ("t1_infra_transilvania", ["vlad@test.ro"], 8.0, None)
+
+    def test_accepts_numeric_telegram_chat_id(self, monkeypatch):
+        monkeypatch.setattr(db, "DATABASE_URL", "")
+        calls = self._capture_update(monkeypatch)
+        client = TestClient(api.app)
+        r = client.put(
+            "/api/v1/tenants/t1_infra_transilvania/alert-settings",
+            json={"alert_email": "vlad@test.ro", "min_alert_score": 8.0, "telegram_chat_id": " 123456789 "},
+        )
+        assert r.status_code == 200
+        assert calls["args"][3] == "123456789"
+
+    def test_accepts_negative_group_chat_id(self, monkeypatch):
+        """Telegram group/channel ids are negative — must not be rejected."""
+        monkeypatch.setattr(db, "DATABASE_URL", "")
+        calls = self._capture_update(monkeypatch)
+        client = TestClient(api.app)
+        r = client.put(
+            "/api/v1/tenants/t1_infra_transilvania/alert-settings",
+            json={"alert_email": "vlad@test.ro", "min_alert_score": 8.0, "telegram_chat_id": "-1001234567890"},
+        )
+        assert r.status_code == 200
+        assert calls["args"][3] == "-1001234567890"
+
+    def test_empty_telegram_chat_id_clears_it(self, monkeypatch):
+        monkeypatch.setattr(db, "DATABASE_URL", "")
+        calls = self._capture_update(monkeypatch)
+        client = TestClient(api.app)
+        r = client.put(
+            "/api/v1/tenants/t1_infra_transilvania/alert-settings",
+            json={"alert_email": "vlad@test.ro", "min_alert_score": 8.0, "telegram_chat_id": ""},
+        )
+        assert r.status_code == 200
+        assert calls["args"][3] == ""
+
+    def test_rejects_telegram_username(self, monkeypatch):
+        """@username is the likeliest wrong value and the Bot API rejects
+        it — fail loudly here rather than silently never alerting."""
+        monkeypatch.setattr(db, "DATABASE_URL", "")
+        client = TestClient(api.app)
+        r = client.put(
+            "/api/v1/tenants/t1_infra_transilvania/alert-settings",
+            json={"alert_email": "vlad@test.ro", "min_alert_score": 8.0, "telegram_chat_id": "@ionpopescu"},
+        )
+        assert r.status_code == 400
+        assert "numeric" in r.json()["detail"]
 
 
 class _FakeDeleteConnection:

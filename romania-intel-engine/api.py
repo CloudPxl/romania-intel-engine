@@ -328,6 +328,10 @@ def _validate_onboarding_payload(payload: "OnboardingRequest") -> None:
 class AlertSettingsRequest(BaseModel):
     alert_email: EmailStr
     min_alert_score: float = 7.5
+    # Omitted entirely -> leave whatever is stored untouched. Empty string
+    # -> clear it. A Telegram chat id is a numeric string (negative for
+    # groups), obtained from the bot; it is not a @username.
+    telegram_chat_id: Optional[str] = None
 
 class ProformaRequest(BaseModel):
     plan_id: str
@@ -378,7 +382,9 @@ class WinProbabilityRequest(BaseModel):
 
 @app.get("/")
 def root_index():
-    return {"engine": "RO-INTEL Enterprise Procurement Engine", "status": "online", "version": "2.4.0"}
+    # Reads the single source of truth rather than a second hardcoded copy
+    # that silently drifts — this string is how a deploy gets verified.
+    return {"engine": "RO-INTEL Enterprise Procurement Engine", "status": "online", "version": app.version}
 
 @app.get("/health")
 def health_check():
@@ -892,7 +898,22 @@ async def update_tenant_alert_settings(
     changed here."""
     if payload.min_alert_score < 0 or payload.min_alert_score > 10:
         raise HTTPException(status_code=400, detail="Pragul de alertă trebuie să fie între 0 și 10.")
-    ok = await db.update_tenant_alert_settings(tenant_id, [payload.alert_email], payload.min_alert_score)
+    chat_id = payload.telegram_chat_id
+    if chat_id is not None:
+        chat_id = chat_id.strip()
+        # Telegram chat ids are numeric (negative for groups/channels). A
+        # @username is the single most likely thing to be pasted here and
+        # is NOT accepted by the Bot API's sendMessage chat_id, so reject
+        # it with an explanation rather than storing a value that would
+        # silently fail on every future alert.
+        if chat_id and not re.fullmatch(r"-?\d{1,20}", chat_id):
+            raise HTTPException(
+                status_code=400,
+                detail="ID-ul de chat Telegram trebuie să fie numeric (ex: 123456789), nu un @nume de utilizator.",
+            )
+    ok = await db.update_tenant_alert_settings(
+        tenant_id, [payload.alert_email], payload.min_alert_score, chat_id
+    )
     if not ok:
         raise HTTPException(status_code=503, detail="Nu s-au putut salva preferințele — baza de date este indisponibilă.")
     try:
