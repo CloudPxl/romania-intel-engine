@@ -2,6 +2,7 @@ import asyncio
 import os
 import time
 import logging
+import uuid
 from contextlib import asynccontextmanager
 from datetime import date, datetime, timezone
 from decimal import Decimal
@@ -777,12 +778,12 @@ async def get_user_profile(user_id: str) -> Optional[Dict[str, Any]]:
 
 async def upsert_user_profile_email(user_id: str, email: str) -> Optional[Dict[str, Any]]:
     """Called from /api/v1/auth/sync on every login. Only ever touches
-    `email` — tenant_id/role are assigned exclusively by
-    scripts/provision_tenant.py, never by the sync endpoint itself, so a
-    brand-new user lands with tenant_id NULL (reported honestly as "not
-    provisioned yet") instead of being silently defaulted into any
-    tenant's data. Returns the current row (post-upsert) so the caller can
-    read back whatever tenant_id already exists, if any."""
+    `email` — tenant_id/role are assigned by scripts/provision_tenant.py
+    (admin) or create_self_provisioned_tenant (self-serve onboarding),
+    never by the sync endpoint itself, so a brand-new user lands with
+    tenant_id NULL (reported honestly as "not provisioned yet") until one
+    of those two runs. Returns the current row (post-upsert) so the caller
+    can read back whatever tenant_id already exists, if any."""
     async with with_connection() as conn:
         if conn is None:
             return None
@@ -800,3 +801,119 @@ async def upsert_user_profile_email(user_id: str, email: str) -> Optional[Dict[s
             logger.warning("[DB] user_profiles not found — run tenants_schema.sql.")
             return None
     return dict(row) if row else None
+
+
+async def create_self_provisioned_tenant(
+    user_id: str,
+    email: str,
+    display_name: str,
+    domain: str,
+    target_counties: List[str],
+    min_value_ron: float,
+    keywords: List[str],
+    exclude_keywords: List[str],
+) -> Optional[Dict[str, Any]]:
+    """Self-serve counterpart to scripts/provision_tenant.py: a signed-in
+    user with no tenant_id yet creates their own individual tenant, a
+    single product line, and their own membership row, in one transaction
+    — no admin action required. This is the real fix for the "signed in
+    but not associated with any company" dead end: that message was correct
+    behavior for an admin-provisioned model, but this product now sells to
+    individuals, and an individual has no one to email to get unblocked.
+
+    One tenant per person, one product row per tenant (id derived as
+    f"{tenant_id}_prod_main") — update_own_tenant_product below assumes the
+    same shape. A tenant that later needs multiple product lines (the
+    original company-style shape) still goes through
+    scripts/provision_tenant.py, which is unaffected by this function.
+
+    Returns None — never raises — when no database is configured, or when
+    this user already has a tenant (the caller should route them to
+    update_own_tenant_product instead of calling this again, since it never
+    overwrites an existing membership)."""
+    async with with_connection() as conn:
+        if conn is None:
+            return None
+        try:
+            async with conn.transaction():
+                existing = await conn.fetchrow(
+                    "SELECT tenant_id FROM user_profiles WHERE id = $1", user_id
+                )
+                if existing and existing["tenant_id"]:
+                    return None
+
+                tenant_id = f"u_{uuid.uuid4().hex[:12]}"
+                product_id = f"{tenant_id}_prod_main"
+                name = display_name.strip() or email.split("@")[0]
+
+                await conn.execute(
+                    """
+                    INSERT INTO tenants (id, company_name, primary_domain, alert_emails, min_alert_score)
+                    VALUES ($1, $2, $3, $4, $5)
+                    """,
+                    tenant_id, name, domain, [email], 7.5,
+                )
+                await conn.execute(
+                    """
+                    INSERT INTO tenant_products
+                        (id, tenant_id, name, domain, target_counties, min_value_ron, keywords, exclude_keywords)
+                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                    """,
+                    product_id, tenant_id, name, domain,
+                    target_counties, min_value_ron, keywords, exclude_keywords,
+                )
+                await conn.execute(
+                    """
+                    INSERT INTO user_profiles (id, email, tenant_id, role)
+                    VALUES ($1, $2, $3, 'owner')
+                    ON CONFLICT (id) DO UPDATE SET
+                        email = EXCLUDED.email, tenant_id = EXCLUDED.tenant_id, updated_at = now()
+                    """,
+                    user_id, email, tenant_id,
+                )
+        except asyncpg.exceptions.UndefinedTableError:
+            logger.warning("[DB] tenants/tenant_products/user_profiles not found — run tenants_schema.sql.")
+            return None
+    return {"tenant_id": tenant_id, "product_id": product_id}
+
+
+async def update_own_tenant_product(
+    tenant_id: str,
+    domain: str,
+    target_counties: List[str],
+    min_value_ron: float,
+    keywords: List[str],
+    exclude_keywords: List[str],
+) -> bool:
+    """Lets an already-provisioned individual edit their own watch criteria
+    (domain, counties, keywords, budget floor) without admin involvement.
+    Assumes the single-product-per-person shape create_self_provisioned_tenant
+    establishes (product id = f"{tenant_id}_prod_main"); upserts rather than
+    requiring the row to already exist, so it also works for a tenant
+    provisioned the old way via scripts/provision_tenant.py with a
+    differently-named product, which simply gains a second, main product line."""
+    async with with_connection() as conn:
+        if conn is None:
+            return False
+        try:
+            product_id = f"{tenant_id}_prod_main"
+            async with conn.transaction():
+                await conn.execute(
+                    """
+                    INSERT INTO tenant_products
+                        (id, tenant_id, name, domain, target_counties, min_value_ron, keywords, exclude_keywords)
+                    VALUES ($1, $2, 'Profilul meu', $3, $4, $5, $6, $7)
+                    ON CONFLICT (id) DO UPDATE SET
+                        domain = EXCLUDED.domain,
+                        target_counties = EXCLUDED.target_counties,
+                        min_value_ron = EXCLUDED.min_value_ron,
+                        keywords = EXCLUDED.keywords,
+                        exclude_keywords = EXCLUDED.exclude_keywords
+                    """,
+                    product_id, tenant_id, domain, target_counties, min_value_ron, keywords, exclude_keywords,
+                )
+                await conn.execute("UPDATE tenants SET primary_domain = $1 WHERE id = $2", domain, tenant_id)
+        except asyncpg.exceptions.UndefinedTableError:
+            logger.warning("[DB] tenants/tenant_products not found — run tenants_schema.sql.")
+            return False
+    return True

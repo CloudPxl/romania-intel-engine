@@ -153,6 +153,20 @@ class AuthSyncRequest(BaseModel):
     full_name: Optional[str] = None
     avatar_url: Optional[str] = None
 
+# Same five domains matching_engine.py's TENANT_ORGANIZATIONS entries and
+# the frontend's CATEGORIES constant already use — kept as a plain set
+# here rather than imported, since the frontend list is the presentation
+# layer and this is just a validity check.
+VALID_TENANT_DOMAINS = {"infrastructura", "sanatate", "energie", "aparare", "digitalizare"}
+
+class OnboardingRequest(BaseModel):
+    display_name: Optional[str] = None
+    domain: str
+    target_counties: List[str] = []
+    min_value_ron: float = 0.0
+    keywords: List[str] = []
+    exclude_keywords: List[str] = []
+
 class ProformaRequest(BaseModel):
     plan_id: str
     company_name: str
@@ -502,6 +516,69 @@ async def sync_user_auth(payload: AuthSyncRequest, user: dict = Depends(require_
             "avatar_url": payload.avatar_url
         }
     }
+
+@app.post("/api/v1/onboarding/complete")
+async def complete_onboarding(payload: OnboardingRequest, user: dict = Depends(require_auth)):
+    """Self-serve replacement for the admin-only scripts/provision_tenant.py
+    flow. This product now sells to individuals rather than companies —
+    there is no admin for a new subscriber to email to get unblocked, so a
+    signed-in user with no tenant yet must be able to create their own
+    right here, choosing their own domain/counties/keywords instead of
+    inheriting a company's product line. See db.create_self_provisioned_tenant
+    for the actual write."""
+    domain = payload.domain.strip().lower()
+    if domain not in VALID_TENANT_DOMAINS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Domeniu invalid. Alegeți dintre: {', '.join(sorted(VALID_TENANT_DOMAINS))}.",
+        )
+    if not payload.keywords:
+        raise HTTPException(
+            status_code=400,
+            detail="Adăugați cel puțin un cuvânt-cheie, altfel nu veți primi nicio oportunitate relevantă.",
+        )
+    if not db.DATABASE_URL:
+        raise HTTPException(status_code=503, detail="Baza de date nu este configurată — configurarea contului este indisponibilă momentan.")
+
+    email = user.get("email", "")
+    result = await db.create_self_provisioned_tenant(
+        user["user_id"], email, (payload.display_name or "").strip(), domain,
+        payload.target_counties, payload.min_value_ron, payload.keywords, payload.exclude_keywords,
+    )
+    if result is None:
+        raise HTTPException(status_code=409, detail="Contul dvs. este deja configurat.")
+
+    # Loaded once at startup (api.py's lifespan); without this refresh a
+    # brand-new tenant would 403 on its own feed until the next restart —
+    # the exact reason /api/v1/admin/reload-tenants exists for the admin
+    # path, needed here too since this route creates tenants the same way.
+    await matching_engine.refresh_tenant_organizations()
+    return {"status": "provisioned", **result}
+
+@app.put("/api/v1/tenants/{tenant_id}/profile")
+async def update_tenant_profile(tenant_id: str, payload: OnboardingRequest, _user: dict = Depends(require_tenant_membership)):
+    """Lets an already-onboarded individual change their own watch
+    criteria later — the self-serve counterpart to re-running
+    scripts/provision_tenant.py by hand. See db.update_own_tenant_product."""
+    domain = payload.domain.strip().lower()
+    if domain not in VALID_TENANT_DOMAINS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Domeniu invalid. Alegeți dintre: {', '.join(sorted(VALID_TENANT_DOMAINS))}.",
+        )
+    if not payload.keywords:
+        raise HTTPException(
+            status_code=400,
+            detail="Adăugați cel puțin un cuvânt-cheie, altfel nu veți primi nicio oportunitate relevantă.",
+        )
+    ok = await db.update_own_tenant_product(
+        tenant_id, domain, payload.target_counties, payload.min_value_ron,
+        payload.keywords, payload.exclude_keywords,
+    )
+    if not ok:
+        raise HTTPException(status_code=503, detail="Nu s-a putut salva profilul — baza de date este indisponibilă.")
+    await matching_engine.refresh_tenant_organizations()
+    return {"status": "updated"}
 
 @app.get("/api/v1/tenants")
 def list_tenant_profiles():
