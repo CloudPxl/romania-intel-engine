@@ -157,7 +157,7 @@ import httpx
 from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential_jitter
 
 import db
-from scrapers.base_scraper import BaseScraper
+from scrapers.base_scraper import USER_AGENT, BaseScraper
 from scrapers.matrix.category_classifier import classify_with_evidence
 from scrapers.models import RawInstitutionalSignal
 from text_utils import contains_term, fold
@@ -389,7 +389,17 @@ class TedRomaniaScraper(BaseScraper):
             cross_reference_candidates = []
 
         try:
-            async with httpx.AsyncClient(timeout=20.0, follow_redirects=True) as client:
+            # Identifies as a normal desktop browser, same single shared
+            # constant every other outbound client in scrapers/ uses. TED's
+            # API was verified to answer 200 either way, so this is a
+            # consistency/robustness measure against a future edge-layer
+            # policy on a headerless client, not a fix for an observed
+            # block — and deliberately one honest fixed UA rather than a
+            # rotation, since this endpoint is hit a handful of times per
+            # tick and has never signalled bot filtering.
+            async with httpx.AsyncClient(
+                timeout=20.0, follow_redirects=True, headers={"User-Agent": USER_AGENT}
+            ) as client:
                 page = 1
                 while page <= self.max_pages:
                     await asyncio.sleep(self.rate_limit_delay)

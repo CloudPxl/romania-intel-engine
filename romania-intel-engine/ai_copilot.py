@@ -56,6 +56,48 @@ _PROVIDERS = {
 }
 _INVALID_KEYS = {"", "dummy_key", "re_dummy"}
 
+# Hard character budget for the variable half of a prompt (the user prompt —
+# the only half that carries caller-supplied text: caiet excerpts, a chat
+# message, a clarification list, a feed sample).
+#
+# Measured in characters, deliberately not in tokens: the four providers
+# above use three different tokenizers, none of them tiktoken's, so a token
+# count computed here would be an accurate count of the wrong number while
+# reading as authoritative. At a pessimistic ~3 chars/token for Romanian
+# (diacritics cost extra), 32k chars is roughly 10k tokens — far inside
+# every configured model's context window, and inside the free-tier
+# tokens-per-minute ceilings on Groq and Gemini, which bind long before the
+# context window does. Those ceilings are the real failure mode: an
+# oversized prompt comes back 413/429 from every provider in turn and
+# complete_text returns None, which each caller silently treats as "the AI
+# expansion just didn't happen" — so an over-long input degrades invisibly
+# rather than loudly. Truncating is the honest trade: the model sees a
+# marked-as-incomplete document instead of the caller seeing nothing.
+#
+# The system prompt is deliberately exempt: every one is a module-level
+# constant carrying the legal grounding and anti-hallucination rules, and
+# cutting those would damage the output far more than dropping the tail of
+# an oversized input does.
+MAX_USER_PROMPT_CHARS = 32_000
+_TRUNCATION_NOTICE = (
+    "\n\n[NOTĂ: textul de mai sus a fost trunchiat automat deoarece a depășit limita "
+    "de caractere pe cerere. Formulează răspunsul doar pe baza porțiunii primite și "
+    "menționează explicit că analiza acoperă un extras parțial al documentului.]"
+)
+
+
+def _bound_user_prompt(user_prompt: str) -> str:
+    """Caps the caller-supplied half of a prompt and tells the model, in the
+    prompt itself, that what it received is an extract — so a truncated input
+    cannot come back as a confident answer about a whole document."""
+    if len(user_prompt) <= MAX_USER_PROMPT_CHARS:
+        return user_prompt
+    logger.warning(
+        f"[LLM] User prompt of {len(user_prompt)} chars exceeds the {MAX_USER_PROMPT_CHARS}-char "
+        "budget — truncating and flagging it as partial to the model."
+    )
+    return user_prompt[:MAX_USER_PROMPT_CHARS] + _TRUNCATION_NOTICE
+
 ROMANIAN_STOPWORDS = {
     "ce", "faci", "cum", "este", "sunt", "care", "asta", "pentru", "despre", "in", "la", "de",
     "cu", "din", "pe", "am", "ai", "au", "vreau", "caut", "vrei", "poti", "mai", "un", "o",
@@ -112,10 +154,19 @@ async def complete_text(
     every provider is unconfigured or failed — every caller must have a
     template fallback, since this is a "nice to have" enhancement, not a
     load-bearing dependency.
+
+    `user_prompt` is capped at MAX_USER_PROMPT_CHARS here rather than in
+    each caller, so no route can send an unbounded document, chat message
+    or clarification list into a provider — see _bound_user_prompt. A
+    caller that wants a *structure-preserving* cut (keeping several
+    sections of context rather than losing the tail) should still slice its
+    own inputs first, the way the drafting generators slice caiet_text.
     """
     providers = list_llm_providers()
     if not providers:
         return None
+
+    user_prompt = _bound_user_prompt(user_prompt)
 
     for name, base_url, model_name, api_key in providers:
         try:

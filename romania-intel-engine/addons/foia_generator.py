@@ -214,7 +214,12 @@ CUI: {cui_fiscal}
         if not list_llm_providers():
             return draft
 
-        context = f"Punctele de clarificare formulate:\n{clarification_points}\n"
+        # Both inputs are sliced before assembly, not left to the global cap
+        # in ai_copilot.complete_text: that one cuts the tail, which here
+        # would mean an over-long points list silently swallowing the entire
+        # caiet excerpt below it. Slicing each part keeps both present.
+        # 6000 chars matches dossier_generator's identical caiet_text bound.
+        context = f"Punctele de clarificare formulate:\n{clarification_points[:6000]}\n"
         if caiet_text:
             context += f"\nExtras din caietul de sarcini / documentația de atribuire:\n{caiet_text[:6000]}\n"
 
