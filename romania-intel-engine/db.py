@@ -863,7 +863,11 @@ async def create_self_provisioned_tenant(
     caller should route them to update_own_tenant_product instead of
     calling this again, since it never overwrites an existing
     membership). Raises TenantCapacityError (see above) when
-    MAX_SELF_PROVISIONED_TENANTS has been reached."""
+    MAX_SELF_PROVISIONED_TENANTS has been reached. On success, returns
+    {"tenant_id", "product_id", "linked_existing"} — the last is True when
+    this call didn't create a new tenant at all, instead linking a second
+    Supabase auth identity (same email, different user_id — see the
+    email-collision comment below) onto an existing one."""
     async with with_connection() as conn:
         if conn is None:
             return None
@@ -892,6 +896,43 @@ async def create_self_provisioned_tenant(
                 )
                 if existing and existing["tenant_id"]:
                     return None
+
+                # Whether the same real person signing in via Google once
+                # and a magic link another time gets ONE Supabase auth
+                # identity (sub claim) or two is entirely a function of
+                # that project's own identity-linking configuration — not
+                # something this code can see or control. If it forks,
+                # each sign-in method mints a distinct user_id, and without
+                # this check each would happily create its OWN tenant: two
+                # billable accounts, two operator-alert emails, for one
+                # customer. This closes it at the one place we CAN see the
+                # collision — our own table — regardless of what Supabase
+                # does under the hood: a second identity claiming an email
+                # that already owns a tenant is linked to that SAME tenant
+                # instead of getting a new one. Safe because email here
+                # comes from the caller's own verified JWT (security.py),
+                # never client-supplied, so this can't be spoofed into
+                # hijacking a stranger's tenant.
+                existing_by_email = await conn.fetchrow(
+                    "SELECT tenant_id FROM user_profiles WHERE lower(email) = lower($1) AND tenant_id IS NOT NULL LIMIT 1",
+                    email,
+                )
+                if existing_by_email and existing_by_email["tenant_id"]:
+                    linked_tenant_id = existing_by_email["tenant_id"]
+                    await conn.execute(
+                        """
+                        INSERT INTO user_profiles (id, email, tenant_id, role)
+                        VALUES ($1, $2, $3, 'owner')
+                        ON CONFLICT (id) DO UPDATE SET
+                            email = EXCLUDED.email, tenant_id = EXCLUDED.tenant_id, updated_at = now()
+                        """,
+                        user_id, email, linked_tenant_id,
+                    )
+                    return {
+                        "tenant_id": linked_tenant_id,
+                        "product_id": f"{linked_tenant_id}_prod_main",
+                        "linked_existing": True,
+                    }
 
                 # Self-provisioned ids are namespaced with a "u_" prefix
                 # (below); admin-provisioned ones (scripts/provision_tenant.py)
@@ -938,7 +979,7 @@ async def create_self_provisioned_tenant(
         except asyncpg.exceptions.UndefinedTableError:
             logger.warning("[DB] tenants/tenant_products/user_profiles not found — run tenants_schema.sql.")
             return None
-    return {"tenant_id": tenant_id, "product_id": product_id}
+    return {"tenant_id": tenant_id, "product_id": product_id, "linked_existing": False}
 
 
 async def update_own_tenant_product(
@@ -1005,3 +1046,60 @@ async def update_tenant_alert_settings(tenant_id: str, alert_emails: List[str], 
             logger.warning("[DB] tenants not found — run tenants_schema.sql.")
             return False
     return True
+
+
+async def delete_own_account(user_id: str) -> Dict[str, Any]:
+    """GDPR right-to-erasure path: a signed-in individual deleting their
+    own account. Removes their user_profiles row and, only if no other
+    identity still needs it, the tenant they own and everything keyed to
+    it (product line via tenants' ON DELETE CASCADE, pipeline deals and
+    their cascaded stage history, alert dispatch log).
+
+    "Only if no other identity still needs it" matters because
+    create_self_provisioned_tenant can link a second Supabase auth
+    identity (same email, different user_id) onto an existing tenant
+    instead of creating a duplicate — so more than one user_profiles row
+    can legitimately point at one tenant. Deleting account A must not
+    silently destroy account B's data.
+
+    product_bidding_deals/tenant_alert_dispatch_log are plain TEXT
+    tenant_id columns with no FK into tenants (see pipeline_schema.sql's
+    own comment on why), so they neither block nor cascade from the
+    tenants DELETE below — checked via to_regclass rather than
+    try/except, since Postgres aborts the whole transaction on the first
+    error and either table may not exist yet in every environment.
+
+    Returns {"deleted", "tenant_deleted", "tenant_id"}. "deleted" is False
+    only when there was no account to delete at all (already gone, or no
+    database configured) — this function does not raise for that case,
+    matching every other function in this module's convention. Does NOT
+    touch the Supabase Auth identity itself (the auth.users row); see
+    security.delete_supabase_auth_identity for that half."""
+    async with with_connection() as conn:
+        if conn is None:
+            return {"deleted": False, "tenant_deleted": False, "tenant_id": None}
+        try:
+            async with conn.transaction():
+                profile = await conn.fetchrow("SELECT tenant_id FROM user_profiles WHERE id = $1", user_id)
+                if profile is None:
+                    return {"deleted": False, "tenant_deleted": False, "tenant_id": None}
+                tenant_id = profile["tenant_id"]
+
+                await conn.execute("DELETE FROM user_profiles WHERE id = $1", user_id)
+
+                tenant_deleted = False
+                if tenant_id:
+                    remaining = await conn.fetchval(
+                        "SELECT COUNT(*) FROM user_profiles WHERE tenant_id = $1", tenant_id
+                    )
+                    if remaining == 0:
+                        if await conn.fetchval("SELECT to_regclass('tenant_alert_dispatch_log') IS NOT NULL"):
+                            await conn.execute("DELETE FROM tenant_alert_dispatch_log WHERE tenant_id = $1", tenant_id)
+                        if await conn.fetchval("SELECT to_regclass('product_bidding_deals') IS NOT NULL"):
+                            await conn.execute("DELETE FROM product_bidding_deals WHERE tenant_id = $1", tenant_id)
+                        await conn.execute("DELETE FROM tenants WHERE id = $1", tenant_id)  # cascades tenant_products
+                        tenant_deleted = True
+        except asyncpg.exceptions.UndefinedTableError:
+            logger.warning("[DB] user_profiles/tenants not found — run tenants_schema.sql.")
+            return {"deleted": False, "tenant_deleted": False, "tenant_id": None}
+    return {"deleted": True, "tenant_deleted": tenant_deleted, "tenant_id": tenant_id}

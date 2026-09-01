@@ -3,6 +3,7 @@ import time
 import logging
 from typing import Dict, Optional, Tuple
 
+import httpx
 import jwt
 from jwt import PyJWKClient
 from jwt.exceptions import PyJWKClientConnectionError, PyJWKClientError, PyJWKSetError
@@ -64,6 +65,12 @@ SUPABASE_JWKS_URL = f"{SUPABASE_URL}/auth/v1/.well-known/jwks.json"
 SUPABASE_JWT_SECRET = os.getenv("SUPABASE_JWT_SECRET", "")
 SUPABASE_JWT_AUDIENCE = "authenticated"
 
+# Deliberately NOT read at import time into a constant the way SUPABASE_URL
+# is above: this key is only needed for the one admin-API call below, and
+# reading it lazily means the value can be added to Render's env vars and
+# take effect without a code change or redeploy.
+SUPABASE_SERVICE_ROLE_KEY_ENV = "SUPABASE_SERVICE_ROLE_KEY"
+
 # Built once per process, not per request: PyJWKClient caches the fetched
 # keyset for `lifespan` seconds (below) and the individual keys by `kid`,
 # so re-verifying a token a moment later costs no network round trip to
@@ -83,6 +90,46 @@ def _get_jwks_client() -> PyJWKClient:
             lifespan=300,
         )
     return _jwks_client
+
+
+async def delete_supabase_auth_identity(user_id: str) -> bool:
+    """The other half of GDPR-style account erasure — db.delete_own_account
+    removes everything this app itself owns (tenant, product line, profile
+    row), but the actual login credential is Supabase's auth.users row,
+    which only Supabase's Admin API can remove, and that API requires the
+    project's service-role key (Project Settings -> API -> service_role in
+    the Supabase dashboard — deliberately never the anon key, which has no
+    admin privileges).
+
+    Returns False without raising, and without even attempting the call,
+    when SUPABASE_SERVICE_ROLE_KEY isn't configured — this is a real,
+    common state (no code change needed to enable it later, see the env
+    var comment above), not an error. Callers must still tell the user
+    their app data is gone and treat this as a followup, not block the
+    rest of deletion on it. Returns True for both a genuine 200/204 and a
+    404 (the identity was already gone), since either means the end state
+    the caller wants — no lingering credential — is already achieved."""
+    service_key = os.getenv(SUPABASE_SERVICE_ROLE_KEY_ENV, "")
+    if not service_key:
+        logger.warning(
+            f"[SecurityGuard] {SUPABASE_SERVICE_ROLE_KEY_ENV} not set — cannot remove the "
+            f"Supabase Auth identity for user_id={user_id}. App-side data is still deleted; "
+            "the login credential needs manual removal from the Supabase dashboard."
+        )
+        return False
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            resp = await client.delete(
+                f"{SUPABASE_URL}/auth/v1/admin/users/{user_id}",
+                headers={"apikey": service_key, "Authorization": f"Bearer {service_key}"},
+            )
+        if resp.status_code in (200, 204, 404):
+            return True
+        logger.error(f"[SecurityGuard] Supabase Auth deletion failed for {user_id}: {resp.status_code} {resp.text[:200]}")
+        return False
+    except Exception as e:
+        logger.error(f"[SecurityGuard] Supabase Auth deletion request failed for {user_id}: {e}")
+        return False
 
 
 class SecurityGuard:

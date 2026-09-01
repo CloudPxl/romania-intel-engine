@@ -36,8 +36,9 @@ class FakeConnection:
     the current self-provisioned tenant count (for the cap check), execute
     recording every call it received for assertions."""
 
-    def __init__(self, existing_tenant_id=None, self_provisioned_count=0):
+    def __init__(self, existing_tenant_id=None, self_provisioned_count=0, existing_tenant_id_for_email=None):
         self.existing_tenant_id = existing_tenant_id
+        self.existing_tenant_id_for_email = existing_tenant_id_for_email
         self.self_provisioned_count = self_provisioned_count
         self.executed = []
         self.fetchval_calls = []
@@ -46,6 +47,8 @@ class FakeConnection:
         return _FakeTransaction()
 
     async def fetchrow(self, query, *args):
+        if "lower(email)" in query:
+            return {"tenant_id": self.existing_tenant_id_for_email} if self.existing_tenant_id_for_email else None
         if "SELECT tenant_id FROM user_profiles" in query:
             return {"tenant_id": self.existing_tenant_id} if self.existing_tenant_id else None
         return None
@@ -169,6 +172,55 @@ class TestCreateSelfProvisionedTenant:
         kinds = [k for k, _ in conn.executed]
         assert kinds == ["INSERT", "INSERT", "INSERT"]
 
+    @pytest.mark.asyncio
+    async def test_second_identity_same_email_links_to_existing_tenant_instead_of_creating_one(self, monkeypatch):
+        # The scenario this guards: the same real person signs in via
+        # Google once and a magic link another time. Whether that mints
+        # one Supabase auth identity (`sub`) or two depends entirely on
+        # that project's own identity-linking setting — not something this
+        # code can see. If it forks, a NEW user_id shows up here with the
+        # SAME email as an account that already owns a tenant. Without
+        # this check, that would silently create a second, duplicate-
+        # billable tenant for one customer.
+        conn = FakeConnection(existing_tenant_id=None, existing_tenant_id_for_email="u_original111111")
+        monkeypatch.setattr(db, "with_connection", _with_connection(conn))
+        result = await db.create_self_provisioned_tenant(
+            "u_second_identity", "same@test.ro", "Same Person", "infrastructura", [], 0.0, ["drum"], []
+        )
+        assert result == {
+            "tenant_id": "u_original111111",
+            "product_id": "u_original111111_prod_main",
+            "linked_existing": True,
+        }
+        # Exactly one write — linking this identity's membership row to
+        # the existing tenant — never a second tenants/tenant_products
+        # INSERT for a "new" tenant.
+        kinds = [k for k, _ in conn.executed]
+        assert kinds == ["INSERT"]
+        membership_args = conn.executed[0][1]
+        assert membership_args == ("u_second_identity", "same@test.ro", "u_original111111")
+
+    @pytest.mark.asyncio
+    async def test_email_lookup_is_case_insensitive(self, monkeypatch):
+        conn = FakeConnection(existing_tenant_id=None, existing_tenant_id_for_email="u_original222222")
+        monkeypatch.setattr(db, "with_connection", _with_connection(conn))
+        result = await db.create_self_provisioned_tenant(
+            "u_second", "Same@Test.RO", "Same Person", "infrastructura", [], 0.0, ["drum"], []
+        )
+        assert result["linked_existing"] is True
+        assert result["tenant_id"] == "u_original222222"
+
+    @pytest.mark.asyncio
+    async def test_no_email_collision_creates_a_normal_new_tenant(self, monkeypatch):
+        conn = FakeConnection(existing_tenant_id=None, existing_tenant_id_for_email=None)
+        monkeypatch.setattr(db, "with_connection", _with_connection(conn))
+        result = await db.create_self_provisioned_tenant(
+            "u6", "genuinely-new@test.ro", "New Person", "infrastructura", [], 0.0, ["drum"], []
+        )
+        assert result["linked_existing"] is False
+        kinds = [k for k, _ in conn.executed]
+        assert kinds == ["INSERT", "INSERT", "INSERT"]
+
 
 class TestUpdateOwnTenantProduct:
     @pytest.mark.asyncio
@@ -200,23 +252,42 @@ class TestOnboardingRoute:
         yield
         api.app.dependency_overrides.pop(security.require_auth, None)
 
+    def test_rejects_missing_consent(self):
+        # consent_accepted defaults to False — an otherwise-perfectly-valid
+        # payload must still be rejected without it, and rejected for
+        # THIS reason specifically (not incidentally by some other check).
+        client = TestClient(api.app)
+        r = client.post("/api/v1/onboarding/complete", json={"domain": "infrastructura", "keywords": ["drum"]})
+        assert r.status_code == 400
+        assert "Termenii" in r.json()["detail"]
+
     def test_rejects_invalid_domain(self):
         client = TestClient(api.app)
-        r = client.post("/api/v1/onboarding/complete", json={"domain": "nu-exista", "keywords": ["x"]})
+        r = client.post(
+            "/api/v1/onboarding/complete",
+            json={"domain": "nu-exista", "keywords": ["x"], "consent_accepted": True},
+        )
         assert r.status_code == 400
         assert "Domeniu invalid" in r.json()["detail"]
 
     def test_rejects_empty_keywords(self):
         client = TestClient(api.app)
-        r = client.post("/api/v1/onboarding/complete", json={"domain": "sanatate", "keywords": []})
+        r = client.post(
+            "/api/v1/onboarding/complete",
+            json={"domain": "sanatate", "keywords": [], "consent_accepted": True},
+        )
         assert r.status_code == 400
+        assert "cuvânt-cheie" in r.json()["detail"]
 
     def test_no_database_configured_is_a_clean_503_not_a_500(self, monkeypatch):
         monkeypatch.setattr(db, "DATABASE_URL", "")
         client = TestClient(api.app)
         r = client.post(
             "/api/v1/onboarding/complete",
-            json={"domain": "infrastructura", "keywords": ["drum"], "target_counties": ["Cluj"]},
+            json={
+                "domain": "infrastructura", "keywords": ["drum"], "target_counties": ["Cluj"],
+                "consent_accepted": True,
+            },
         )
         assert r.status_code == 503
 
@@ -255,6 +326,7 @@ class TestOnboardingHardening:
             json={
                 "domain": "infrastructura",
                 "keywords": [f"kw{i}" for i in range(api.MAX_ONBOARDING_LIST_ITEMS + 1)],
+                "consent_accepted": True,
             },
         )
         assert r.status_code == 400
@@ -264,7 +336,11 @@ class TestOnboardingHardening:
         client = TestClient(api.app)
         r = client.post(
             "/api/v1/onboarding/complete",
-            json={"domain": "infrastructura", "keywords": ["x" * (api.MAX_ONBOARDING_STRING_LENGTH + 1)]},
+            json={
+                "domain": "infrastructura",
+                "keywords": ["x" * (api.MAX_ONBOARDING_STRING_LENGTH + 1)],
+                "consent_accepted": True,
+            },
         )
         assert r.status_code == 400
         assert "prea lung" in r.json()["detail"]
@@ -273,9 +349,10 @@ class TestOnboardingHardening:
         client = TestClient(api.app)
         r = client.post(
             "/api/v1/onboarding/complete",
-            json={"domain": "infrastructura", "keywords": ["drum"], "min_value_ron": -1},
+            json={"domain": "infrastructura", "keywords": ["drum"], "min_value_ron": -1, "consent_accepted": True},
         )
         assert r.status_code == 400
+        assert "buget" in r.json()["detail"]
 
     def test_capacity_error_returns_503_and_alerts_operator(self, monkeypatch):
         monkeypatch.setattr(db, "DATABASE_URL", "postgresql://fake/db")
@@ -294,7 +371,10 @@ class TestOnboardingHardening:
         monkeypatch.setattr(api.LeadAlertDispatcher, "dispatch_admin_alert", fake_alert)
 
         client = TestClient(api.app)
-        r = client.post("/api/v1/onboarding/complete", json={"domain": "infrastructura", "keywords": ["drum"]})
+        r = client.post(
+            "/api/v1/onboarding/complete",
+            json={"domain": "infrastructura", "keywords": ["drum"], "consent_accepted": True},
+        )
         assert r.status_code == 503
         assert len(alerts) == 1
         assert "Plafonul" in alerts[0]
@@ -323,7 +403,10 @@ class TestOnboardingHardening:
         client = TestClient(api.app)
         r = client.post(
             "/api/v1/onboarding/complete",
-            json={"domain": "infrastructura", "keywords": ["drum"], "display_name": "Maria Ionescu"},
+            json={
+                "domain": "infrastructura", "keywords": ["drum"], "display_name": "Maria Ionescu",
+                "consent_accepted": True,
+            },
         )
         assert r.status_code == 200
         assert r.json()["tenant_id"] == "u_abcdef123456"
@@ -351,7 +434,10 @@ class TestOnboardingHardening:
         monkeypatch.setattr(api.LeadAlertDispatcher, "dispatch_admin_alert", fake_alert)
 
         client = TestClient(api.app)
-        r = client.post("/api/v1/onboarding/complete", json={"domain": "infrastructura", "keywords": ["drum"]})
+        r = client.post(
+            "/api/v1/onboarding/complete",
+            json={"domain": "infrastructura", "keywords": ["drum"], "consent_accepted": True},
+        )
         # The tenant/product/membership rows already committed inside
         # create_self_provisioned_tenant's own transaction — a refresh
         # failure after that point must not be reported back as a failed
@@ -384,10 +470,11 @@ class TestOnboardingHardening:
         # No database configured -> every allowed call cleanly 503s past
         # the rate limiter, so this isolates the limiter itself.
         client = TestClient(api.app)
+        payload = {"domain": "infrastructura", "keywords": ["drum"], "consent_accepted": True}
         for _ in range(security.ONBOARDING_RATE_LIMIT_REQUESTS):
-            r = client.post("/api/v1/onboarding/complete", json={"domain": "infrastructura", "keywords": ["drum"]})
+            r = client.post("/api/v1/onboarding/complete", json=payload)
             assert r.status_code == 503
-        r = client.post("/api/v1/onboarding/complete", json={"domain": "infrastructura", "keywords": ["drum"]})
+        r = client.post("/api/v1/onboarding/complete", json=payload)
         assert r.status_code == 429
 
 
@@ -450,3 +537,174 @@ class TestAlertSettingsRoute:
         )
         assert r.status_code == 200
         assert calls["args"] == ("t1_infra_transilvania", ["vlad@test.ro"], 8.0)
+
+
+class _FakeDeleteConnection:
+    """Enough of asyncpg's Connection interface for delete_own_account:
+    a canned user_profiles row, a configurable count of OTHER profiles
+    still pointing at the same tenant, and to_regclass returning whether
+    the optional pipeline/alert-log tables "exist" in this scenario."""
+
+    def __init__(self, tenant_id="u_abc123", other_profiles_on_tenant=0, optional_tables_exist=True):
+        self.tenant_id = tenant_id
+        self.other_profiles_on_tenant = other_profiles_on_tenant
+        self.optional_tables_exist = optional_tables_exist
+        self.executed = []
+
+    def transaction(self):
+        return _FakeTransaction()
+
+    async def fetchrow(self, query, *args):
+        if "SELECT tenant_id FROM user_profiles WHERE id" in query:
+            if self.tenant_id is _MISSING:
+                return None
+            return {"tenant_id": self.tenant_id}
+        return None
+
+    async def fetchval(self, query, *args):
+        if "to_regclass" in query:
+            return self.optional_tables_exist
+        if "COUNT(*) FROM user_profiles WHERE tenant_id" in query:
+            return self.other_profiles_on_tenant
+        return None
+
+    async def execute(self, query, *args):
+        self.executed.append((query.strip(), args))
+
+
+_MISSING = object()
+
+
+class TestDeleteOwnAccount:
+    @pytest.mark.asyncio
+    async def test_no_database_returns_not_deleted(self, monkeypatch):
+        monkeypatch.setattr(db, "with_connection", _with_connection(None))
+        result = await db.delete_own_account("u1")
+        assert result == {"deleted": False, "tenant_deleted": False, "tenant_id": None}
+
+    @pytest.mark.asyncio
+    async def test_no_profile_returns_not_deleted_without_writing(self, monkeypatch):
+        conn = _FakeDeleteConnection(tenant_id=_MISSING)
+        monkeypatch.setattr(db, "with_connection", _with_connection(conn))
+        result = await db.delete_own_account("ghost")
+        assert result == {"deleted": False, "tenant_deleted": False, "tenant_id": None}
+        assert conn.executed == []
+
+    @pytest.mark.asyncio
+    async def test_sole_owner_deletes_profile_and_tenant(self, monkeypatch):
+        conn = _FakeDeleteConnection(tenant_id="u_abc123", other_profiles_on_tenant=0)
+        monkeypatch.setattr(db, "with_connection", _with_connection(conn))
+        result = await db.delete_own_account("u1")
+        assert result == {"deleted": True, "tenant_deleted": True, "tenant_id": "u_abc123"}
+        queries = [q for q, _ in conn.executed]
+        assert any("DELETE FROM user_profiles" in q for q in queries)
+        assert any("DELETE FROM tenant_alert_dispatch_log" in q for q in queries)
+        assert any("DELETE FROM product_bidding_deals" in q for q in queries)
+        assert any("DELETE FROM tenants" in q for q in queries)
+
+    @pytest.mark.asyncio
+    async def test_shared_tenant_keeps_tenant_when_another_identity_still_uses_it(self, monkeypatch):
+        # The interaction with create_self_provisioned_tenant's email-merge
+        # path: two user_profiles rows can legitimately point at one
+        # tenant. Deleting one account must not destroy the other
+        # identity's data.
+        conn = _FakeDeleteConnection(tenant_id="u_shared", other_profiles_on_tenant=1)
+        monkeypatch.setattr(db, "with_connection", _with_connection(conn))
+        result = await db.delete_own_account("u_second_identity")
+        assert result == {"deleted": True, "tenant_deleted": False, "tenant_id": "u_shared"}
+        queries = [q for q, _ in conn.executed]
+        assert len(queries) == 1
+        assert "DELETE FROM user_profiles" in queries[0]  # only the profile row, tenant left alone
+
+    @pytest.mark.asyncio
+    async def test_missing_optional_tables_do_not_block_deletion(self, monkeypatch):
+        # pipeline_schema.sql/the alert-log table may not be applied in
+        # every environment — must not fail the whole deletion over an
+        # optional table that was never created.
+        conn = _FakeDeleteConnection(tenant_id="u_abc123", other_profiles_on_tenant=0, optional_tables_exist=False)
+        monkeypatch.setattr(db, "with_connection", _with_connection(conn))
+        result = await db.delete_own_account("u1")
+        assert result == {"deleted": True, "tenant_deleted": True, "tenant_id": "u_abc123"}
+        queries = [q for q, _ in conn.executed]
+        assert not any("tenant_alert_dispatch_log" in q for q in queries)
+        assert not any("product_bidding_deals" in q for q in queries)
+        assert any("DELETE FROM tenants" in q for q in queries)
+
+
+class TestDeleteAccountRoute:
+    @pytest.fixture(autouse=True)
+    def _auth_override(self):
+        api.app.dependency_overrides[security.require_auth] = lambda: {
+            "user_id": "route-uid-3", "email": "delete-me@test.ro", "role": "Membru"
+        }
+        yield
+        api.app.dependency_overrides.pop(security.require_auth, None)
+
+    def test_no_account_returns_404(self, monkeypatch):
+        async def fake_delete(user_id):
+            return {"deleted": False, "tenant_deleted": False, "tenant_id": None}
+
+        monkeypatch.setattr(db, "delete_own_account", fake_delete)
+        client = TestClient(api.app)
+        r = client.delete("/api/v1/account")
+        assert r.status_code == 404
+
+    def test_success_without_service_role_key_reports_it_honestly(self, monkeypatch):
+        # No SUPABASE_SERVICE_ROLE_KEY configured is a real, supported
+        # state — the app-side deletion must still succeed and say so
+        # plainly rather than failing the whole request over it.
+        monkeypatch.delenv("SUPABASE_SERVICE_ROLE_KEY", raising=False)
+
+        async def fake_delete(user_id):
+            return {"deleted": True, "tenant_deleted": True, "tenant_id": "u_abc123"}
+
+        monkeypatch.setattr(db, "delete_own_account", fake_delete)
+
+        async def fake_refresh():
+            return True
+
+        monkeypatch.setattr(matching_engine, "refresh_tenant_organizations", fake_refresh)
+
+        alerts = []
+
+        async def fake_alert(text):
+            alerts.append(text)
+            return True
+
+        monkeypatch.setattr(api.LeadAlertDispatcher, "dispatch_admin_alert", fake_alert)
+
+        client = TestClient(api.app)
+        r = client.delete("/api/v1/account")
+        assert r.status_code == 200
+        body = r.json()
+        assert body == {"status": "deleted", "auth_identity_deleted": False}
+        assert len(alerts) == 1
+        assert "SUPABASE_SERVICE_ROLE_KEY" in alerts[0]
+
+    def test_success_with_service_role_key_deletes_auth_identity_too(self, monkeypatch):
+        monkeypatch.setenv("SUPABASE_SERVICE_ROLE_KEY", "fake-service-key")
+
+        async def fake_delete(user_id):
+            return {"deleted": True, "tenant_deleted": True, "tenant_id": "u_abc123"}
+
+        monkeypatch.setattr(db, "delete_own_account", fake_delete)
+
+        async def fake_refresh():
+            return True
+
+        monkeypatch.setattr(matching_engine, "refresh_tenant_organizations", fake_refresh)
+
+        async def fake_auth_delete(user_id):
+            return True
+
+        monkeypatch.setattr(api, "delete_supabase_auth_identity", fake_auth_delete)
+
+        async def fake_alert(text):
+            return True
+
+        monkeypatch.setattr(api.LeadAlertDispatcher, "dispatch_admin_alert", fake_alert)
+
+        client = TestClient(api.app)
+        r = client.delete("/api/v1/account")
+        assert r.status_code == 200
+        assert r.json() == {"status": "deleted", "auth_identity_deleted": True}

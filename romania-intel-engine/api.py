@@ -26,7 +26,10 @@ from scrapers.orchestrator import OpportunityOrchestrator, TICK_DEADLINE_SECONDS
 from cache_engine import global_cache, newsletter_store
 from freemium_shield import FreemiumGatekeeper
 from notifier import LeadAlertDispatcher
-from security import SecurityGuard, require_auth, require_tenant_membership, enforce_onboarding_rate_limit
+from security import (
+    SecurityGuard, require_auth, require_tenant_membership,
+    enforce_onboarding_rate_limit, delete_supabase_auth_identity,
+)
 
 from addons.caiet_analyzer import CaietDeSarciniAnalyzer, TextExtractionError
 from addons.win_probability import WinProbabilityEngine
@@ -166,6 +169,12 @@ class OnboardingRequest(BaseModel):
     min_value_ron: float = 0.0
     keywords: List[str] = []
     exclude_keywords: List[str] = []
+    # Only meaningful on the initial POST /api/v1/onboarding/complete (see
+    # the check there) — an existing user re-editing their criteria via
+    # PUT .../profile isn't asked to re-accept anything, so this field is
+    # simply ignored on that route rather than duplicated onto a second
+    # request model.
+    consent_accepted: bool = False
 
 # Self-serve callers submit these fields directly — there is no admin
 # reviewing the payload before it's written, unlike scripts/provision_tenant.py's
@@ -575,6 +584,50 @@ async def sync_user_auth(payload: AuthSyncRequest, user: dict = Depends(require_
         }
     }
 
+@app.delete("/api/v1/account")
+async def delete_own_account_route(user: dict = Depends(require_auth)):
+    """Self-serve GDPR erasure — this identity's own account, on their own
+    request, no admin involved. Splits into two independent halves and is
+    honest when only one succeeds: db.delete_own_account removes every row
+    this app itself owns (user_profiles, and — only if no other identity
+    still needs it, see that function's docstring — the tenant, its
+    product line, pipeline deals, and alert dispatch log); a separate call
+    then asks Supabase to remove the auth.users row, which is the actual
+    login credential and something only Supabase's Admin API can touch.
+
+    Returns 200 either way once the first half succeeds — a missing
+    SUPABASE_SERVICE_ROLE_KEY (see security.py) is a real, expected state,
+    not a failure the caller should have to handle specially. What changes
+    is `auth_identity_deleted` in the response and, either way, an operator
+    alert naming exactly which user_id/email to check."""
+    result = await db.delete_own_account(user["user_id"])
+    if not result["deleted"]:
+        raise HTTPException(status_code=404, detail="Nu a fost găsit niciun cont de șters.")
+
+    if result["tenant_deleted"]:
+        try:
+            await matching_engine.refresh_tenant_organizations()
+        except Exception as e:
+            logger.error(f"[DeleteAccount] Post-deletion tenant-cache refresh failed: {e}")
+
+    auth_identity_deleted = await delete_supabase_auth_identity(user["user_id"])
+
+    try:
+        note = "" if auth_identity_deleted else (
+            "\n⚠️ SUPABASE_SERVICE_ROLE_KEY nu este configurat — identitatea Supabase Auth "
+            "NU a fost ștearsă automat. Ștergeți manual din Supabase Dashboard -> Authentication -> Users."
+        )
+        await LeadAlertDispatcher.dispatch_admin_alert(
+            f"🗑️ Cont șters pe RO-INTEL\n"
+            f"Email: {user.get('email')}\n"
+            f"Tenant: {result['tenant_id'] or '—'} "
+            f"({'șters' if result['tenant_deleted'] else 'păstrat — altă identitate încă îl folosește'}){note}"
+        )
+    except Exception as e:
+        logger.error(f"[DeleteAccount] Operator notification failed: {e}")
+
+    return {"status": "deleted", "auth_identity_deleted": auth_identity_deleted}
+
 @app.post("/api/v1/onboarding/complete")
 async def complete_onboarding(
     payload: OnboardingRequest,
@@ -594,6 +647,11 @@ async def complete_onboarding(
     only way the person actually running this business finds out a new
     account exists to follow up with (billing.py has no automatic payment
     collection, only manual proforma invoices)."""
+    if not payload.consent_accepted:
+        raise HTTPException(
+            status_code=400,
+            detail="Trebuie să fiți de acord cu Termenii și Politica de Confidențialitate pentru a continua.",
+        )
     domain = payload.domain.strip().lower()
     if domain not in VALID_TENANT_DOMAINS:
         raise HTTPException(
@@ -654,13 +712,26 @@ async def complete_onboarding(
         logger.error(f"[Onboarding] Post-provisioning tenant-cache refresh failed: {e}")
 
     try:
-        await LeadAlertDispatcher.dispatch_admin_alert(
-            "🆕 Cont nou auto-provizionat pe RO-INTEL\n"
-            f"Nume: {display_name or email}\n"
-            f"Email: {email}\n"
-            f"Domeniu: {domain}\n"
-            f"Tenant: {result['tenant_id']}"
-        )
+        if result.get("linked_existing"):
+            # A second Supabase auth identity (same email, different
+            # user_id — see the comment in create_self_provisioned_tenant)
+            # was linked onto an existing tenant rather than a new one
+            # being created. Worth a different message: this is not a new
+            # customer, and an operator seeing "new account" here would
+            # double-count it for billing/follow-up.
+            await LeadAlertDispatcher.dispatch_admin_alert(
+                "🔗 Identitate suplimentară asociată unui cont existent pe RO-INTEL\n"
+                f"Email: {email}\n"
+                f"Tenant existent: {result['tenant_id']}"
+            )
+        else:
+            await LeadAlertDispatcher.dispatch_admin_alert(
+                "🆕 Cont nou auto-provizionat pe RO-INTEL\n"
+                f"Nume: {display_name or email}\n"
+                f"Email: {email}\n"
+                f"Domeniu: {domain}\n"
+                f"Tenant: {result['tenant_id']}"
+            )
     except Exception as e:
         # A failed operator notification must never fail the signup itself
         # — the account is already real in the database at this point.
