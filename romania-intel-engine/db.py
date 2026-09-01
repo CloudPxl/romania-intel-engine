@@ -777,30 +777,100 @@ async def get_user_profile(user_id: str) -> Optional[Dict[str, Any]]:
 
 
 async def upsert_user_profile_email(user_id: str, email: str) -> Optional[Dict[str, Any]]:
-    """Called from /api/v1/auth/sync on every login. Only ever touches
-    `email` — tenant_id/role are assigned by scripts/provision_tenant.py
-    (admin) or create_self_provisioned_tenant (self-serve onboarding),
-    never by the sync endpoint itself, so a brand-new user lands with
-    tenant_id NULL (reported honestly as "not provisioned yet") until one
-    of those two runs. Returns the current row (post-upsert) so the caller
-    can read back whatever tenant_id already exists, if any."""
+    """Called from /api/v1/auth/sync on every login. Never assigns
+    tenant_id itself — that is scripts/provision_tenant.py (admin) or
+    create_self_provisioned_tenant (self-serve onboarding) — so a genuinely
+    new person lands with tenant_id NULL, reported honestly as "not
+    provisioned yet". Returns the current row so the caller can read back
+    whatever tenant_id already exists, if any.
+
+    One human can hold SEVERAL Supabase auth identities for one email:
+    signing in with Google and with a magic link can mint different
+    auth.users rows (whether they're linked is a project-level Supabase
+    setting, not something this app controls), and re-signing up after an
+    account deletion mints another. `user_profiles.id` IS that auth id, so
+    the same person can arrive with an id this table has never seen while
+    their email is already on a row.
+
+    That case used to be a hard 500 on EVERY login, taking the whole
+    product down: the statement was a bare `INSERT ... ON CONFLICT (id)`,
+    which handles only an id collision, so a second identity for a known
+    email sailed past it and hit the live `user_profiles_email_key` unique
+    index — a constraint no schema file in this repo declares, i.e.
+    undocumented drift on the hand-applied database. The API returned 500,
+    the frontend could not decode it, and the user got an infinite
+    sign-in loop.
+
+    So the email, not the auth id, is treated as the identity: it is
+    verified by Supabase in both flows (Google and magic link), which makes
+    "same email" a trustworthy "same person". An existing row is re-pointed
+    at the current auth identity rather than duplicated, which also
+    preserves their tenant — they land straight back in their account
+    instead of being asked to onboard again. Nothing FK-references
+    user_profiles.id, so re-pointing is safe.
+
+    Correct whether or not the unique index is present, so no migration is
+    required to recover from this.
+    """
     async with with_connection() as conn:
         if conn is None:
             return None
         try:
-            row = await conn.fetchrow(
-                """
-                INSERT INTO user_profiles (id, email)
-                VALUES ($1, $2)
-                ON CONFLICT (id) DO UPDATE SET email = EXCLUDED.email, updated_at = now()
-                RETURNING id, email, tenant_id, role
-                """,
-                user_id, email,
-            )
+            async with conn.transaction():
+                # Serialises two concurrent logins for the same person
+                # (double-submit, a client retry, two tabs) so they can't
+                # both decide to insert. Mirrors the advisory lock
+                # create_self_provisioned_tenant takes, keyed on the email
+                # here since that is the identity this function resolves.
+                await conn.execute("SELECT pg_advisory_xact_lock(hashtext(lower($1)))", email)
+
+                row = await conn.fetchrow(
+                    "SELECT id, email, tenant_id, role FROM user_profiles WHERE id = $1", user_id
+                )
+                if row is not None:
+                    if row["email"] != email:
+                        await conn.execute(
+                            "UPDATE user_profiles SET email = $1, updated_at = now() WHERE id = $2",
+                            email, user_id,
+                        )
+                    return {**dict(row), "email": email}
+
+                # No row for this auth identity. Adopt one already held by
+                # this email, preferring a provisioned row so a person with
+                # both a stale empty profile and a real one keeps the real
+                # tenant.
+                existing = await conn.fetchrow(
+                    """
+                    SELECT id, email, tenant_id, role FROM user_profiles
+                    WHERE lower(email) = lower($1)
+                    ORDER BY (tenant_id IS NULL), created_at
+                    LIMIT 1
+                    """,
+                    email,
+                )
+                if existing is not None:
+                    await conn.execute(
+                        "UPDATE user_profiles SET id = $1, email = $2, updated_at = now() WHERE id = $3",
+                        user_id, email, existing["id"],
+                    )
+                    logger.info(
+                        f"[DB] Re-pointed the profile for {email} onto a new Supabase auth identity "
+                        f"(tenant={existing['tenant_id']})."
+                    )
+                    return {**dict(existing), "id": user_id, "email": email}
+
+                row = await conn.fetchrow(
+                    """
+                    INSERT INTO user_profiles (id, email)
+                    VALUES ($1, $2)
+                    RETURNING id, email, tenant_id, role
+                    """,
+                    user_id, email,
+                )
+                return dict(row) if row else None
         except asyncpg.exceptions.UndefinedTableError:
             logger.warning("[DB] user_profiles not found — run tenants_schema.sql.")
             return None
-    return dict(row) if row else None
 
 
 # Self-serve signup means anyone with a free Supabase account (Google
@@ -817,6 +887,48 @@ async def upsert_user_profile_email(user_id: str, email: str) -> Optional[Dict[s
 # should revisit the number once real signup volume exists — there is
 # nothing principled about 300 beyond "obviously more than legitimate
 # usage, obviously less than a farming script would otherwise create".
+async def _attach_profile_to_tenant(conn, user_id: str, email: str, tenant_id: str) -> None:
+    """Binds this auth identity to `tenant_id`, tolerating the same
+    several-identities-per-email case upsert_user_profile_email documents.
+
+    A bare `INSERT ... ON CONFLICT (id)` is not enough on its own: if this
+    email already sits on a row under a DIFFERENT auth id, the id conflict
+    never fires and the statement hits the live user_profiles_email_key
+    unique index instead, 500-ing onboarding exactly the way it used to
+    500 login. In the normal flow /api/v1/auth/sync has already re-pointed
+    that row, so this is defence in depth rather than the primary guard —
+    but it is the same bug class, and it has already cost one outage.
+    """
+    existing = await conn.fetchrow(
+        """
+        SELECT id FROM user_profiles
+        WHERE lower(email) = lower($1) AND id <> $2
+        ORDER BY (tenant_id IS NULL), created_at
+        LIMIT 1
+        """,
+        email, user_id,
+    )
+    # Only re-point when this identity has no row of its own; otherwise the
+    # update would collide with it on the primary key.
+    if existing is not None:
+        mine = await conn.fetchrow("SELECT 1 FROM user_profiles WHERE id = $1", user_id)
+        if mine is None:
+            await conn.execute(
+                "UPDATE user_profiles SET id = $1, updated_at = now() WHERE id = $2",
+                user_id, existing["id"],
+            )
+
+    await conn.execute(
+        """
+        INSERT INTO user_profiles (id, email, tenant_id, role)
+        VALUES ($1, $2, $3, 'owner')
+        ON CONFLICT (id) DO UPDATE SET
+            email = EXCLUDED.email, tenant_id = EXCLUDED.tenant_id, updated_at = now()
+        """,
+        user_id, email, tenant_id,
+    )
+
+
 MAX_SELF_PROVISIONED_TENANTS = int(os.getenv("MAX_SELF_PROVISIONED_TENANTS", "300"))
 
 
@@ -919,15 +1031,7 @@ async def create_self_provisioned_tenant(
                 )
                 if existing_by_email and existing_by_email["tenant_id"]:
                     linked_tenant_id = existing_by_email["tenant_id"]
-                    await conn.execute(
-                        """
-                        INSERT INTO user_profiles (id, email, tenant_id, role)
-                        VALUES ($1, $2, $3, 'owner')
-                        ON CONFLICT (id) DO UPDATE SET
-                            email = EXCLUDED.email, tenant_id = EXCLUDED.tenant_id, updated_at = now()
-                        """,
-                        user_id, email, linked_tenant_id,
-                    )
+                    await _attach_profile_to_tenant(conn, user_id, email, linked_tenant_id)
                     return {
                         "tenant_id": linked_tenant_id,
                         "product_id": f"{linked_tenant_id}_prod_main",
@@ -967,15 +1071,7 @@ async def create_self_provisioned_tenant(
                     product_id, tenant_id, name, domain,
                     target_counties, min_value_ron, keywords, exclude_keywords,
                 )
-                await conn.execute(
-                    """
-                    INSERT INTO user_profiles (id, email, tenant_id, role)
-                    VALUES ($1, $2, $3, 'owner')
-                    ON CONFLICT (id) DO UPDATE SET
-                        email = EXCLUDED.email, tenant_id = EXCLUDED.tenant_id, updated_at = now()
-                    """,
-                    user_id, email, tenant_id,
-                )
+                await _attach_profile_to_tenant(conn, user_id, email, tenant_id)
         except asyncpg.exceptions.UndefinedTableError:
             logger.warning("[DB] tenants/tenant_products/user_profiles not found — run tenants_schema.sql.")
             return None

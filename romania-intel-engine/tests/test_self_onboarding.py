@@ -47,6 +47,13 @@ class FakeConnection:
         return _FakeTransaction()
 
     async def fetchrow(self, query, *args):
+        # _attach_profile_to_tenant's re-point probe — also matches on
+        # lower(email), so it has to be checked BEFORE the broader branch
+        # below or it would be handed a row with no "id" key.
+        if "lower(email)" in query and "id <> $2" in query:
+            return None  # no other auth identity holds this email
+        if "SELECT 1 FROM user_profiles WHERE id" in query:
+            return {"?column?": 1}  # this identity already has its own row
         if "lower(email)" in query:
             return {"tenant_id": self.existing_tenant_id_for_email} if self.existing_tenant_id_for_email else None
         if "SELECT tenant_id FROM user_profiles" in query:
