@@ -16,12 +16,30 @@ RATE_LIMIT_STORE: Dict[str, Tuple[int, float]] = {}
 RATE_LIMIT_REQUESTS = 180
 RATE_LIMIT_WINDOW = 60
 
+# Self-serve onboarding (/api/v1/onboarding/complete) does a real
+# transactional DB write (tenant + product + membership rows) and, on
+# success, an in-process refresh of every tenant's matching config — far
+# heavier than an ordinary read, and each success leaves a permanent row
+# behind rather than just serving a response. The global 180-req/60s
+# budget above exists to stop generic API hammering, not tenant-farming
+# specifically: 180 requests/minute is no obstacle at all to a script
+# cycling through disposable free Supabase accounts from one IP. This is
+# a separate, much tighter budget scoped to just that one route — a
+# legitimate user onboards once, so even a handful of allowed attempts
+# per hour (retries after a validation error, one person setting up a
+# couple of accounts) comfortably covers real usage.
+ONBOARDING_RATE_LIMIT_STORE: Dict[str, Tuple[int, float]] = {}
+ONBOARDING_RATE_LIMIT_REQUESTS = 5
+ONBOARDING_RATE_LIMIT_WINDOW = 3600
+
 # The rate limiter never evicted an IP once it stopped sending requests, so
 # RATE_LIMIT_STORE grew by one entry per distinct client IP ever seen and
 # never shrank — a slow but real OOM risk on a long-lived process. Cleanup
 # runs opportunistically (inside enforce_rate_limit, not a separate
 # scheduled task) but only every CLEANUP_INTERVAL_SECONDS, so it stays an
-# O(n) scan every few minutes rather than every request.
+# O(n) scan every few minutes rather than every request. Covers both
+# stores above — the onboarding one grows far slower, but not enforcing
+# the same hygiene on it would just move the same slow OOM risk over.
 CLEANUP_INTERVAL_SECONDS = 300
 _last_cleanup_at = 0.0
 
@@ -74,11 +92,15 @@ class SecurityGuard:
         if now - _last_cleanup_at < CLEANUP_INTERVAL_SECONDS:
             return
         _last_cleanup_at = now
-        stale = [ip for ip, (_, start_time) in RATE_LIMIT_STORE.items() if now - start_time >= RATE_LIMIT_WINDOW]
-        for ip in stale:
-            del RATE_LIMIT_STORE[ip]
-        if stale:
-            logger.info(f"[SecurityGuard] Purged {len(stale)} stale rate-limit entries ({len(RATE_LIMIT_STORE)} remaining).")
+        for store, window, label in (
+            (RATE_LIMIT_STORE, RATE_LIMIT_WINDOW, "global"),
+            (ONBOARDING_RATE_LIMIT_STORE, ONBOARDING_RATE_LIMIT_WINDOW, "onboarding"),
+        ):
+            stale = [ip for ip, (_, start_time) in store.items() if now - start_time >= window]
+            for ip in stale:
+                del store[ip]
+            if stale:
+                logger.info(f"[SecurityGuard] Purged {len(stale)} stale {label} rate-limit entries ({len(store)} remaining).")
 
     @staticmethod
     def enforce_rate_limit(request: Request):
@@ -98,6 +120,31 @@ class SecurityGuard:
                 RATE_LIMIT_STORE[client_ip] = (1, now)
         else:
             RATE_LIMIT_STORE[client_ip] = (1, now)
+
+    @staticmethod
+    def enforce_onboarding_rate_limit(request: Request):
+        """Tighter, route-scoped budget layered on top of the global
+        limiter above — see ONBOARDING_RATE_LIMIT_REQUESTS' comment for
+        why self-serve tenant creation needs its own, much stricter cap."""
+        client_ip = request.client.host if request.client else "127.0.0.1"
+        now = time.time()
+
+        SecurityGuard._cleanup_stale_ips(now)
+
+        if client_ip in ONBOARDING_RATE_LIMIT_STORE:
+            count, start_time = ONBOARDING_RATE_LIMIT_STORE[client_ip]
+            if now - start_time < ONBOARDING_RATE_LIMIT_WINDOW:
+                if count >= ONBOARDING_RATE_LIMIT_REQUESTS:
+                    logger.warning(f"[SecurityGuard] Onboarding rate limit exceeded for IP: {client_ip}")
+                    raise HTTPException(
+                        status_code=429,
+                        detail="Prea multe încercări de înregistrare de pe această adresă. Reîncercați peste o oră.",
+                    )
+                ONBOARDING_RATE_LIMIT_STORE[client_ip] = (count + 1, start_time)
+            else:
+                ONBOARDING_RATE_LIMIT_STORE[client_ip] = (1, now)
+        else:
+            ONBOARDING_RATE_LIMIT_STORE[client_ip] = (1, now)
 
     @staticmethod
     def verify_tenant_authorization(request: Request) -> Dict:
@@ -220,6 +267,14 @@ def require_auth(request: Request) -> Dict:
     unreachable auth backend must not silently accept everything, which is
     exactly the behaviour the previous stub had."""
     return SecurityGuard.verify_tenant_authorization(request)
+
+
+def enforce_onboarding_rate_limit(request: Request) -> None:
+    """`Depends()`-compatible wrapper around
+    SecurityGuard.enforce_onboarding_rate_limit, for routes that need the
+    tighter self-serve-signup budget on top of the global per-IP limit
+    the middleware already applies to every request."""
+    SecurityGuard.enforce_onboarding_rate_limit(request)
 
 
 def optional_auth(request: Request) -> Optional[Dict]:

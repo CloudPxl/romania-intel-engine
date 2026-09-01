@@ -803,6 +803,37 @@ async def upsert_user_profile_email(user_id: str, email: str) -> Optional[Dict[s
     return dict(row) if row else None
 
 
+# Self-serve signup means anyone with a free Supabase account (Google
+# OAuth or a magic-link email, no cost and no human review) can call
+# create_self_provisioned_tenant once per account — and nothing stops the
+# same person scripting many accounts to create many tenants. Every
+# tenant added here is one more iteration of orchestrator.py:run_tick's
+# `for tenant_id in TENANT_ORGANIZATIONS` loop, which runs once per
+# newly-ingested signal — unbounded growth there degrades ingestion
+# latency for *every* tenant, not just the abuser's own feed. This cap is
+# deliberately generous (a few hundred, comfortably above any real growth
+# this product has seen) rather than tuned tight: the goal is to catch
+# scripted tenant-farming, not to constrain genuine adoption. A human
+# should revisit the number once real signup volume exists — there is
+# nothing principled about 300 beyond "obviously more than legitimate
+# usage, obviously less than a farming script would otherwise create".
+MAX_SELF_PROVISIONED_TENANTS = int(os.getenv("MAX_SELF_PROVISIONED_TENANTS", "300"))
+
+
+class TenantCapacityError(Exception):
+    """Raised by create_self_provisioned_tenant when
+    MAX_SELF_PROVISIONED_TENANTS has been reached.
+
+    Deliberately a real exception rather than folding into this
+    function's existing `return None` convention: None already means two
+    ordinary, expected outcomes here (no database configured; caller
+    already has a tenant) that api.py reacts to quietly. Hitting the cap
+    is an operational anomaly — worth the operator finding out about
+    (api.py fires an admin alert on it), not something to silently
+    swallow alongside the routine cases.
+    """
+
+
 async def create_self_provisioned_tenant(
     user_id: str,
     email: str,
@@ -827,20 +858,53 @@ async def create_self_provisioned_tenant(
     original company-style shape) still goes through
     scripts/provision_tenant.py, which is unaffected by this function.
 
-    Returns None — never raises — when no database is configured, or when
-    this user already has a tenant (the caller should route them to
-    update_own_tenant_product instead of calling this again, since it never
-    overwrites an existing membership)."""
+    Returns None — never raises for either ordinary case — when no
+    database is configured, or when this user already has a tenant (the
+    caller should route them to update_own_tenant_product instead of
+    calling this again, since it never overwrites an existing
+    membership). Raises TenantCapacityError (see above) when
+    MAX_SELF_PROVISIONED_TENANTS has been reached."""
     async with with_connection() as conn:
         if conn is None:
             return None
         try:
             async with conn.transaction():
+                # Serializes two concurrent onboarding attempts for the
+                # SAME user against the SELECT-then-INSERT check just
+                # below: under READ COMMITTED, a double-click submit or a
+                # client retry after a slow response could otherwise have
+                # both requests see "no tenant yet", both proceed to
+                # create a *distinct* tenant, and leave one permanently
+                # orphaned — real in Postgres with no user ever pointing
+                # at it, since only whichever one's user_profiles upsert
+                # commits last actually "wins" the membership. A
+                # transaction-scoped advisory lock keyed by this user_id
+                # makes the second attempt block here until the first
+                # commits or rolls back, then re-read `existing` and
+                # correctly see the just-committed row. hashtext() turns
+                # the UUID into the bigint key pg_advisory_xact_lock
+                # wants; the lock releases automatically at transaction
+                # end, no explicit unlock needed.
+                await conn.fetchval("SELECT pg_advisory_xact_lock(hashtext($1))", user_id)
+
                 existing = await conn.fetchrow(
                     "SELECT tenant_id FROM user_profiles WHERE id = $1", user_id
                 )
                 if existing and existing["tenant_id"]:
                     return None
+
+                # Self-provisioned ids are namespaced with a "u_" prefix
+                # (below); admin-provisioned ones (scripts/provision_tenant.py)
+                # use human-chosen ids like "t1_infra_transilvania" and are
+                # never counted here — hand-onboarding the next 10-20 real
+                # companies never competes with this cap.
+                self_provisioned_count = await conn.fetchval(
+                    "SELECT COUNT(*) FROM tenants WHERE left(id, 2) = 'u_'"
+                )
+                if self_provisioned_count is not None and self_provisioned_count >= MAX_SELF_PROVISIONED_TENANTS:
+                    raise TenantCapacityError(
+                        f"Self-provisioned tenant cap reached ({self_provisioned_count}/{MAX_SELF_PROVISIONED_TENANTS})."
+                    )
 
                 tenant_id = f"u_{uuid.uuid4().hex[:12]}"
                 product_id = f"{tenant_id}_prod_main"
@@ -915,5 +979,29 @@ async def update_own_tenant_product(
                 await conn.execute("UPDATE tenants SET primary_domain = $1 WHERE id = $2", domain, tenant_id)
         except asyncpg.exceptions.UndefinedTableError:
             logger.warning("[DB] tenants/tenant_products not found — run tenants_schema.sql.")
+            return False
+    return True
+
+
+async def update_tenant_alert_settings(tenant_id: str, alert_emails: List[str], min_alert_score: float) -> bool:
+    """Lets a tenant change where automated alerts actually go and at what
+    score they fire — the real dispatch-side counterpart to
+    update_own_tenant_product (which only ever touched matching criteria,
+    never the tenants.alert_emails/min_alert_score columns notifier.py's
+    dispatch_lead_alert_to_tenant reads). Before this existed, the
+    frontend's Settings modal wrote a notification email/threshold to
+    localStorage only — it looked saved, but automated alerts kept using
+    whatever create_self_provisioned_tenant set once at signup ([email],
+    7.5), forever."""
+    async with with_connection() as conn:
+        if conn is None:
+            return False
+        try:
+            await conn.execute(
+                "UPDATE tenants SET alert_emails = $1, min_alert_score = $2 WHERE id = $3",
+                alert_emails, min_alert_score, tenant_id,
+            )
+        except asyncpg.exceptions.UndefinedTableError:
+            logger.warning("[DB] tenants not found — run tenants_schema.sql.")
             return False
     return True

@@ -26,7 +26,7 @@ from scrapers.orchestrator import OpportunityOrchestrator, TICK_DEADLINE_SECONDS
 from cache_engine import global_cache, newsletter_store
 from freemium_shield import FreemiumGatekeeper
 from notifier import LeadAlertDispatcher
-from security import SecurityGuard, require_auth, require_tenant_membership
+from security import SecurityGuard, require_auth, require_tenant_membership, enforce_onboarding_rate_limit
 
 from addons.caiet_analyzer import CaietDeSarciniAnalyzer, TextExtractionError
 from addons.win_probability import WinProbabilityEngine
@@ -166,6 +166,64 @@ class OnboardingRequest(BaseModel):
     min_value_ron: float = 0.0
     keywords: List[str] = []
     exclude_keywords: List[str] = []
+
+# Self-serve callers submit these fields directly — there is no admin
+# reviewing the payload before it's written, unlike scripts/provision_tenant.py's
+# hand-typed --keywords/--target-counties. None of these caps constrain
+# real usage (the largest existing hand-configured product line has under
+# 20 keywords, see matching_engine.py); they exist so one garbage or
+# malicious payload can't blow up matching_terms()'s per-opportunity,
+# per-tenant regex scan — run once per *ingested signal*, for every
+# product of every tenant in TENANT_ORGANIZATIONS (orchestrator.py:
+# run_tick) — or write an unreasonably large row. target_counties and
+# keywords are deliberately NOT validated against a fixed vocabulary
+# (e.g. a real județ list): counties_match()/matching_terms() already
+# degrade a typo'd or unrecognised value gracefully rather than failing —
+# a bad county just never earns the +1.6 geography bonus (matching_engine.py),
+# it does not zero out the match. A bad *keyword* is a harsher case
+# (keyword evidence is a mandatory gate — TenantMatchingEngine._score_product's
+# docstring), but validating "real Romanian procurement vocabulary" isn't
+# something a fixed list can do reliably, and that risk is best addressed
+# in the signup UI (out of scope here — frontend), not by rejecting
+# free-text server-side.
+MAX_ONBOARDING_LIST_ITEMS = 60
+MAX_ONBOARDING_COUNTIES = 42  # 41 județe + București
+MAX_ONBOARDING_STRING_LENGTH = 80
+MAX_DISPLAY_NAME_LENGTH = 120
+MAX_MIN_VALUE_RON = 1_000_000_000_000.0  # 1 trilion RON — past this it's not a real budget floor
+
+
+def _validate_onboarding_payload(payload: "OnboardingRequest") -> None:
+    """Shared sanity checks for both /api/v1/onboarding/complete and
+    PUT /api/v1/tenants/{tenant_id}/profile. See the caps above for why
+    each one exists."""
+    def _check_list(values: List[str], max_items: int, field_label: str) -> None:
+        if len(values) > max_items:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Prea multe valori la {field_label} (maxim {max_items}).",
+            )
+        for v in values:
+            if len(v) > MAX_ONBOARDING_STRING_LENGTH:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"O valoare la {field_label} este prea lungă (maxim {MAX_ONBOARDING_STRING_LENGTH} caractere).",
+                )
+
+    _check_list(payload.keywords, MAX_ONBOARDING_LIST_ITEMS, "cuvinte-cheie")
+    _check_list(payload.exclude_keywords, MAX_ONBOARDING_LIST_ITEMS, "cuvinte-cheie de excludere")
+    _check_list(payload.target_counties, MAX_ONBOARDING_COUNTIES, "județe")
+    if payload.display_name and len(payload.display_name) > MAX_DISPLAY_NAME_LENGTH:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Numele este prea lung (maxim {MAX_DISPLAY_NAME_LENGTH} caractere).",
+        )
+    if payload.min_value_ron < 0 or payload.min_value_ron > MAX_MIN_VALUE_RON:
+        raise HTTPException(status_code=400, detail="Valoarea minimă a bugetului nu este validă.")
+
+class AlertSettingsRequest(BaseModel):
+    alert_email: EmailStr
+    min_alert_score: float = 7.5
 
 class ProformaRequest(BaseModel):
     plan_id: str
@@ -518,14 +576,24 @@ async def sync_user_auth(payload: AuthSyncRequest, user: dict = Depends(require_
     }
 
 @app.post("/api/v1/onboarding/complete")
-async def complete_onboarding(payload: OnboardingRequest, user: dict = Depends(require_auth)):
+async def complete_onboarding(
+    payload: OnboardingRequest,
+    user: dict = Depends(require_auth),
+    _rl: None = Depends(enforce_onboarding_rate_limit),
+):
     """Self-serve replacement for the admin-only scripts/provision_tenant.py
     flow. This product now sells to individuals rather than companies —
     there is no admin for a new subscriber to email to get unblocked, so a
     signed-in user with no tenant yet must be able to create their own
     right here, choosing their own domain/counties/keywords instead of
     inheriting a company's product line. See db.create_self_provisioned_tenant
-    for the actual write."""
+    for the actual write.
+
+    Self-serve with zero admin approval also means zero admin visibility
+    unless something here surfaces it — dispatch_admin_alert below is the
+    only way the person actually running this business finds out a new
+    account exists to follow up with (billing.py has no automatic payment
+    collection, only manual proforma invoices)."""
     domain = payload.domain.strip().lower()
     if domain not in VALID_TENANT_DOMAINS:
         raise HTTPException(
@@ -537,14 +605,33 @@ async def complete_onboarding(payload: OnboardingRequest, user: dict = Depends(r
             status_code=400,
             detail="Adăugați cel puțin un cuvânt-cheie, altfel nu veți primi nicio oportunitate relevantă.",
         )
+    _validate_onboarding_payload(payload)
     if not db.DATABASE_URL:
         raise HTTPException(status_code=503, detail="Baza de date nu este configurată — configurarea contului este indisponibilă momentan.")
 
     email = user.get("email", "")
-    result = await db.create_self_provisioned_tenant(
-        user["user_id"], email, (payload.display_name or "").strip(), domain,
-        payload.target_counties, payload.min_value_ron, payload.keywords, payload.exclude_keywords,
-    )
+    display_name = (payload.display_name or "").strip()
+    try:
+        result = await db.create_self_provisioned_tenant(
+            user["user_id"], email, display_name, domain,
+            payload.target_counties, payload.min_value_ron, payload.keywords, payload.exclude_keywords,
+        )
+    except db.TenantCapacityError as e:
+        logger.warning(f"[Onboarding] {e}")
+        # This is exactly the kind of thing the operator needs to know
+        # about promptly — the cap constant itself likely needs revisiting,
+        # not just this one signup rejecting.
+        try:
+            await LeadAlertDispatcher.dispatch_admin_alert(
+                f"⚠️ Plafonul de conturi auto-provizionate a fost atins ({e}). "
+                f"Următoarea înregistrare (user_id={user['user_id']}, email={email}) a fost refuzată."
+            )
+        except Exception as alert_err:
+            logger.error(f"[Onboarding] Capacity-alert dispatch failed: {alert_err}")
+        raise HTTPException(
+            status_code=503,
+            detail="Numărul maxim de conturi noi a fost atins momentan. Contactați echipa RO-INTEL pentru acces.",
+        )
     if result is None:
         raise HTTPException(status_code=409, detail="Contul dvs. este deja configurat.")
 
@@ -552,7 +639,33 @@ async def complete_onboarding(payload: OnboardingRequest, user: dict = Depends(r
     # brand-new tenant would 403 on its own feed until the next restart —
     # the exact reason /api/v1/admin/reload-tenants exists for the admin
     # path, needed here too since this route creates tenants the same way.
-    await matching_engine.refresh_tenant_organizations()
+    #
+    # The tenant/product/membership rows above already committed
+    # successfully (create_self_provisioned_tenant runs them in one
+    # transaction) before this line ever runs — a failure here (e.g. a
+    # transient pool error) does not mean provisioning failed, only that
+    # this process's in-memory copy is stale until the next natural
+    # refresh or a manual POST /api/v1/admin/reload-tenants. Letting the
+    # exception propagate would turn a successful signup into a fabricated
+    # 500 for a brand-new (possibly paying) user.
+    try:
+        await matching_engine.refresh_tenant_organizations()
+    except Exception as e:
+        logger.error(f"[Onboarding] Post-provisioning tenant-cache refresh failed: {e}")
+
+    try:
+        await LeadAlertDispatcher.dispatch_admin_alert(
+            "🆕 Cont nou auto-provizionat pe RO-INTEL\n"
+            f"Nume: {display_name or email}\n"
+            f"Email: {email}\n"
+            f"Domeniu: {domain}\n"
+            f"Tenant: {result['tenant_id']}"
+        )
+    except Exception as e:
+        # A failed operator notification must never fail the signup itself
+        # — the account is already real in the database at this point.
+        logger.error(f"[Onboarding] Operator notification failed: {e}")
+
     return {"status": "provisioned", **result}
 
 @app.put("/api/v1/tenants/{tenant_id}/profile")
@@ -571,13 +684,45 @@ async def update_tenant_profile(tenant_id: str, payload: OnboardingRequest, _use
             status_code=400,
             detail="Adăugați cel puțin un cuvânt-cheie, altfel nu veți primi nicio oportunitate relevantă.",
         )
+    _validate_onboarding_payload(payload)
     ok = await db.update_own_tenant_product(
         tenant_id, domain, payload.target_counties, payload.min_value_ron,
         payload.keywords, payload.exclude_keywords,
     )
     if not ok:
         raise HTTPException(status_code=503, detail="Nu s-a putut salva profilul — baza de date este indisponibilă.")
-    await matching_engine.refresh_tenant_organizations()
+    # Same reasoning as complete_onboarding above: the write already
+    # succeeded, so a refresh failure here must not surface as if the
+    # edit itself failed.
+    try:
+        await matching_engine.refresh_tenant_organizations()
+    except Exception as e:
+        logger.error(f"[UpdateTenantProfile] Post-update tenant-cache refresh failed: {e}")
+    return {"status": "updated"}
+
+@app.put("/api/v1/tenants/{tenant_id}/alert-settings")
+async def update_tenant_alert_settings(
+    tenant_id: str, payload: AlertSettingsRequest, _user: dict = Depends(require_tenant_membership)
+):
+    """Where automated alerts actually go and at what score they fire.
+
+    Split from update_tenant_profile (matching criteria) on purpose: the
+    frontend's Settings modal used to write a notification email/threshold
+    to localStorage only, which looked saved but never touched the
+    tenants.alert_emails/min_alert_score columns notifier.py's
+    dispatch_lead_alert_to_tenant actually reads — a real signup kept
+    getting alerts at whatever create_self_provisioned_tenant set once at
+    onboarding ([their signup email], 7.5), forever, no matter what they
+    changed here."""
+    if payload.min_alert_score < 0 or payload.min_alert_score > 10:
+        raise HTTPException(status_code=400, detail="Pragul de alertă trebuie să fie între 0 și 10.")
+    ok = await db.update_tenant_alert_settings(tenant_id, [payload.alert_email], payload.min_alert_score)
+    if not ok:
+        raise HTTPException(status_code=503, detail="Nu s-au putut salva preferințele — baza de date este indisponibilă.")
+    try:
+        await matching_engine.refresh_tenant_organizations()
+    except Exception as e:
+        logger.error(f"[UpdateTenantAlertSettings] Post-update tenant-cache refresh failed: {e}")
     return {"status": "updated"}
 
 @app.get("/api/v1/tenants")
