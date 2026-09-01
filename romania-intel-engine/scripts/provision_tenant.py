@@ -1,8 +1,13 @@
 #!/usr/bin/env python3
-"""Onboards one real external client, by hand — the operational workflow
-Part B of the tenant-isolation fix relies on instead of a self-serve
-signup flow (deliberately not built: unnecessary for 10-20 hand-picked
-companies, and out of scope for a $0-investment fix).
+"""Onboards one real external client, by hand.
+
+Self-serve signup now exists (POST /api/v1/onboarding/complete —
+db.create_self_provisioned_tenant) and is the primary path for the
+individual clients this product sells to today. This script is no longer
+that path's stand-in; it remains for a tenant that genuinely needs
+multiple product lines (the original company-style shape self-serve
+onboarding deliberately doesn't build), or for hand-fixing a tenant's
+config out of band.
 
 Unlike the since-deleted scripts/seed_tenants.py (confirmed dead, and
 unsafe to run: it inserted synthetic user ids that aren't real Supabase
