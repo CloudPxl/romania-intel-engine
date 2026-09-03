@@ -51,6 +51,39 @@ DROP TABLE IF EXISTS tenants CASCADE;
 DROP TABLE IF EXISTS audit_logs CASCADE;
 DROP TABLE IF EXISTS dossier_notes CASCADE;
 
+-- --------------------------------------------------------------------
+-- The deleted `src/` pipeline's tables.
+--
+-- These are older than the multi-tenant tables above and were missed by
+-- the first pass, which enumerated only the tenant-era ones. They belong
+-- to the complete parallel implementation that used to sit under `src/`
+-- with its own store, its own scrapers and its own matching engine,
+-- reachable only from four developer CLI scripts and never from the
+-- deployed API. That tree is gone; these are its orphans.
+--
+-- The pairing is the giveaway that this is a whole second lineage, not
+-- stray tables: raw_intel -> structured_intel is a two-stage
+-- scrape-then-refine store that `opportunities` replaced with one table,
+-- and scraper_logs is what `source_run_log` replaced (the latter also
+-- carries poll intervals and circuit-breaker state, which is why the
+-- orchestrator can skip and back off and the old one could not).
+--
+-- Verified dead: `grep -rn` for all six names across every .py, .sql,
+-- .ts and .tsx in both projects returns nothing. Dropping them cannot
+-- break the running system.
+--
+-- THIS DISCARDS WHATEVER THEY STILL HOLD. raw_intel/structured_intel may
+-- contain real rows scraped by the old pipeline; they are superseded by
+-- `opportunities`, which the live scrapers write and every read path
+-- uses. Nothing reads the old rows and no code can put them to use.
+-- --------------------------------------------------------------------
+DROP TABLE IF EXISTS tenant_dispatches CASCADE;          -- FK -> structured_intel
+DROP TABLE IF EXISTS tenant_analytics_reports CASCADE;
+DROP TABLE IF EXISTS tenant_filters CASCADE;
+DROP TABLE IF EXISTS structured_intel CASCADE;           -- FK -> raw_intel
+DROP TABLE IF EXISTS raw_intel CASCADE;
+DROP TABLE IF EXISTS scraper_logs CASCADE;
+
 -- Re-run safety: these are this file's own tables.
 DROP TABLE IF EXISTS alert_dispatch_log CASCADE;
 DROP TABLE IF EXISTS saved_deals CASCADE;

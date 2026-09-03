@@ -11,6 +11,9 @@ match "salariu" and "apa" match "apartament", which is the documented reason
 text_utils.contains_term exists — and getting it wrong in SQL would present
 as "the feed is full of garbage" rather than as an error.
 """
+import inspect
+import re
+
 import pytest
 
 import api
@@ -39,6 +42,47 @@ class TestWordPatterns:
 
     def test_none_is_safe(self):
         assert db._pg_word_patterns(None) == []
+
+
+class TestCountyKey:
+    """County matching is exact equality, so a separator decides whether a
+    match happens at all — and the two sides disagreed in production.
+
+    Scrapers store "Caras Severin" with a space. The county's real name is
+    "Caraș-Severin" with a hyphen, which is what a user types and what
+    fold() faithfully preserves. Folded, those were 'caras severin' and
+    'caras-severin' — never equal — so that user's county scored nothing on
+    every row, with no error anywhere.
+    """
+
+    def test_hyphen_and_space_spellings_converge(self):
+        assert db._county_key("Caraș-Severin") == db._county_key("Caras Severin")
+
+    def test_folds_diacritics_like_the_rest_of_the_system(self):
+        assert db._county_key("Iași") == "iasi"
+        assert db._county_key("București") == "bucuresti"
+
+    def test_collapses_repeated_and_surrounding_whitespace(self):
+        assert db._county_key("  CARAS   SEVERIN ") == "caras severin"
+
+    def test_bistrita_nasaud_normalises(self):
+        assert db._county_key("Bistrița-Năsăud") == "bistrita nasaud"
+
+    def test_sql_translate_map_is_length_balanced(self):
+        """Postgres rejects translate() when from/to differ in length, and
+        the hyphen addition is exactly the kind of edit that breaks it.
+        A mismatch would 500 every feed request rather than mis-rank."""
+        sql = db._PG_COUNTY_KEY.format(col="county")
+        frm, to = re.findall(r"'((?:[^']|'')*)'", sql)[:2]
+        assert len(frm) == len(to), f"translate map unbalanced: {len(frm)} vs {len(to)}"
+
+    def test_query_uses_the_county_key_not_the_plain_fold(self):
+        """The regression guard: the ranked query must normalise county
+        with _PG_COUNTY_KEY. Reverting it to _PG_FOLD compiles, runs, and
+        silently stops matching hyphenated counties."""
+        source = inspect.getsource(db.get_ranked_opportunities)
+        assert "_PG_COUNTY_KEY.format(col='county')" in source
+        assert "_PG_FOLD.format(col='county')" not in source
 
 
 class TestRankedQuery:

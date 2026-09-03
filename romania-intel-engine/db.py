@@ -419,6 +419,30 @@ RELEVANCE_WEIGHTS = {
 # is cheap; the alternative is another stored column for no real gain.
 _PG_FOLD = "translate(lower({col}), 'ăĂâÂîÎșȘşŞțȚţŢ', 'aaaaiisssstttt')"
 
+# County comparison is exact equality, so separators decide whether a
+# match happens at all — and the two sides genuinely disagree. Scrapers
+# store "Caras Severin" with a space; the county's actual name is
+# "Caraș-Severin" with a hyphen, which is what a user types and what
+# fold() faithfully preserves. Folded, those are 'caras severin' and
+# 'caras-severin' — never equal, so the user's county silently scored
+# nothing on every row.
+#
+# Normalising both sides to single-spaced words fixes it in the one place
+# the comparison happens, rather than trying to keep a hand-written list
+# spelled exactly the way the current scrapers happen to store it. The
+# translate map gains '-' -> ' ' (both strings stay 15 chars; Postgres
+# requires equal lengths), then whitespace collapses.
+_PG_COUNTY_KEY = (
+    "btrim(regexp_replace("
+    "translate(lower({col}), 'ăĂâÂîÎșȘşŞțȚţŢ-', 'aaaaiisssstttt '),"
+    r" '\s+', ' ', 'g'))"
+)
+
+
+def _county_key(value: str) -> str:
+    """Python side of _PG_COUNTY_KEY — must agree exactly."""
+    return " ".join(fold(str(value)).replace("-", " ").split())
+
 
 def _pg_word_patterns(terms: Optional[List[str]]) -> List[str]:
     """Folded whole-word POSIX patterns for `search_blob ~ ANY(...)`.
@@ -448,7 +472,7 @@ async def get_ranked_opportunities(
     """
     keywords = _pg_word_patterns(profile.get("keywords"))
     excludes = _pg_word_patterns(profile.get("exclude_keywords"))
-    counties = [fold(str(c)) for c in (profile.get("target_counties") or []) if str(c).strip()]
+    counties = [_county_key(c) for c in (profile.get("target_counties") or []) if str(c).strip()]
     domain = (profile.get("domain") or "").strip().lower() or None
     min_value = float(profile.get("min_value_ron") or 0)
 
@@ -456,13 +480,13 @@ async def get_ranked_opportunities(
     query = f"""
         SELECT *,
             (COALESCE(search_blob, '') ~ ANY($1::text[])) AS kw_hit,
-            ({_PG_FOLD.format(col='county')} = ANY($2::text[])) AS county_hit,
+            ({_PG_COUNTY_KEY.format(col='county')} = ANY($2::text[])) AS county_hit,
             ($3::text IS NOT NULL AND lower(category) = $3) AS domain_hit,
             ($4::numeric > 0 AND estimated_value_ron >= $4) AS value_hit,
             (COALESCE(search_blob, '') ~ ANY($5::text[])) AS excluded_hit,
             (
                 CASE WHEN COALESCE(search_blob, '') ~ ANY($1::text[]) THEN {w['keyword']} ELSE 0 END
-              + CASE WHEN {_PG_FOLD.format(col='county')} = ANY($2::text[]) THEN {w['county']} ELSE 0 END
+              + CASE WHEN {_PG_COUNTY_KEY.format(col='county')} = ANY($2::text[]) THEN {w['county']} ELSE 0 END
               + CASE WHEN $3::text IS NOT NULL AND lower(category) = $3 THEN {w['domain']} ELSE 0 END
               + CASE WHEN $4::numeric > 0 AND estimated_value_ron >= $4 THEN {w['value']} ELSE 0 END
               + CASE WHEN COALESCE(search_blob, '') ~ ANY($5::text[]) THEN {w['excluded']} ELSE 0 END
