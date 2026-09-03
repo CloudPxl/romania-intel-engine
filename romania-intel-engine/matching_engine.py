@@ -1,239 +1,115 @@
-import logging
-from typing import Any, Dict, List, Optional
+"""Does this opportunity matter to this person?
 
-import db
+Scope note, because there are now two things that "match" in this codebase
+and they deliberately disagree:
+
+  * THIS module answers "is this worth interrupting someone for?" — a hard
+    question, gated on real keyword evidence, used for email/Telegram
+    alerts.
+  * db.get_ranked_opportunities answers "what order should the feed be
+    in?" — a soft question that ranks the entire market and hides nothing.
+
+Feeding the soft ranking into alerting would mean everything matches a
+little, and every user would be emailed about every signal until they
+unsubscribed. Ranking a page and filling an inbox are not the same
+decision, so they are not the same function.
+
+There is no tenant, no organisation and no product line. A profile is a
+person, and a person has exactly one set of criteria — which is why the
+old per-product loop and the in-process TENANT_ORGANIZATIONS cache are
+both gone. Profiles are loaded once per tick by the caller (see
+db.get_onboarded_profiles) and passed in; nothing here holds state.
+"""
+
+import logging
+from typing import Any, Dict, List
+
 from text_utils import counties_match, matching_terms
 
 logger = logging.getLogger("MatchingEngine")
 
-# Default per-tenant alerting bar on the 0-10 tenant-match scale below.
-# Calibrated to the current weights: clearing it needs domain alignment
-# plus real keyword evidence plus either the right county or a qualifying
-# budget — i.e. a lead worth interrupting someone for, not merely a
-# plausible one. Tenants may override `min_alert_score` individually.
-#
-# This was 9.0 when match scores started from a 7.0 baseline. Both scales
-# were rebuilt from evidence, so the old literal no longer means what it
-# used to and is defined here once rather than repeated per tenant.
+# Default alerting bar on the 0-10 scale below. Clearing it needs domain
+# alignment plus real keyword evidence plus either the right county or a
+# qualifying budget — a lead worth interrupting someone for, not merely a
+# plausible one. Each profile may override it via min_alert_score.
 ALERT_THRESHOLD = 7.5
 
-# Tenant/product configuration.
-#
-# `keywords`      — terms that make an opportunity relevant to this division.
-# `exclude_keywords` — terms that disqualify it outright even if other
-#                   signals look good (a "reabilitare" that turns out to be
-#                   a cleaning-services contract is not a roadworks lead).
-# `min_value_ron` — a floor applied only when the value is actually known;
-#                   see UNKNOWN_VALUE handling in the engine.
-#
-# This literal is now a FALLBACK, not the live source of truth: api.py's
-# lifespan calls refresh_tenant_organizations() once at startup, which
-# overwrites the *contents* of this dict (via .clear()/.update(), never
-# reassignment — see that function's docstring for why the distinction
-# matters) from Postgres's tenants/tenant_products tables
-# (tenants_schema.sql) if that migration has been applied. If it hasn't
-# (or no database is configured — e.g. local dev), this hardcoded literal
-# is exactly what keeps running, so existing behaviour for these 3 tenants
-# never regresses either way.
-TENANT_ORGANIZATIONS = {
-    "t1_infra_transilvania": {
-        "name": "SC Infra Construct Transilvania SRL",
-        "primary_domain": "infrastructura",
-        "alert_emails": ["director@infraconstruct.ro"],
-        "telegram_chat_id": None,
-        "min_alert_score": ALERT_THRESHOLD,
-        "products": [
-            {
-                "product_id": "prod_heavy_infra",
-                "name": "Divizia Infrastructură Grea & Drumuri Județene",
-                "domain": "infrastructura",
-                "target_counties": ["Cluj", "Iasi", "Bihor", "Timis", "Bucuresti", "Constanta"],
-                "min_value_ron": 10000000.0,
-                "keywords": [
-                    "drum", "drumuri", "pod", "poduri", "pasaj", "asfalt", "asfaltare",
-                    "reabilitare", "modernizare", "infrastructura", "metrou", "sala de sport",
-                    "sala polivalenta", "viaduct", "tunel", "consolidare", "terasamente",
-                    "constructie", "construire", "extindere",
-                ],
-                "exclude_keywords": [
-                    "curatenie", "igienizare", "papetarie", "rechizite", "catering",
-                    "asigurare", "medicina muncii", "formare profesionala",
-                ],
-            },
-            {
-                "product_id": "prod_smart_traffic",
-                "name": "Divizia Smart City & Sisteme ITS SCATS",
-                "domain": "infrastructura",
-                "target_counties": ["Iasi", "Cluj", "Bucuresti", "Timis", "Constanta"],
-                "min_value_ron": 3000000.0,
-                "keywords": [
-                    "its", "trafic", "semaforizare", "semafor", "anpr", "senzori",
-                    "scats", "monitorizare video", "supraveghere video", "smart city",
-                    "management al traficului", "parcari",
-                ],
-                "exclude_keywords": ["curatenie", "papetarie", "catering"],
-            },
-        ],
-    },
-    "t2_medtech_bucuresti": {
-        "name": "SC MedTech Pharma SRL",
-        "primary_domain": "sanatate",
-        "alert_emails": ["office@ro-intel.xyz"],
-        "telegram_chat_id": None,
-        "min_alert_score": ALERT_THRESHOLD,
-        "products": [
-            {
-                "product_id": "prod_radiology_advanced",
-                "name": "Divizia Imagistică Avansată & Radioterapie",
-                "domain": "sanatate",
-                "target_counties": ["Bucuresti", "Iasi", "Cluj", "Timis", "Dolj"],
-                "min_value_ron": 5000000.0,
-                "keywords": [
-                    "rmn", "ct", "radioterapie", "accelerator", "imagistica", "imagistic",
-                    "spital", "spitalicesc", "oncologie", "oncologic", "radiologie",
-                    "tomograf", "angiograf", "mamograf", "ecograf", "dispensar",
-                    "unitate sanitara", "ambulatoriu", "bloc operator",
-                ],
-                "exclude_keywords": [
-                    "papetarie", "curatenie", "paza", "formare profesionala", "catering",
-                ],
-            }
-        ],
-    },
-    "t3_vest_consulting_grants": {
-        "name": "SC Vest Project Consulting",
-        "primary_domain": "energie",
-        "alert_emails": ["office@ro-intel.xyz"],
-        "telegram_chat_id": None,
-        "min_alert_score": ALERT_THRESHOLD,
-        "products": [
-            {
-                "product_id": "prod_green_energy",
-                "name": "Divizia Consultanță Parcuri Solare & BESS",
-                "domain": "energie",
-                "target_counties": ["Timis", "Cluj", "Iasi", "Constanta", "Bihor"],
-                "min_value_ron": 5000000.0,
-                "keywords": [
-                    "fotovoltaic", "fotovoltaice", "solar", "solara", "energie",
-                    "energetica", "baterii", "stocare", "cogenerare", "eficienta energetica",
-                    "regenerabil", "regenerabila", "panouri", "bess", "termoficare",
-                    "pompe de caldura", "eolian",
-                ],
-                "exclude_keywords": ["papetarie", "curatenie", "catering"],
-            }
-        ],
-    },
-}
-
-async def refresh_tenant_organizations() -> bool:
-    """Reloads TENANT_ORGANIZATIONS from Postgres. Returns True if it did
-    (Postgres reachable and tenants_schema.sql applied), False if it fell
-    through to keeping whatever was already loaded (the hardcoded literal
-    on first startup, or the previous successful refresh's data on a later
-    one — never wiped just because one refresh attempt failed).
-
-    Mutates the dict IN PLACE (.clear() + .update()) rather than rebinding
-    the module-level name to a new dict object. api.py imports this exact
-    dict by reference (`from matching_engine import TENANT_ORGANIZATIONS`)
-    at module load time — reassigning `TENANT_ORGANIZATIONS = new_dict`
-    here would leave api.py's already-bound name pointing at the old
-    object forever, silently undoing every future refresh from api.py's
-    point of view. Mutating the existing object is what makes every
-    importer see the update.
-
-    Called once at API startup (api.py's lifespan) and again by
-    scripts/provision_tenant.py after adding a new tenant, so a freshly
-    provisioned client's config is live without a redeploy — the whole
-    point of moving this out of a hardcoded dict in the first place.
-    """
-    fresh = await db.get_tenant_organizations()
-    if fresh is None:
-        return False
-    TENANT_ORGANIZATIONS.clear()
-    TENANT_ORGANIZATIONS.update(fresh)
-    logger.info(f"[MatchingEngine] Loaded {len(fresh)} tenant(s) from Postgres.")
-    return True
-
-
-# Opportunities whose budget the publisher never states arrive as 0.0.
-# 0.0 means "not disclosed", not "worth nothing" — most CNI register rows,
-# every ms.ro notice and every MFE funding call land this way — so the
-# value floor must not be applied to them as if they had failed it.
+# Most Romanian pre-tender publications carry no figure at all: an intention
+# notice names the object and the authority but not the money. Nearly every
+# ms.ro notice and every MFE funding call land this way — so the value floor
+# must not be applied to them as if they had failed it.
 UNKNOWN_VALUE = 0.0
 
-# A product must clear this to count as a match. Scores are built from
-# weighted evidence below rather than nudged off a high baseline, so this
-# sits mid-scale instead of just above the old 7.0 floor.
+# What an opportunity must clear to count as a match at all. Scores are
+# built from weighted evidence rather than nudged off a high baseline, so
+# this sits mid-scale.
 MATCH_THRESHOLD = 6.0
 
 
-class TenantMatchingEngine:
+class RelevanceEngine:
     @staticmethod
-    def _score_product(opportunity: Dict[str, Any], prod: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-        """Scores one product line against one opportunity.
+    def evaluate(opportunity: Dict[str, Any], profile: Dict[str, Any]) -> Dict[str, Any]:
+        """Scores one opportunity against one person's criteria.
 
-        Returns None when the opportunity is not relevant to *this specific
-        product*. Relevance is gated on keyword evidence, not domain: a
-        tenant can have several products in the same domain (t1's
-        heavy-infrastructure roads division and its separate ITS/smart-
-        traffic division are both "infrastructura"), and domain membership
-        alone doesn't say which one an opportunity actually belongs to.
-
-        This used to also accept domain-alone as sufficient, which meant a
-        plain road-resurfacing contract — zero overlap with the ITS
-        product's keywords (its/trafic/semaforizare/scats/...) — still
-        cleared the match threshold on domain (+3.4) plus county (+1.6)
-        plus budget (+1.5) alone, attributing a roads lead to the smart-
-        traffic product line. The earlier, related fix removed geography
-        as a sufficient signal on its own (an energy tenant was matching
-        defence contracts by county); this closes the same hole one layer
-        down, at the product rather than the domain.
+        Always returns a dict — `is_match` False rather than None — so the
+        caller can log or display a near-miss instead of it vanishing.
         """
         title = opportunity.get("project_title", "") or ""
-        summary = opportunity.get("executive_summary", "") or opportunity.get("raw_description", "") or ""
+        summary = opportunity.get("executive_summary", "") or ""
         sub_category = opportunity.get("sub_category", "") or ""
         text = f"{title} {summary} {sub_category}"
 
+        def _result(is_match: bool, score: float, reasons: List[str]) -> Dict[str, Any]:
+            return {
+                "is_match": is_match,
+                "score": score,
+                "reasons": reasons,
+            }
+
         # Hard exclusions first — a disqualifying term ends it regardless of
-        # how well everything else lines up.
-        blocked = matching_terms(text, prod.get("exclude_keywords", []))
+        # how well everything else lines up. Note this is where alerting
+        # diverges most from the feed ranking, which only *sinks* excluded
+        # items so the user can still scroll to them.
+        blocked = matching_terms(text, profile.get("exclude_keywords") or [])
         if blocked:
-            return None
+            return _result(False, 0.0, [f"Exclus prin: {', '.join(blocked[:3])}"])
 
-        domain_hit = opportunity.get("category") == prod["domain"]
-        matched_kws = matching_terms(text, prod.get("keywords", []))
+        matched_kws = matching_terms(text, profile.get("keywords") or [])
 
-        # Relevance gate: keyword evidence is mandatory. Domain match alone
-        # no longer clears it — it remains a scoring bonus below, so it can
-        # reinforce a keyword-relevant match but never create one by itself.
+        # Keyword evidence is mandatory. Domain and geography reinforce a
+        # match below but must never create one on their own: without this
+        # gate an energy specialist was alerted about defence contracts
+        # purely because they shared a county.
         if not matched_kws:
-            return None
+            return _result(False, 0.0, ["Fără dovezi în text pentru cuvintele-cheie alese"])
 
         score = 0.0
         reasons: List[str] = []
 
-        # Domain alignment — the strongest single signal.
-        if domain_hit:
+        if profile.get("domain") and opportunity.get("category") == profile["domain"]:
             score += 3.4
-            reasons.append(f"Domeniu: {prod['domain'].capitalize()}")
+            reasons.append(f"Domeniu: {str(profile['domain']).capitalize()}")
 
-        # Keyword evidence, with diminishing returns so one very generic
-        # term can't outweigh genuine domain alignment.
-        if matched_kws:
-            score += min(3.0, 1.4 + 0.55 * (len(matched_kws) - 1))
-            reasons.append(f"Relevanță tehnică: {', '.join(matched_kws[:4])}")
+        # Diminishing returns, so one very generic term cannot outweigh
+        # genuine domain alignment.
+        score += min(3.0, 1.4 + 0.55 * (len(matched_kws) - 1))
+        reasons.append(f"Relevanță tehnică: {', '.join(matched_kws[:4])}")
 
-        # Geography now *reinforces* a match instead of creating one.
-        if any(counties_match(opportunity.get("county", ""), c) for c in prod.get("target_counties", [])):
+        county = opportunity.get("county", "")
+        if any(counties_match(county, c) for c in profile.get("target_counties") or []):
             score += 1.6
-            reasons.append(f"Zonă vizată: {opportunity.get('county')}")
-        elif opportunity.get("county"):
-            reasons.append(f"În afara zonei prioritare ({opportunity.get('county')})")
+            reasons.append(f"Zonă vizată: {county}")
+        elif county:
+            reasons.append(f"În afara zonei prioritare ({county})")
 
-        # Budget. Unknown budgets neither reward nor penalise — they're
-        # flagged so the user knows the figure still has to be confirmed.
-        value = opportunity.get("financial_value_ron") or opportunity.get("estimated_value_ron") or UNKNOWN_VALUE
-        min_value = prod.get("min_value_ron", 0.0)
+        # Unknown budgets neither reward nor penalise — they are flagged so
+        # the user knows the figure still has to be confirmed at source.
+        value = (
+            opportunity.get("financial_value_ron")
+            or opportunity.get("estimated_value_ron")
+            or UNKNOWN_VALUE
+        )
+        min_value = float(profile.get("min_value_ron") or 0.0)
         if value == UNKNOWN_VALUE:
             score += 0.5
             reasons.append("Buget nepublicat — de confirmat la sursă")
@@ -242,57 +118,15 @@ class TenantMatchingEngine:
             reasons.append(f"Buget eligibil: {value:,.0f} RON")
         else:
             score -= 1.5
-            reasons.append(f"Sub pragul diviziei ({value:,.0f} < {min_value:,.0f} RON)")
+            reasons.append(f"Sub pragul stabilit ({value:,.0f} < {min_value:,.0f} RON)")
 
-        # Pre-tender stages are worth more to a consultancy than a notice
-        # that is already out to bid, because the specification can still
-        # be influenced. Set by the CNI scrapers (see cni_common.py).
+        # Pre-tender stages are worth more than a notice already out to bid,
+        # because the specification can still be influenced. Set by the CNI
+        # scrapers (see cni_common.py).
         stage = (opportunity.get("metadata") or {}).get("procurement_stage")
         if stage in ("pre_tender_approved_indicators", "pre_tender_documentation_review"):
             score += 0.8
             reasons.append("Fază pre-licitație — specificațiile pot fi încă influențate")
 
         final_score = max(0.0, min(10.0, round(score, 1)))
-        if final_score < MATCH_THRESHOLD:
-            return None
-
-        return {
-            "product_id": prod["product_id"],
-            "product_name": prod["name"],
-            "product_score": final_score,
-            "reasons": reasons,
-        }
-
-    @staticmethod
-    def evaluate_opportunity_for_tenant(opportunity: Dict[str, Any], tenant_id: str) -> Dict[str, Any]:
-        tenant = TENANT_ORGANIZATIONS.get(tenant_id)
-        if not tenant:
-            # Fail closed. This previously returned is_match=True, so an
-            # unrecognised tenant id matched every opportunity in the feed
-            # and would have been alerted about all of them.
-            logger.warning(f"[Matching] Unknown tenant_id '{tenant_id}' — no match returned.")
-            return {
-                "tenant_id": tenant_id,
-                "is_match": False,
-                "tenant_opportunity_score": 0.0,
-                "product_matches": [],
-                "match_reasons": ["Tenant necunoscut — configurație lipsă"],
-            }
-
-        matched_products = [
-            match
-            for match in (
-                TenantMatchingEngine._score_product(opportunity, prod)
-                for prod in tenant.get("products", [])
-            )
-            if match is not None
-        ]
-        matched_products.sort(key=lambda m: m["product_score"], reverse=True)
-
-        return {
-            "tenant_id": tenant_id,
-            "is_match": bool(matched_products),
-            "tenant_opportunity_score": matched_products[0]["product_score"] if matched_products else 0.0,
-            "product_matches": matched_products,
-            "match_reasons": matched_products[0]["reasons"] if matched_products else ["Nu corespunde profilului diviziilor"],
-        }
+        return _result(final_score >= MATCH_THRESHOLD, final_score, reasons)

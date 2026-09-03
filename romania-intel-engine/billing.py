@@ -57,7 +57,6 @@ class StripeBillingEngine:
 
     @staticmethod
     def generate_proforma_invoice(
-        tenant_id: str,
         plan_id: str,
         company_name: str,
         cui_fiscal: str,
@@ -164,7 +163,7 @@ class StripeBillingEngine:
         }
 
     @staticmethod
-    def create_checkout_session(tenant_id: str, plan_id: str, currency: str = "ron") -> Dict[str, Any]:
+    def create_checkout_session(plan_id: str, currency: str = "ron") -> Dict[str, Any]:
         plan = SUBSCRIPTION_PLANS.get(plan_id, SUBSCRIPTION_PLANS["plan_founder_vip"])
         return {
             "status": "proforma_required",

@@ -19,16 +19,14 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 import db
 import document_extractions
 from workers import document_tasks
-import matching_engine
-from matching_engine import TenantMatchingEngine, TENANT_ORGANIZATIONS
+from matching_engine import RelevanceEngine
 from workflow_engine import ConcurrentWorkflowEngine
 from billing import StripeBillingEngine
 from scrapers.orchestrator import OpportunityOrchestrator, TICK_DEADLINE_SECONDS
 from cache_engine import global_cache, newsletter_store
-from freemium_shield import FreemiumGatekeeper
 from notifier import LeadAlertDispatcher
 from security import (
-    SecurityGuard, require_auth, require_tenant_membership,
+    SecurityGuard, require_auth,
     enforce_onboarding_rate_limit, delete_supabase_auth_identity,
     # Imported by reference for the /api/v1/system/status diagnostic below.
     # security.py only ever mutates this dict in place, never rebinds it,
@@ -51,10 +49,6 @@ orchestrator = OpportunityOrchestrator()
 
 TICK_SECRET = os.getenv("TICK_SECRET", "")
 
-# Fallback profile for a session that hasn't picked one. Must be a real key
-# in TENANT_ORGANIZATIONS — matching_engine fails closed on an unknown
-# tenant id, so a made-up default silently yields an empty feed.
-DEFAULT_TENANT_ID = "t1_infra_transilvania"
 # How long without a completed tick before ingestion counts as stale.
 #
 # The heartbeat asks GitHub Actions for a tick every 5 minutes, but
@@ -66,6 +60,15 @@ DEFAULT_TENANT_ID = "t1_infra_transilvania"
 # stoppages (the kind that went unnoticed for four days) rather than
 # ordinary scheduler jitter.
 STALENESS_THRESHOLD_MINUTES = float(os.getenv("STALENESS_THRESHOLD_MINUTES", "180"))
+
+# The feed shows the whole market ranked, but three consumers must not
+# receive all of it: the 72h briefing, the copilot's context window and
+# the CSV export would each turn from "my qualified leads" into "the
+# entire database, sorted". On the relevance scale in db.RELEVANCE_WEIGHTS
+# this clears anything with no evidence behind it — a county hit alone
+# (+20) passes, an unmatched row (score = its 0-10 opportunity_score) does
+# not.
+BRIEFING_RELEVANCE_FLOOR = float(os.getenv("BRIEFING_RELEVANCE_FLOOR", "15"))
 
 async def background_scraping_job():
     """The in-process 6-hourly ingestion run (plus one at startup).
@@ -87,8 +90,8 @@ async def background_scraping_job():
         pile-up _tick_lock was introduced to prevent, reached by a
         different door.
 
-    run_tick also alerts per tenant (dispatch_lead_alert_to_tenant, deduped
-    via db.has_alert_been_dispatched) instead of the legacy non-tenant-aware
+    run_tick also alerts per user (dispatch_lead_alert_to_user, deduped
+    via db.has_alert_been_dispatched) instead of the legacy
     dispatch_high_priority_alert this used to call.
     """
     if _tick_lock.locked():
@@ -119,7 +122,6 @@ async def lifespan(app: FastAPI):
     scheduler.add_job(background_scraping_job, "interval", hours=6)
     scheduler.start()
     document_tasks.start_workers()
-    await matching_engine.refresh_tenant_organizations()
     asyncio.create_task(background_scraping_job())
     logger.info("[SYSTEM] RO-INTEL Enterprise API active.")
     yield
@@ -220,7 +222,7 @@ async def catch_exceptions_middleware(request: Request, call_next):
 @app.middleware("http")
 async def rate_limit_middleware(request: Request, call_next):
     # Global, IP-based — safe to enable unconditionally since it requires
-    # no client-side change (unlike SecurityGuard.verify_tenant_authorization,
+    # no client-side change (unlike SecurityGuard.verify_access_token,
     # which needs the frontend to start sending a bearer token before it can
     # be enforced on any route without breaking it). Exempted from itself:
     # the GitHub Actions heartbeat and health checks should never be able to
@@ -251,11 +253,10 @@ class AuthSyncRequest(BaseModel):
     full_name: Optional[str] = None
     avatar_url: Optional[str] = None
 
-# Same five domains matching_engine.py's TENANT_ORGANIZATIONS entries and
-# the frontend's CATEGORIES constant already use — kept as a plain set
-# here rather than imported, since the frontend list is the presentation
-# layer and this is just a validity check.
-VALID_TENANT_DOMAINS = {"infrastructura", "sanatate", "energie", "aparare", "digitalizare"}
+# The five domains the frontend's CATEGORIES constant offers — kept as a
+# plain set here rather than imported, since the frontend list is the
+# presentation layer and this is just a validity check.
+VALID_DOMAINS = {"infrastructura", "sanatate", "energie", "aparare", "digitalizare"}
 
 class OnboardingRequest(BaseModel):
     display_name: Optional[str] = None
@@ -264,29 +265,26 @@ class OnboardingRequest(BaseModel):
     min_value_ron: float = 0.0
     keywords: List[str] = []
     exclude_keywords: List[str] = []
-    # Only meaningful on the initial POST /api/v1/onboarding/complete (see
-    # the check there) — an existing user re-editing their criteria via
-    # PUT .../profile isn't asked to re-accept anything, so this field is
-    # simply ignored on that route rather than duplicated onto a second
-    # request model.
+    # Only meaningful on the initial POST /api/v1/me/onboarding (see the
+    # check there) — an existing user re-editing their criteria via
+    # PUT /api/v1/me/profile isn't asked to re-accept anything, so this
+    # field is simply ignored on that route rather than duplicated onto a
+    # second request model.
     consent_accepted: bool = False
 
 # Self-serve callers submit these fields directly — there is no admin
-# reviewing the payload before it's written, unlike scripts/provision_tenant.py's
-# hand-typed --keywords/--target-counties. None of these caps constrain
-# real usage (the largest existing hand-configured product line has under
-# 20 keywords, see matching_engine.py); they exist so one garbage or
-# malicious payload can't blow up matching_terms()'s per-opportunity,
-# per-tenant regex scan — run once per *ingested signal*, for every
-# product of every tenant in TENANT_ORGANIZATIONS (orchestrator.py:
-# run_tick) — or write an unreasonably large row. target_counties and
+# reviewing the payload before it's written. None of these caps constrain
+# real usage; they exist so one garbage or malicious payload can't blow
+# up matching_terms()'s regex scan — run once per *ingested signal*, for
+# every onboarded profile (orchestrator.py: run_tick) — or write an
+# unreasonably large row. target_counties and
 # keywords are deliberately NOT validated against a fixed vocabulary
 # (e.g. a real județ list): counties_match()/matching_terms() already
 # degrade a typo'd or unrecognised value gracefully rather than failing —
 # a bad county just never earns the +1.6 geography bonus (matching_engine.py),
 # it does not zero out the match. A bad *keyword* is a harsher case
-# (keyword evidence is a mandatory gate — TenantMatchingEngine._score_product's
-# docstring), but validating "real Romanian procurement vocabulary" isn't
+# (keyword evidence is a mandatory gate for alerting — see
+# matching_engine.RelevanceEngine.evaluate), but validating "real Romanian procurement vocabulary" isn't
 # something a fixed list can do reliably, and that risk is best addressed
 # in the signup UI (out of scope here — frontend), not by rejecting
 # free-text server-side.
@@ -298,9 +296,8 @@ MAX_MIN_VALUE_RON = 1_000_000_000_000.0  # 1 trilion RON — past this it's not 
 
 
 def _validate_onboarding_payload(payload: "OnboardingRequest") -> None:
-    """Shared sanity checks for both /api/v1/onboarding/complete and
-    PUT /api/v1/tenants/{tenant_id}/profile. See the caps above for why
-    each one exists."""
+    """Shared sanity checks for both POST /api/v1/me/onboarding and
+    PUT /api/v1/me/profile. See the caps above for why each one exists."""
     def _check_list(values: List[str], max_items: int, field_label: str) -> None:
         if len(values) > max_items:
             raise HTTPException(
@@ -325,6 +322,22 @@ def _validate_onboarding_payload(payload: "OnboardingRequest") -> None:
     if payload.min_value_ron < 0 or payload.min_value_ron > MAX_MIN_VALUE_RON:
         raise HTTPException(status_code=400, detail="Valoarea minimă a bugetului nu este validă.")
 
+def _validated_domain(payload: "OnboardingRequest") -> str:
+    """Shared by onboarding and the later profile edit."""
+    domain = payload.domain.strip().lower()
+    if domain not in VALID_DOMAINS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Domeniu invalid. Alegeți dintre: {', '.join(sorted(VALID_DOMAINS))}.",
+        )
+    if not payload.keywords:
+        raise HTTPException(
+            status_code=400,
+            detail="Adăugați cel puțin un cuvânt-cheie, altfel nu veți primi nicio oportunitate relevantă.",
+        )
+    return domain
+
+
 class AlertSettingsRequest(BaseModel):
     alert_email: EmailStr
     min_alert_score: float = 7.5
@@ -342,13 +355,11 @@ class ProformaRequest(BaseModel):
 
 class CopilotQueryRequest(BaseModel):
     query: str
-    tenant_id: Optional[str] = "t1_infra_transilvania"
 
 class PipelineAddRequest(BaseModel):
     lead_data: dict
 
 class PipelineUpdateRequest(BaseModel):
-    deal_id: str
     new_stage: str
     notes: Optional[str] = None
     proposed_price: Optional[float] = None
@@ -436,21 +447,11 @@ async def system_tick(x_tick_secret: Optional[str] = Header(None)):
     asyncio.create_task(_run_tick_locked())
     return {"status": "started", "detail": "Tick dispatched in the background."}
 
-@app.post("/api/v1/admin/reload-tenants")
-async def reload_tenants(x_admin_secret: Optional[str] = Header(None)):
-    """Called by scripts/provision_tenant.py right after it writes a new
-    tenant/product/user_profiles row, so a freshly provisioned client's
-    config is live in the running process without a redeploy — otherwise
-    matching_engine.TENANT_ORGANIZATIONS (loaded once at startup, see
-    api.py's lifespan) would only pick up the new tenant on the next
-    natural restart. Reuses TICK_SECRET rather than adding a second admin
-    secret env var — this is the same class of internal-operator-only
-    endpoint as /api/v1/system/tick, not a user-facing route.
-    """
-    if not TICK_SECRET or x_admin_secret != TICK_SECRET:
-        raise HTTPException(status_code=401, detail="unauthorized")
-    loaded = await matching_engine.refresh_tenant_organizations()
-    return {"status": "reloaded" if loaded else "unavailable", "tenant_count": len(TENANT_ORGANIZATIONS)}
+# POST /api/v1/admin/reload-tenants used to live here. It existed only to
+# prime an in-process config cache after an admin provisioned a client by
+# hand; the tick now reads profiles straight from Postgres each run, so a
+# new signup is live the moment it commits and there is nothing to reload.
+
 
 @app.get("/api/v1/system/status")
 async def system_status():
@@ -655,54 +656,38 @@ async def sync_user_auth(payload: AuthSyncRequest, user: dict = Depends(require_
     # arbitrary email and be handed a profile back for it.
     email = user.get("email") or payload.email
 
-    # Upserts (email only — tenant_id/role are assigned exclusively by
-    # scripts/provision_tenant.py, see db.upsert_user_profile_email's
-    # docstring) and reads back whatever tenant_id already exists for this
-    # user, if any. This used to return a hardcoded DEFAULT_TENANT_ID for
-    # every user and write nothing anywhere — a brand-new, unprovisioned
-    # user was silently handed tenant #1's data on every login.
+    # Creates the bare row on a first-ever sign-in and reads back whatever
+    # criteria this person already has. Never sets criteria itself — that
+    # is onboarding — so a genuinely new user comes back with
+    # onboarded_at None and the frontend shows them the setup form.
     profile = await db.upsert_user_profile_email(user["user_id"], email)
-    if profile is not None:
-        tenant_id = profile.get("tenant_id")
-    elif not db.DATABASE_URL:
-        # No database configured at all — local/dev, same fallback
-        # condition security.require_tenant_membership uses. There's
-        # nothing to check a real membership against, so this preserves
-        # today's "just works against the 3 hardcoded tenants" local dev
-        # ergonomics rather than locking a developer with no DB out of
-        # every tenant-scoped page.
-        tenant_id = DEFAULT_TENANT_ID
-    else:
-        # A database IS configured but this specific call failed (e.g. the
-        # migration hasn't been applied yet) — report honestly rather than
-        # guessing a tenant.
-        tenant_id = None
-    role = (profile.get("role") if profile else None) or "Membru"
 
     return {
         "status": "synced",
         "user": {
             "user_id": user.get("user_id"),
             "email": email,
-            "full_name": payload.full_name or email.split("@")[0].title(),
-            # None when the user hasn't been provisioned to a tenant yet
-            # (no db.upsert_user_profile_email row, or no database
-            # configured at all) — the frontend must treat this as "no
-            # access yet", never fall back to a default tenant.
-            "tenant_id": tenant_id,
-            "role": role,
-            "avatar_url": payload.avatar_url
-        }
+            "full_name": (profile or {}).get("display_name")
+            or payload.full_name
+            or email.split("@")[0].title(),
+            # False both for a brand-new signup and when the database could
+            # not be reached. The frontend treats it the same way either
+            # way — show onboarding — which is honest: without a profile
+            # there is nothing to personalise, and the public market view
+            # stays available regardless.
+            "onboarded": bool(profile and profile.get("onboarded_at")),
+            "avatar_url": payload.avatar_url,
+        },
+        "profile": profile,
     }
 
 @app.delete("/api/v1/account")
 async def delete_own_account_route(user: dict = Depends(require_auth)):
     """Self-serve GDPR erasure — this identity's own account, on their own
     request, no admin involved. Splits into two independent halves and is
-    honest when only one succeeds: db.delete_own_account removes every row
-    this app itself owns (user_profiles, and — only if no other identity
-    still needs it, see that function's docstring — the tenant, its
-    product line, pipeline deals, and alert dispatch log); a separate call
+    honest when only one succeeds: db.delete_own_account removes the
+    profile row, and the database cascades everything keyed to it (saved
+    deals, their stage history, the alert dispatch log); a separate call
     then asks Supabase to remove the auth.users row, which is the actual
     login credential and something only Supabase's Admin API can touch.
 
@@ -711,15 +696,9 @@ async def delete_own_account_route(user: dict = Depends(require_auth)):
     not a failure the caller should have to handle specially. What changes
     is `auth_identity_deleted` in the response and, either way, an operator
     alert naming exactly which user_id/email to check."""
-    result = await db.delete_own_account(user["user_id"])
-    if not result["deleted"]:
+    deleted = await db.delete_own_account(user["user_id"])
+    if not deleted:
         raise HTTPException(status_code=404, detail="Nu a fost găsit niciun cont de șters.")
-
-    if result["tenant_deleted"]:
-        try:
-            await matching_engine.refresh_tenant_organizations()
-        except Exception as e:
-            logger.error(f"[DeleteAccount] Post-deletion tenant-cache refresh failed: {e}")
 
     auth_identity_deleted = await delete_supabase_auth_identity(user["user_id"])
 
@@ -729,70 +708,69 @@ async def delete_own_account_route(user: dict = Depends(require_auth)):
             "NU a fost ștearsă automat. Ștergeți manual din Supabase Dashboard -> Authentication -> Users."
         )
         await LeadAlertDispatcher.dispatch_admin_alert(
-            f"🗑️ Cont șters pe RO-INTEL\n"
-            f"Email: {user.get('email')}\n"
-            f"Tenant: {result['tenant_id'] or '—'} "
-            f"({'șters' if result['tenant_deleted'] else 'păstrat — altă identitate încă îl folosește'}){note}"
+            f"🗑️ Cont șters pe RO-INTEL\nEmail: {user.get('email')}{note}"
         )
     except Exception as e:
         logger.error(f"[DeleteAccount] Operator notification failed: {e}")
 
     return {"status": "deleted", "auth_identity_deleted": auth_identity_deleted}
 
-@app.post("/api/v1/onboarding/complete")
+@app.get("/api/v1/me")
+async def get_me(user: dict = Depends(require_auth)):
+    """This user's own profile. There is no route for anyone else's — the
+    id comes from the verified token, so there is no id to tamper with."""
+    profile = await db.get_profile(user["user_id"])
+    return {
+        "user_id": user["user_id"],
+        "email": user.get("email"),
+        "onboarded": bool(profile and profile.get("onboarded_at")),
+        "profile": profile,
+    }
+
+
+@app.post("/api/v1/me/onboarding")
 async def complete_onboarding(
     payload: OnboardingRequest,
     user: dict = Depends(require_auth),
     _rl: None = Depends(enforce_onboarding_rate_limit),
 ):
-    """Self-serve replacement for the admin-only scripts/provision_tenant.py
-    flow. This product now sells to individuals rather than companies —
-    there is no admin for a new subscriber to email to get unblocked, so a
-    signed-in user with no tenant yet must be able to create their own
-    right here, choosing their own domain/counties/keywords instead of
-    inheriting a company's product line. See db.create_self_provisioned_tenant
-    for the actual write.
+    """Turns a signed-in identity into a configured profile.
 
-    Self-serve with zero admin approval also means zero admin visibility
-    unless something here surfaces it — dispatch_admin_alert below is the
-    only way the person actually running this business finds out a new
-    account exists to follow up with (billing.py has no automatic payment
-    collection, only manual proforma invoices)."""
+    Self-serve with zero admin approval means zero admin visibility unless
+    something here surfaces it — dispatch_admin_alert below is the only way
+    the person running this business finds out a new account exists to
+    follow up with (billing.py has no automatic payment collection, only
+    manual proforma invoices).
+    """
     if not payload.consent_accepted:
         raise HTTPException(
             status_code=400,
             detail="Trebuie să fiți de acord cu Termenii și Politica de Confidențialitate pentru a continua.",
         )
-    domain = payload.domain.strip().lower()
-    if domain not in VALID_TENANT_DOMAINS:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Domeniu invalid. Alegeți dintre: {', '.join(sorted(VALID_TENANT_DOMAINS))}.",
-        )
-    if not payload.keywords:
-        raise HTTPException(
-            status_code=400,
-            detail="Adăugați cel puțin un cuvânt-cheie, altfel nu veți primi nicio oportunitate relevantă.",
-        )
+    domain = _validated_domain(payload)
     _validate_onboarding_payload(payload)
     if not db.DATABASE_URL:
-        raise HTTPException(status_code=503, detail="Baza de date nu este configurată — configurarea contului este indisponibilă momentan.")
+        raise HTTPException(
+            status_code=503,
+            detail="Baza de date nu este configurată — configurarea contului este indisponibilă momentan.",
+        )
 
     email = user.get("email", "")
     display_name = (payload.display_name or "").strip()
     try:
-        result = await db.create_self_provisioned_tenant(
-            user["user_id"], email, display_name, domain,
-            payload.target_counties, payload.min_value_ron, payload.keywords, payload.exclude_keywords,
+        profile = await db.complete_onboarding(
+            user["user_id"], email, display_name or None, domain,
+            payload.target_counties, payload.min_value_ron,
+            payload.keywords, payload.exclude_keywords,
         )
-    except db.TenantCapacityError as e:
+    except db.UserCapacityError as e:
         logger.warning(f"[Onboarding] {e}")
-        # This is exactly the kind of thing the operator needs to know
-        # about promptly — the cap constant itself likely needs revisiting,
-        # not just this one signup rejecting.
+        # Exactly the kind of thing the operator needs to know promptly —
+        # the cap constant itself likely needs revisiting, not just this
+        # one signup being rejected.
         try:
             await LeadAlertDispatcher.dispatch_admin_alert(
-                f"⚠️ Plafonul de conturi auto-provizionate a fost atins ({e}). "
+                f"⚠️ Plafonul de conturi a fost atins ({e}). "
                 f"Următoarea înregistrare (user_id={user['user_id']}, email={email}) a fost refuzată."
             )
         except Exception as alert_err:
@@ -801,101 +779,56 @@ async def complete_onboarding(
             status_code=503,
             detail="Numărul maxim de conturi noi a fost atins momentan. Contactați echipa RO-INTEL pentru acces.",
         )
-    if result is None:
+    if profile is None:
         raise HTTPException(status_code=409, detail="Contul dvs. este deja configurat.")
 
-    # Loaded once at startup (api.py's lifespan); without this refresh a
-    # brand-new tenant would 403 on its own feed until the next restart —
-    # the exact reason /api/v1/admin/reload-tenants exists for the admin
-    # path, needed here too since this route creates tenants the same way.
-    #
-    # The tenant/product/membership rows above already committed
-    # successfully (create_self_provisioned_tenant runs them in one
-    # transaction) before this line ever runs — a failure here (e.g. a
-    # transient pool error) does not mean provisioning failed, only that
-    # this process's in-memory copy is stale until the next natural
-    # refresh or a manual POST /api/v1/admin/reload-tenants. Letting the
-    # exception propagate would turn a successful signup into a fabricated
-    # 500 for a brand-new (possibly paying) user.
     try:
-        await matching_engine.refresh_tenant_organizations()
-    except Exception as e:
-        logger.error(f"[Onboarding] Post-provisioning tenant-cache refresh failed: {e}")
-
-    try:
-        if result.get("linked_existing"):
-            # A second Supabase auth identity (same email, different
-            # user_id — see the comment in create_self_provisioned_tenant)
-            # was linked onto an existing tenant rather than a new one
-            # being created. Worth a different message: this is not a new
-            # customer, and an operator seeing "new account" here would
-            # double-count it for billing/follow-up.
-            await LeadAlertDispatcher.dispatch_admin_alert(
-                "🔗 Identitate suplimentară asociată unui cont existent pe RO-INTEL\n"
-                f"Email: {email}\n"
-                f"Tenant existent: {result['tenant_id']}"
-            )
-        else:
-            await LeadAlertDispatcher.dispatch_admin_alert(
-                "🆕 Cont nou auto-provizionat pe RO-INTEL\n"
-                f"Nume: {display_name or email}\n"
-                f"Email: {email}\n"
-                f"Domeniu: {domain}\n"
-                f"Tenant: {result['tenant_id']}"
-            )
+        await LeadAlertDispatcher.dispatch_admin_alert(
+            "🆕 Cont nou pe RO-INTEL\n"
+            f"Nume: {display_name or email}\n"
+            f"Email: {email}\n"
+            f"Domeniu: {domain}"
+        )
     except Exception as e:
         # A failed operator notification must never fail the signup itself
         # — the account is already real in the database at this point.
         logger.error(f"[Onboarding] Operator notification failed: {e}")
 
-    return {"status": "provisioned", **result}
+    return {"status": "provisioned", "profile": profile}
 
-@app.put("/api/v1/tenants/{tenant_id}/profile")
-async def update_tenant_profile(tenant_id: str, payload: OnboardingRequest, _user: dict = Depends(require_tenant_membership)):
-    """Lets an already-onboarded individual change their own watch
-    criteria later — the self-serve counterpart to re-running
-    scripts/provision_tenant.py by hand. See db.update_own_tenant_product."""
-    domain = payload.domain.strip().lower()
-    if domain not in VALID_TENANT_DOMAINS:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Domeniu invalid. Alegeți dintre: {', '.join(sorted(VALID_TENANT_DOMAINS))}.",
-        )
-    if not payload.keywords:
-        raise HTTPException(
-            status_code=400,
-            detail="Adăugați cel puțin un cuvânt-cheie, altfel nu veți primi nicio oportunitate relevantă.",
-        )
+
+@app.put("/api/v1/me/profile")
+async def update_my_profile(payload: OnboardingRequest, user: dict = Depends(require_auth)):
+    """Lets an onboarded user change their own watch criteria later.
+
+    Until now this route existed but nothing called it, so there was no way
+    to edit your criteria after signup short of deleting the account.
+    """
+    domain = _validated_domain(payload)
     _validate_onboarding_payload(payload)
-    ok = await db.update_own_tenant_product(
-        tenant_id, domain, payload.target_counties, payload.min_value_ron,
-        payload.keywords, payload.exclude_keywords,
-    )
-    if not ok:
+    profile = await db.update_profile(user["user_id"], {
+        "display_name": (payload.display_name or "").strip() or None,
+        "domain": domain,
+        "target_counties": payload.target_counties,
+        "min_value_ron": payload.min_value_ron,
+        "keywords": payload.keywords,
+        "exclude_keywords": payload.exclude_keywords,
+    })
+    if profile is None:
         raise HTTPException(status_code=503, detail="Nu s-a putut salva profilul — baza de date este indisponibilă.")
-    # Same reasoning as complete_onboarding above: the write already
-    # succeeded, so a refresh failure here must not surface as if the
-    # edit itself failed.
-    try:
-        await matching_engine.refresh_tenant_organizations()
-    except Exception as e:
-        logger.error(f"[UpdateTenantProfile] Post-update tenant-cache refresh failed: {e}")
-    return {"status": "updated"}
+    return {"status": "updated", "profile": profile}
 
-@app.put("/api/v1/tenants/{tenant_id}/alert-settings")
-async def update_tenant_alert_settings(
-    tenant_id: str, payload: AlertSettingsRequest, _user: dict = Depends(require_tenant_membership)
-):
+
+@app.put("/api/v1/me/alert-settings")
+async def update_my_alert_settings(payload: AlertSettingsRequest, user: dict = Depends(require_auth)):
     """Where automated alerts actually go and at what score they fire.
 
-    Split from update_tenant_profile (matching criteria) on purpose: the
-    frontend's Settings modal used to write a notification email/threshold
-    to localStorage only, which looked saved but never touched the
-    tenants.alert_emails/min_alert_score columns notifier.py's
-    dispatch_lead_alert_to_tenant actually reads — a real signup kept
-    getting alerts at whatever create_self_provisioned_tenant set once at
-    onboarding ([their signup email], 7.5), forever, no matter what they
-    changed here."""
+    Split from the profile route on purpose: the Settings modal used to
+    write a notification email/threshold to localStorage only, which looked
+    saved but never touched the columns notifier.py actually reads, so a
+    real signup kept getting alerts at their signup address forever no
+    matter what they changed here.
+    """
     if payload.min_alert_score < 0 or payload.min_alert_score > 10:
         raise HTTPException(status_code=400, detail="Pragul de alertă trebuie să fie între 0 și 10.")
     chat_id = payload.telegram_chat_id
@@ -911,51 +844,21 @@ async def update_tenant_alert_settings(
                 status_code=400,
                 detail="ID-ul de chat Telegram trebuie să fie numeric (ex: 123456789), nu un @nume de utilizator.",
             )
-    ok = await db.update_tenant_alert_settings(
-        tenant_id, [payload.alert_email], payload.min_alert_score, chat_id
+    ok = await db.update_alert_settings(
+        user["user_id"], payload.alert_email, payload.min_alert_score, chat_id
     )
     if not ok:
         raise HTTPException(status_code=503, detail="Nu s-au putut salva preferințele — baza de date este indisponibilă.")
-    try:
-        await matching_engine.refresh_tenant_organizations()
-    except Exception as e:
-        logger.error(f"[UpdateTenantAlertSettings] Post-update tenant-cache refresh failed: {e}")
     return {"status": "updated"}
 
-@app.get("/api/v1/tenants")
-def list_tenant_profiles():
-    """The intelligence profiles a desk can be pointed at.
-
-    The frontend models companies as browser-local "desks", but matching
-    only works against a real key in TENANT_ORGANIZATIONS — a desk id like
-    `desk_main_infra` matches nothing, because evaluate_opportunity_for_tenant
-    fails closed on an unknown tenant. Exposing the real ids lets the UI
-    bind each desk to one instead of guessing.
-    """
-    return {
-        "tenants": [
-            {
-                "tenant_id": tenant_id,
-                "name": org["name"],
-                "primary_domain": org["primary_domain"],
-                "products": [
-                    {"product_id": p["product_id"], "name": p["name"], "domain": p["domain"]}
-                    for p in org.get("products", [])
-                ],
-            }
-            for tenant_id, org in TENANT_ORGANIZATIONS.items()
-        ],
-        "default_tenant_id": DEFAULT_TENANT_ID,
-    }
 
 @app.get("/api/v1/billing/plans")
 def list_billing_plans():
     return StripeBillingEngine.get_plans()
 
-@app.post("/api/v1/tenants/{tenant_id}/billing/proforma")
-def generate_proforma(tenant_id: str, payload: ProformaRequest, _user: dict = Depends(require_tenant_membership)):
+@app.post("/api/v1/me/billing/proforma")
+def generate_proforma(payload: ProformaRequest, _user: dict = Depends(require_auth)):
     return StripeBillingEngine.generate_proforma_invoice(
-        tenant_id=tenant_id,
         plan_id=payload.plan_id,
         company_name=payload.company_name,
         cui_fiscal=payload.cui_fiscal,
@@ -963,33 +866,32 @@ def generate_proforma(tenant_id: str, payload: ProformaRequest, _user: dict = De
         billing_address=payload.billing_address
     )
 
-@app.get("/api/v1/tenants/{tenant_id}/pipeline")
-async def get_tenant_pipeline(tenant_id: str, product_id: Optional[str] = None, _user: dict = Depends(require_tenant_membership)):
-    # Previously named `stage` here while being forwarded into
-    # get_tenant_pipeline's product_id filter — a request for
-    # ?stage=discovery silently filtered on product_id="discovery" instead
-    # (always empty) rather than actually filtering by stage. Renamed to
-    # match what the parameter actually does; the frontend never sent this
-    # param, so nothing depended on the old (wrong) name.
+@app.get("/api/v1/me/pipeline")
+async def get_my_pipeline(user: dict = Depends(require_auth)):
     return {
-        "tenant_id": tenant_id,
         "stages": ConcurrentWorkflowEngine.get_stages(),
-        "deals": await ConcurrentWorkflowEngine.get_tenant_pipeline(tenant_id, product_id)
+        "deals": await ConcurrentWorkflowEngine.get_pipeline_for_user(user["user_id"]),
     }
 
-@app.get("/api/v1/tenants/{tenant_id}/pipeline/metrics")
-async def get_tenant_pipeline_metrics(tenant_id: str, product_id: Optional[str] = None, _user: dict = Depends(require_tenant_membership)):
-    return await ConcurrentWorkflowEngine.get_pipeline_metrics(tenant_id, product_id)
+@app.get("/api/v1/me/pipeline/metrics")
+async def get_my_pipeline_metrics(user: dict = Depends(require_auth)):
+    return await ConcurrentWorkflowEngine.get_pipeline_metrics(user["user_id"])
 
-@app.post("/api/v1/tenants/{tenant_id}/pipeline/add")
-async def add_pipeline_deal(tenant_id: str, payload: PipelineAddRequest, _user: dict = Depends(require_tenant_membership)):
-    return await ConcurrentWorkflowEngine.add_lead_to_pipeline(tenant_id, payload.lead_data)
+@app.post("/api/v1/me/pipeline/deals")
+async def add_pipeline_deal(payload: PipelineAddRequest, user: dict = Depends(require_auth)):
+    return await ConcurrentWorkflowEngine.add_lead_to_pipeline(user["user_id"], payload.lead_data)
 
-@app.post("/api/v1/tenants/{tenant_id}/pipeline/update")
-async def update_pipeline_deal(tenant_id: str, payload: PipelineUpdateRequest, _user: dict = Depends(require_tenant_membership)):
+@app.patch("/api/v1/me/pipeline/deals/{deal_id}")
+async def update_pipeline_deal(
+    deal_id: str, payload: PipelineUpdateRequest, user: dict = Depends(require_auth)
+):
+    """The deal id is in the path, but ownership is still enforced in the
+    query (db.update_deal scopes by user_id AND deal_id). Deal ids are
+    guessable, so taking the caller's word that the deal is theirs would
+    let any authenticated user advance a stranger's pipeline."""
     return await ConcurrentWorkflowEngine.update_deal_stage(
-        tenant_id=tenant_id,
-        deal_id=payload.deal_id,
+        user_id=user["user_id"],
+        deal_id=deal_id,
         new_stage=payload.new_stage,
         notes=payload.notes,
         proposed_price=payload.proposed_price
@@ -1071,111 +973,132 @@ async def get_document_extraction_route(doc_id: str, _user: dict = Depends(requi
         raise HTTPException(status_code=404, detail="Extragerea documentului nu a fost gasita.")
     return row
 
-@app.get("/api/v1/tenants/{tenant_id}/feed")
-async def get_tenant_feed_route(
-    tenant_id: str,
-    product_id: Optional[str] = None,
+@app.get("/api/v1/me/feed")
+async def get_my_feed_route(
     category: Optional[str] = None,
     force_refresh: bool = False,
-    _user: dict = Depends(require_tenant_membership),
+    user: dict = Depends(require_auth),
 ):
-    # `is_subscribed` used to be a plain query parameter defaulting to
-    # True — so the freemium gate was both trivially bypassable
-    # (?is_subscribed=true) and off by default anyway, meaning
-    # FreemiumGatekeeper never actually withheld anything. Entitlement is
-    # now decided server-side. Until billing.py has real subscription
-    # state (deliberately deferred), "authenticated" is the entitlement:
-    # that is honest about what the system currently knows, and the knob
-    # is no longer something a client can set for itself.
-    return await get_tenant_feed(
-        tenant_id,
-        product_id=product_id,
-        category=category,
-        force_refresh=force_refresh,
-        is_subscribed=True,
-    )
+    return await get_my_feed(user["user_id"], category=category, force_refresh=force_refresh)
 
 
-async def get_tenant_feed(
-    tenant_id: str,
-    product_id: Optional[str] = None,
+async def get_my_feed(
+    user_id: str,
     category: Optional[str] = None,
     force_refresh: bool = False,
-    is_subscribed: bool = True
+    min_relevance: Optional[float] = None,
 ):
-    """Matches ingested opportunities against one tenant's product lines.
+    """The whole market, ranked so this user's matches come first.
 
-    This used to call orchestrator.run_pipeline() on every cache miss —
-    a full synchronous re-scrape of all 13 live sources (CNI's ~15k-row
-    register, multi-page PDF parsing, etc.) inside the HTTP request path,
-    on a 90-second cache TTL. On Render's free-tier CPU that reliably took
-    well over a minute, which is why /api/v1/copilot/chat (which calls
-    this for context) was timing out at 90s with no response at all.
-    It also duplicated the ingestion the tick already performs on its own
-    schedule, and — unlike run_tick() — ignored each source's
-    poll_interval_minutes entirely, so a handful of requests could hammer
-    every source far more often than the scrapers were designed for.
+    A SOFT filter, and that is the point. The previous version returned
+    ONLY what matched a user's keywords, which meant a narrow profile saw
+    an empty dashboard — indistinguishable from a broken product — and
+    never saw the adjacent work a bidder would actually have wanted. Now
+    nothing is hidden: db.get_ranked_opportunities scores every row and
+    orders by it, so matches surface at the top and the general market
+    continues below.
 
-    force_refresh now means "recompute matching against the latest
-    ingested data," not "trigger a live re-scrape" — the tick already
-    keeps that data fresh on its own cadence; a request re-running the
-    scrapers themselves was never the right place for that to happen.
+    Each lead carries a `match` object explaining its position, so the UI
+    can badge the matched ones and say WHY (county, keyword) rather than
+    presenting an unexplained order.
+
+    `min_relevance` exists for the callers that must NOT receive the whole
+    market — the CSV export and the 72h briefing, which would otherwise go
+    from "my qualified leads" to "the entire database, sorted", which is
+    noise rather than a product. Left None for the dashboard itself.
     """
-    product_key = product_id or "all"
-    cache_key = f"feed:{tenant_id}:{product_key}:{category or 'all'}:{is_subscribed}"
+    cache_key = f"feed:{user_id}:{category or 'all'}:{min_relevance or 0}"
     if not force_refresh:
         cached_data = global_cache.get(cache_key)
         if cached_data:
             return cached_data
 
-    feed = await _load_feed()
-    raw_leads = feed.get("leads", [])
+    profile = await db.get_profile(user_id)
 
-    matched_leads = []
-    for lead in raw_leads:
-        if category and category != "all" and lead.get("category") != category:
-            continue
-        match_info = TenantMatchingEngine.evaluate_opportunity_for_tenant(lead, tenant_id)
-        if not match_info["is_match"]:
-            continue
-        # product_id was accepted and folded into the cache key but never
-        # actually applied — every request advertising this filter got an
-        # unfiltered result back regardless.
-        if product_id and product_id != "all":
-            if not any(p["product_id"] == product_id for p in match_info["product_matches"]):
-                continue
-        lead_copy = dict(lead)
-        lead_copy["opportunity_score"] = match_info["tenant_opportunity_score"]
-        lead_copy["product_matches"] = match_info["product_matches"]
-        matched_leads.append(lead_copy)
+    if profile and profile.get("onboarded_at") and db.DATABASE_URL:
+        rows = await db.get_ranked_opportunities(profile, limit=500)
+        leads = [_ranked_row_to_lead(r) for r in rows]
+        source, updated_at, degraded = "postgres", None, False
+        if rows:
+            newest = max((r.get("last_seen_at") for r in rows if r.get("last_seen_at")), default=None)
+            updated_at = newest.isoformat() if hasattr(newest, "isoformat") else newest
+        if not rows and not await db.is_available():
+            degraded = True
+    else:
+        # No profile yet (or no database): there is nothing to rank
+        # against, so serve the unranked market rather than nothing. A
+        # user still in onboarding can look around, and the ranking simply
+        # switches on once they have criteria.
+        feed = await _load_feed()
+        leads = [{**lead, "match": None} for lead in feed.get("leads", [])]
+        source = feed.get("source", "file-cache")
+        updated_at = feed.get("updated_at")
+        degraded = bool(feed.get("degraded"))
 
-    matched_leads.sort(key=lambda x: x.get("opportunity_score", 0), reverse=True)
-    gated_leads = FreemiumGatekeeper.enforce_paywall_tier(matched_leads, has_active_subscription=is_subscribed)
+    if category and category != "all":
+        leads = [l for l in leads if l.get("category") == category]
+    if min_relevance is not None:
+        leads = [l for l in leads if (l.get("match") or {}).get("score", 0) >= min_relevance]
 
     payload = {
-        "tenant_id": tenant_id,
-        "count": len(gated_leads),
-        "leads": gated_leads,
-        "data_source": feed.get("source", "file-cache"),
-        "data_updated_at": feed.get("updated_at"),
+        "count": len(leads),
+        "leads": leads,
+        "data_source": source,
+        "data_updated_at": updated_at,
     }
-    if feed.get("degraded"):
+    if degraded:
         payload["degraded"] = True
+        # Say so explicitly rather than quietly returning an unranked list
+        # from a function whose contract is "ranked" — otherwise a database
+        # outage looks exactly like the ranking having broken.
+        payload["detail"] = "Baza de date nu a răspuns — ordinea după relevanță nu a putut fi calculată."
     global_cache.set(cache_key, payload, ttl_seconds=60)
     return payload
 
+
+def _ranked_row_to_lead(row: Dict[str, Any]) -> Dict[str, Any]:
+    """Splits a ranked SQL row into the lead payload plus its `match`
+    explanation. The boolean hits come from the query itself, so nothing is
+    re-matched in Python for 500 rows on every request."""
+    reasons: List[str] = []
+    if row.get("kw_hit"):
+        reasons.append("cuvânt-cheie")
+    if row.get("county_hit"):
+        reasons.append("județ vizat")
+    if row.get("domain_hit"):
+        reasons.append("domeniu")
+    if row.get("value_hit"):
+        reasons.append("buget peste prag")
+    excluded = bool(row.get("excluded_hit"))
+
+    lead = _row_to_lead({k: v for k, v in row.items() if k not in _RANKING_KEYS})
+    lead["match"] = {
+        "score": float(row.get("relevance") or 0),
+        # Any real evidence badges the card. Deliberately broader than the
+        # alerting gate in matching_engine, which demands keyword evidence:
+        # being shown a well-placed contract is cheap, being emailed about
+        # one is not.
+        "is_match": bool(reasons) and not excluded,
+        "excluded": excluded,
+        "reasons": reasons,
+    }
+    return lead
+
+
+# Scoring columns the ranked query adds; stripped before the row is shaped
+# into a lead so the payload keeps exactly the fields the frontend types.
+_RANKING_KEYS = {
+    "kw_hit", "county_hit", "domain_hit", "value_hit", "excluded_hit",
+    "relevance", "search_blob",
+}
+
+
 @app.get("/api/v1/analytics/market-report-72h")
-async def get_72h_report(tenant_id: str = DEFAULT_TENANT_ID, user: dict = Depends(require_auth)):
-    # tenant_id here is a query param with a default, not a path param, so
-    # it can't be checked via Depends(require_tenant_membership) the way
-    # the /tenants/{tenant_id}/... routes are (FastAPI would resolve that
-    # dependency's own tenant_id as a *required* query param, breaking the
-    # default). Calling the same check function directly instead — it's a
-    # plain async function underneath Depends(), nothing stops calling it
-    # like one. This is the same tenant-scoped /feed data as the path-param
-    # route above, so it needs the same check, not a lesser one.
-    await require_tenant_membership(tenant_id, user)
-    feed_data = await get_tenant_feed(tenant_id)
+async def get_72h_report(user: dict = Depends(require_auth)):
+    # Ranked feed with a relevance floor, not the whole market: this is a
+    # briefing, and summarising 500 loosely-ordered rows would produce
+    # confident prose about things the reader never asked to see.
+    feed_data = await get_my_feed(user["user_id"], min_relevance=BRIEFING_RELEVANCE_FLOOR)
     leads = feed_data.get("leads", [])
     return ProcurementAICopilot.generate_72h_macro_report(leads)
 
@@ -1195,13 +1118,12 @@ async def copilot_chat(payload: CopilotQueryRequest, user: dict = Depends(requir
     # can no longer hang indefinitely regardless of which layer is at
     # fault, and degrades to a real answer from the template fallback
     # path instead of leaving the caller with nothing at all.
-    tenant_id = payload.tenant_id or DEFAULT_TENANT_ID
-    # Same reasoning as get_72h_report above: tenant_id lives inside the
-    # JSON body here, not a path param, so the check is called directly.
-    await require_tenant_membership(tenant_id, user)
     try:
         feed_data = await asyncio.wait_for(
-            get_tenant_feed(tenant_id),
+            # Same floor as the briefing: the copilot only ever sees the
+            # top slice of what it is given (leads[:25]), so handing it the
+            # unfiltered market would fill that slice with noise.
+            get_my_feed(user["user_id"], min_relevance=BRIEFING_RELEVANCE_FLOOR),
             timeout=10.0,
         )
         leads = feed_data.get("leads", [])
@@ -1220,13 +1142,6 @@ async def copilot_chat(payload: CopilotQueryRequest, user: dict = Depends(requir
             ),
             "degraded": True,
         }
-
-@app.get("/api/v1/tenants/{tenant_id}/products")
-async def get_tenant_products(tenant_id: str, _user: dict = Depends(require_tenant_membership)):
-    org = TENANT_ORGANIZATIONS.get(tenant_id)
-    if not org:
-        return {"tenant_id": tenant_id, "company_name": "SC General Procurement SRL", "products": []}
-    return {"tenant_id": tenant_id, "company_name": org["name"], "products": org["products"]}
 
 @app.post("/api/v1/addons/analyze-caiet")
 async def analyze_caiet_sarcini(payload: CaietAnalysisRequest, _user: dict = Depends(require_auth)):
@@ -1248,9 +1163,11 @@ def predict_win_rate(payload: WinProbabilityRequest, _user: dict = Depends(requi
         payload.estimated_budget_ron, payload.proposed_price_ron, payload.has_local_partnership, payload.lead_time_days
     )
 
-@app.get("/api/v1/tenants/{tenant_id}/export/csv")
-async def export_tenant_csv(tenant_id: str, _user: dict = Depends(require_tenant_membership)):
-    feed_data = await get_tenant_feed(tenant_id)
+@app.get("/api/v1/me/export/csv")
+async def export_my_csv(user: dict = Depends(require_auth)):
+    # Floored for the same reason as the briefing: an export of the
+    # entire database sorted by relevance is not a useful artifact.
+    feed_data = await get_my_feed(user["user_id"], min_relevance=BRIEFING_RELEVANCE_FLOOR)
     leads = feed_data.get("leads", [])
 
     output = io.StringIO()
@@ -1268,5 +1185,5 @@ async def export_tenant_csv(tenant_id: str, _user: dict = Depends(require_tenant
     return StreamingResponse(
         iter([output.getvalue()]),
         media_type="text/csv",
-        headers={"Content-Disposition": f"attachment; filename=RO-INTEL-{tenant_id}.csv"}
+        headers={"Content-Disposition": "attachment; filename=RO-INTEL-export.csv"}
     )

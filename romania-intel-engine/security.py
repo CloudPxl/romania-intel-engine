@@ -17,12 +17,11 @@ RATE_LIMIT_STORE: Dict[str, Tuple[int, float]] = {}
 RATE_LIMIT_REQUESTS = 180
 RATE_LIMIT_WINDOW = 60
 
-# Self-serve onboarding (/api/v1/onboarding/complete) does a real
-# transactional DB write (tenant + product + membership rows) and, on
-# success, an in-process refresh of every tenant's matching config — far
-# heavier than an ordinary read, and each success leaves a permanent row
+# Self-serve onboarding (POST /api/v1/me/onboarding) does a real
+# transactional DB write that configures a profile — far heavier than
+# an ordinary read, and each success leaves a permanent row
 # behind rather than just serving a response. The global 180-req/60s
-# budget above exists to stop generic API hammering, not tenant-farming
+# budget above exists to stop generic API hammering, not account-farming
 # specifically: 180 requests/minute is no obstacle at all to a script
 # cycling through disposable free Supabase accounts from one IP. This is
 # a separate, much tighter budget scoped to just that one route — a
@@ -94,8 +93,8 @@ def _get_jwks_client() -> PyJWKClient:
 
 async def delete_supabase_auth_identity(user_id: str) -> bool:
     """The other half of GDPR-style account erasure — db.delete_own_account
-    removes everything this app itself owns (tenant, product line, profile
-    row), but the actual login credential is Supabase's auth.users row,
+    removes everything this app itself owns (the profile row, and
+    everything cascading from it), but the actual login credential is Supabase's auth.users row,
     which only Supabase's Admin API can remove, and that API requires the
     project's service-role key (Project Settings -> API -> service_role in
     the Supabase dashboard — deliberately never the anon key, which has no
@@ -204,7 +203,7 @@ class SecurityGuard:
     def enforce_onboarding_rate_limit(request: Request):
         """Tighter, route-scoped budget layered on top of the global
         limiter above — see ONBOARDING_RATE_LIMIT_REQUESTS' comment for
-        why self-serve tenant creation needs its own, much stricter cap."""
+        why self-serve signup needs its own, much stricter cap."""
         ip = client_ip(request)
         now = time.time()
 
@@ -226,22 +225,19 @@ class SecurityGuard:
             ONBOARDING_RATE_LIMIT_STORE[ip] = (1, now)
 
     @staticmethod
-    def verify_tenant_authorization(request: Request) -> Dict:
+    def verify_access_token(request: Request) -> Dict:
         """Decodes and validates a Supabase-issued JWT from the
         Authorization header. Replaces a hardcoded stub that returned a
         fixed fake user/role for every request regardless of what (if
         anything) was actually sent — i.e. no request was ever rejected.
 
-        Scope note — this authenticates, it does not authorize per tenant.
-        It proves the caller holds a valid, unexpired Supabase session for
-        *some* account; it does not by itself prove that account is
-        entitled to any particular {tenant_id} in a route's path — that
-        check is `require_tenant_membership` below, layered on top of this
-        function via `Depends(require_auth)`, not folded into this one.
-        Naming this function `verify_tenant_authorization` never made it
-        one; every tenant-scoped route in api.py now depends on
-        `require_tenant_membership` instead of `require_auth` directly for
-        exactly this reason — see tenants_schema.sql / db.get_user_profile.
+        This authenticates, and that is now the whole job. It used to be
+        called `verify_tenant_authorization`, which it never was: a
+        separate `require_tenant_membership` had to be layered on top to
+        check that the {tenant_id} in a route's path belonged to the
+        caller. No route names anyone else's data any more — the user id
+        comes from this token and never from a URL — so that second layer
+        is gone and the name no longer lies.
         """
         auth_header = request.headers.get("Authorization", "")
         if not auth_header.startswith("Bearer "):
@@ -289,7 +285,7 @@ class SecurityGuard:
                 # — accepting any token regardless of who signed it or
                 # what it claims. That was live in production and
                 # confirmed exploitable (a forged token with a fake `sub`
-                # and no valid signature returned real tenant data over
+                # and no valid signature returned real user data over
                 # the public API) before this replaced it. Never reduce
                 # this path back to that: the fix for "wrong algorithm
                 # rejected" is verifying against the *correct* key and
@@ -345,7 +341,7 @@ def require_auth(request: Request) -> Dict:
     endpoint is unreachable. Fails closed either way — an unconfigured or
     unreachable auth backend must not silently accept everything, which is
     exactly the behaviour the previous stub had."""
-    return SecurityGuard.verify_tenant_authorization(request)
+    return SecurityGuard.verify_access_token(request)
 
 
 def enforce_onboarding_rate_limit(request: Request) -> None:
@@ -365,37 +361,6 @@ def optional_auth(request: Request) -> Optional[Dict]:
     if not request.headers.get("Authorization", "").startswith("Bearer "):
         return None
     try:
-        return SecurityGuard.verify_tenant_authorization(request)
+        return SecurityGuard.verify_access_token(request)
     except HTTPException:
         return None
-
-
-async def require_tenant_membership(tenant_id: str, user: Dict = Depends(require_auth)) -> Dict:
-    """The actual per-tenant authorization check `require_auth` alone never
-    did (see its docstring above, and verify_tenant_authorization's).
-    `tenant_id` is resolved by FastAPI from the route's own path parameter
-    of the same name — every tenant-scoped route in api.py depends on this
-    instead of `require_auth` directly, so this composes with it rather
-    than replacing it.
-
-    Fails CLOSED on ambiguity, deliberately unlike almost every other read
-    in this codebase: an unreachable database is not "let the request
-    through", because this is a tenant-isolation boundary, not a feed that
-    degrades gracefully to empty. The one exception is when no database is
-    configured *at all* (`db.DATABASE_URL` unset) — that's the local/dev
-    case (this repo's tests and `python server.py` runs work with no
-    DATABASE_URL by design), where trusting the path param reproduces
-    exactly today's pre-fix behaviour rather than breaking local
-    development for a check that has nothing to check against.
-    """
-    if not db.DATABASE_URL:
-        return user
-
-    profile = await db.get_user_profile(user["user_id"])
-    if profile is None or profile.get("tenant_id") != tenant_id:
-        logger.warning(
-            f"[SecurityGuard] Denied {user.get('email') or user['user_id']} access to tenant '{tenant_id}' "
-            f"(profile {'not found' if profile is None else 'assigned to ' + str(profile.get('tenant_id'))})."
-        )
-        raise HTTPException(status_code=403, detail="Nu aveți acces la acest tenant.")
-    return user

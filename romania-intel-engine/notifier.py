@@ -7,6 +7,8 @@ from email.mime.multipart import MIMEMultipart
 from typing import Dict, Any, List, Optional
 import httpx
 
+from matching_engine import ALERT_THRESHOLD
+
 logger = logging.getLogger("AlertDispatcher")
 
 SMTP_HOST = os.getenv("SMTP_HOST", "")
@@ -128,55 +130,66 @@ body {{ font-family: -apple-system, sans-serif; background-color: #060b13; color
 
     @classmethod
     async def dispatch_high_priority_alert(cls, lead: Dict[str, Any], recipient_emails: Optional[List[str]] = None):
-        """Legacy, non-tenant-aware path — kept for the old 6h batch job
-        (api.py:background_scraping_job / daemon.py) while it still runs
-        alongside the new per-tenant streaming pipeline. New code should use
-        dispatch_lead_alert_to_tenant instead."""
+        """Legacy, non-personalised path — kept for the old batch job in
+        daemon.py while it still exists. New code should use
+        dispatch_lead_alert_to_user instead."""
         from ai_refinery import HIGH_PRIORITY_SCORE
 
         if lead.get("opportunity_score", 0) >= HIGH_PRIORITY_SCORE:
             await cls.dispatch_email_alert(lead, recipient_emails)
 
     @classmethod
-    async def dispatch_lead_alert_to_tenant(cls, lead: Dict[str, Any], tenant_id: str, match_info: Dict[str, Any]) -> Dict[str, bool]:
-        """Tenant-aware, per-channel-idempotent alert dispatch for the
-        streaming pipeline (orchestrator.run_tick). Fires Telegram (instant)
-        and email (rich HTML dossier) independently — one failing doesn't
-        block the other — and only records a channel as dispatched once it
-        actually succeeds, gated by min_alert_score per tenant rather than
-        the old global 9.0/9.2 hardcoded thresholds."""
-        import db
-        from matching_engine import TENANT_ORGANIZATIONS
+    async def dispatch_lead_alert_to_user(
+        cls, lead: Dict[str, Any], profile: Dict[str, Any], match_info: Dict[str, Any]
+    ) -> Dict[str, bool]:
+        """Per-user, per-channel-idempotent alert dispatch for the streaming
+        pipeline (orchestrator.run_tick).
 
-        tenant = TENANT_ORGANIZATIONS.get(tenant_id, {})
-        # `.get(..., 9.0)` only falls back when the key is absent — but
-        # db.get_tenant_organizations() stores an explicit None for a
-        # tenant whose min_alert_score column is NULL (nullable, no DB
-        # default), so the key is always present. That made this compare a
-        # float against None for any such tenant, raising TypeError on
-        # every match (caught by orchestrator.py's per-alert try/except,
-        # so it silently dropped every alert for that tenant instead of
-        # crashing the tick).
-        min_score = tenant.get("min_alert_score")
+        Takes the profile itself rather than looking it up: the tick loads
+        every profile once per run and passes them down, so there is no
+        per-signal query here and — more importantly — no module-level
+        config cache to go stale.
+
+        Telegram and email fire independently, so one failing doesn't block
+        the other, and a channel is only recorded as dispatched once it
+        actually succeeded.
+        """
+        import db
+
+        user_id = profile.get("id")
+        if not user_id:
+            return {"telegram": False, "email": False}
+
+        # `.get(..., default)` would only fall back when the key is absent,
+        # but min_alert_score is present-and-None for a profile whose column
+        # is NULL. That previously compared a float against None and raised
+        # TypeError on every match — caught by the tick's per-alert
+        # try/except, so it silently dropped that user's alerts entirely
+        # rather than failing loudly.
+        min_score = profile.get("min_alert_score")
         if min_score is None:
-            min_score = 9.0
-        if match_info.get("tenant_opportunity_score", 0) < min_score:
+            min_score = ALERT_THRESHOLD
+        if match_info.get("score", 0) < min_score:
             return {"telegram": False, "email": False}
 
         source_id = lead.get("source_id", "")
         results = {"telegram": False, "email": False}
 
-        chat_id = tenant.get("telegram_chat_id")
-        if chat_id and not await db.has_alert_been_dispatched(tenant_id, source_id, "telegram"):
-            text = f"🚨 <b>{lead.get('project_title', '')}</b>\n{lead.get('entity_name', '')} ({lead.get('county', '')})\nScor: {match_info.get('tenant_opportunity_score')}/10\n{lead.get('source_url', '')}"
+        chat_id = profile.get("telegram_chat_id")
+        if chat_id and not await db.has_alert_been_dispatched(user_id, source_id, "telegram"):
+            text = (
+                f"🚨 <b>{lead.get('project_title', '')}</b>\n"
+                f"{lead.get('entity_name', '')} ({lead.get('county', '')})\n"
+                f"Scor: {match_info.get('score')}/10\n{lead.get('source_url', '')}"
+            )
             if await cls.dispatch_telegram_message(chat_id, text):
-                await db.record_alert_dispatch(tenant_id, source_id, "telegram")
+                await db.record_alert_dispatch(user_id, source_id, "telegram")
                 results["telegram"] = True
 
-        emails = tenant.get("alert_emails") or []
-        if emails and not await db.has_alert_been_dispatched(tenant_id, source_id, "email"):
-            if await cls.dispatch_email_alert(lead, emails):
-                await db.record_alert_dispatch(tenant_id, source_id, "email")
+        alert_email = profile.get("alert_email")
+        if alert_email and not await db.has_alert_been_dispatched(user_id, source_id, "email"):
+            if await cls.dispatch_email_alert(lead, [alert_email]):
+                await db.record_alert_dispatch(user_id, source_id, "email")
                 results["email"] = True
 
         return results

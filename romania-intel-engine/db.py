@@ -1,5 +1,6 @@
 import asyncio
 import os
+import re
 import time
 import logging
 import uuid
@@ -9,6 +10,8 @@ from decimal import Decimal
 from typing import Any, Dict, List, Optional
 
 import asyncpg
+
+from text_utils import fold
 
 logger = logging.getLogger("DB")
 
@@ -85,7 +88,7 @@ async def get_pool() -> Optional[asyncpg.Pool]:
             # Was 5 — shared by every concurrent request, the ingestion
             # tick, and the document worker at once. Fine for a single
             # developer; a 6th simultaneous DB-touching request (trivial
-            # once several external tenants' dashboards overlap) just
+            # once a handful of users' dashboards overlap) just
             # queued silently behind it instead of erroring. Still the
             # same free Supabase project — this only raises the client-
             # side ceiling, so it's worth confirming Supabase's own
@@ -124,7 +127,6 @@ def _redact(text: str) -> str:
     """Strips credentials out of a connection error before it can be
     returned over HTTP — asyncpg happily echoes the DSN in some parse
     errors, and the DSN carries the database password."""
-    import re
     return re.sub(r"(?i)(postgres(?:ql)?://)[^\s'\"]*", r"\1<redacted>", text)
 
 
@@ -204,9 +206,9 @@ async def with_connection():
     # `RuntimeError: generator didn't stop after athrow()` — masking the real
     # error rather than retrying it. Wrapping the yield in try/except (as this
     # did before) therefore turned an ordinary stale-connection error into an
-    # unhandled RuntimeError at every call site, including
-    # security.require_tenant_membership, which has no broad except of its own
-    # and would 500 instead of cleanly allowing or denying.
+    # unhandled RuntimeError at every call site — including, at the time,
+    # the tenant-membership guard, which had no broad except of its own and
+    # would 500 instead of cleanly allowing or denying.
     try:
         conn = await pool.acquire(timeout=POOL_ACQUIRE_TIMEOUT)
     except _CONNECTION_ERRORS as e:
@@ -235,21 +237,30 @@ async def upsert_opportunity(record: Dict[str, Any]) -> bool:
             INSERT INTO opportunities (
                 source_id, source_type, category, sub_category, county, locality,
                 entity_name, project_title, estimated_value_ron, caen_codes, cpv_code,
-                published_date, action_deadline, raw_description, executive_summary,
+                published_date, action_deadline, executive_summary,
                 sales_pitch_angle, funding_source, opportunity_score, source_url,
-                document_url, metadata, last_seen_at
+                document_url, metadata, search_blob, last_seen_at
             ) VALUES (
-                $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15,
-                $16, $17, $18, $19, $20, $21, now()
+                $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14,
+                $15, $16, $17, $18, $19, $20, $21, now()
             )
             ON CONFLICT (source_id) DO UPDATE SET
                 estimated_value_ron = EXCLUDED.estimated_value_ron,
                 action_deadline = EXCLUDED.action_deadline,
                 opportunity_score = EXCLUDED.opportunity_score,
                 metadata = EXCLUDED.metadata,
+                search_blob = EXCLUDED.search_blob,
                 last_seen_at = now()
             RETURNING (xmax = 0) AS inserted
         """
+        # `executive_summary` is where the descriptive text actually lives.
+        # refine_signal maps the source's raw_description into it and never
+        # emits a `raw_description` key of its own, which is why the column
+        # of that name was NULL on every row ever written and has now been
+        # dropped. The search blob must read the same four fields the
+        # Python matcher reads, or SQL ranking and Python alerting would
+        # disagree about what a keyword matches.
+        summary = record.get("executive_summary")
         row = await conn.fetchrow(
             query,
             record.get("source_id"),
@@ -265,16 +276,39 @@ async def upsert_opportunity(record: Dict[str, Any]) -> bool:
             record.get("cpv_code"),
             _parse_date(record.get("published_date")),
             _parse_date(record.get("action_deadline")),
-            record.get("raw_description"),
-            record.get("executive_summary"),
+            summary,
             record.get("sales_pitch_angle"),
             record.get("funding_source"),
             record.get("opportunity_score"),
             record.get("source_url"),
             record.get("document_url"),
             _to_jsonb(record.get("metadata") or {}),
+            build_search_blob(record),
         )
     return bool(row["inserted"]) if row else True
+
+
+def build_search_blob(record: Dict[str, Any]) -> str:
+    """The pre-folded haystack the ranked feed matches keywords against.
+
+    Folded here, on write, with the same text_utils.fold() the Python
+    matcher uses — so a keyword either matches in both places or in
+    neither. Doing it in SQL instead (unaccent() at query time) would need
+    the extension, defeat any index, and disagree with fold() on the
+    legacy cedilla forms (ş/ţ) that Romanian institutional sites emit
+    alongside the correct comma-below ones.
+
+    The field list is deliberately the same one matching_engine reads.
+    Exported (not underscore-private) so the matcher can build the same
+    string for an in-memory signal that has not been persisted yet.
+    """
+    parts = (
+        record.get("project_title"),
+        record.get("executive_summary"),
+        record.get("sub_category"),
+        record.get("entity_name"),
+    )
+    return fold(" ".join(str(p) for p in parts if p))
 
 
 def _parse_date(value: Any) -> Optional[date]:
@@ -357,6 +391,94 @@ async def get_recent_opportunities(
         if conn is None:
             return []
         rows = await conn.fetch(query, *params)
+    return [dict(r) for r in rows]
+
+
+# --- The ranked feed ------------------------------------------------------
+#
+# A SOFT filter, deliberately: the feed returns the whole market and sorts
+# it, rather than hiding what does not match. A hard filter on a narrow
+# keyword list produces an empty dashboard, which reads as a broken product
+# rather than as a quiet market — and it hides the adjacent work a bidder
+# would actually have wanted to see.
+#
+# These weights order the feed ONLY. They are not the alert threshold:
+# matching_engine keeps a hard keyword-evidence gate for alerting, because
+# "everything matches a little" is fine for a ranked page and unacceptable
+# for an inbox. The two answer different questions and are meant to differ.
+RELEVANCE_WEIGHTS = {
+    "keyword": 50,   # the strongest signal — the user typed these words
+    "county": 20,    # right geography, wrong subject is still worth seeing
+    "domain": 15,
+    "value": 10,     # clears their minimum contract size
+    "excluded": -100,  # sinks below everything; never removed
+}
+
+# Mirrors text_utils.fold()'s Romanian map for the one column that is not
+# pre-folded. county is short and low-cardinality, so calling this per row
+# is cheap; the alternative is another stored column for no real gain.
+_PG_FOLD = "translate(lower({col}), 'ăĂâÂîÎșȘşŞțȚţŢ', 'aaaaiisssstttt')"
+
+
+def _pg_word_patterns(terms: Optional[List[str]]) -> List[str]:
+    """Folded whole-word POSIX patterns for `search_blob ~ ANY(...)`.
+
+    Whole-word matters as much as the folding, and for the same reason
+    text_utils.contains_term says so: a substring test lets "sala" match
+    "salariu" and "apa" match "apartament", which is how an unrelated
+    contract ends up at the top of someone's feed. Postgres spells the
+    word boundary \\m ... \\M where Python spells it \\b.
+    """
+    patterns: List[str] = []
+    for term in terms or []:
+        parts = re.findall(r"[a-z0-9]+", fold(str(term)))
+        if parts:
+            patterns.append(r"\m" + r"\s+".join(parts) + r"\M")
+    return patterns
+
+
+async def get_ranked_opportunities(
+    profile: Dict[str, Any], limit: int = 300
+) -> List[Dict[str, Any]]:
+    """The whole market, ordered by how well it fits this user.
+
+    Returns each row with a `relevance` score plus the individual boolean
+    hits that produced it, so the caller can explain the ranking in the UI
+    without re-running any matching in Python.
+    """
+    keywords = _pg_word_patterns(profile.get("keywords"))
+    excludes = _pg_word_patterns(profile.get("exclude_keywords"))
+    counties = [fold(str(c)) for c in (profile.get("target_counties") or []) if str(c).strip()]
+    domain = (profile.get("domain") or "").strip().lower() or None
+    min_value = float(profile.get("min_value_ron") or 0)
+
+    w = RELEVANCE_WEIGHTS
+    query = f"""
+        SELECT *,
+            (COALESCE(search_blob, '') ~ ANY($1::text[])) AS kw_hit,
+            ({_PG_FOLD.format(col='county')} = ANY($2::text[])) AS county_hit,
+            ($3::text IS NOT NULL AND lower(category) = $3) AS domain_hit,
+            ($4::numeric > 0 AND estimated_value_ron >= $4) AS value_hit,
+            (COALESCE(search_blob, '') ~ ANY($5::text[])) AS excluded_hit,
+            (
+                CASE WHEN COALESCE(search_blob, '') ~ ANY($1::text[]) THEN {w['keyword']} ELSE 0 END
+              + CASE WHEN {_PG_FOLD.format(col='county')} = ANY($2::text[]) THEN {w['county']} ELSE 0 END
+              + CASE WHEN $3::text IS NOT NULL AND lower(category) = $3 THEN {w['domain']} ELSE 0 END
+              + CASE WHEN $4::numeric > 0 AND estimated_value_ron >= $4 THEN {w['value']} ELSE 0 END
+              + CASE WHEN COALESCE(search_blob, '') ~ ANY($5::text[]) THEN {w['excluded']} ELSE 0 END
+              + COALESCE(opportunity_score, 0)
+            ) AS relevance
+        FROM opportunities
+        ORDER BY relevance DESC, last_seen_at DESC
+        LIMIT $6
+    """
+    # `~ ANY('{}')` on an empty array is false for every row, so a user who
+    # has set no keywords simply gets an unweighted feed rather than an
+    # error or an empty one.
+    async with with_connection() as conn:
+        if conn is None:
+            return []
+        rows = await conn.fetch(query, keywords, counties, domain, min_value, excludes, limit)
     return [dict(r) for r in rows]
 
 
@@ -465,32 +587,42 @@ async def close_circuit(source_name: str) -> None:
         )
 
 
-async def has_alert_been_dispatched(tenant_id: str, source_id: str, channel: str) -> bool:
+async def has_alert_been_dispatched(user_id: str, source_id: str, channel: str) -> bool:
+    """False when there is no database — so an outage re-sends an alert
+    rather than dropping it. Duplicates are recoverable; a lead nobody was
+    told about is not."""
     async with with_connection() as conn:
         if conn is None:
             return False
-        row = await conn.fetchrow(
-            """
-            SELECT 1 FROM tenant_alert_dispatch_log
-            WHERE tenant_id = $1 AND source_id = $2 AND channel = $3
-            """,
-            tenant_id, source_id, channel,
-        )
+        try:
+            row = await conn.fetchrow(
+                """
+                SELECT 1 FROM alert_dispatch_log
+                WHERE user_id = $1 AND source_id = $2 AND channel = $3
+                """,
+                user_id, source_id, channel,
+            )
+        except asyncpg.exceptions.UndefinedTableError:
+            logger.warning("[DB] alert_dispatch_log not found — run schema.sql.")
+            return False
     return row is not None
 
 
-async def record_alert_dispatch(tenant_id: str, source_id: str, channel: str) -> None:
+async def record_alert_dispatch(user_id: str, source_id: str, channel: str) -> None:
     async with with_connection() as conn:
         if conn is None:
             return
-        await conn.execute(
-            """
-            INSERT INTO tenant_alert_dispatch_log (tenant_id, source_id, channel)
-            VALUES ($1, $2, $3)
-            ON CONFLICT (tenant_id, source_id, channel) DO NOTHING
-            """,
-            tenant_id, source_id, channel,
-        )
+        try:
+            await conn.execute(
+                """
+                INSERT INTO alert_dispatch_log (user_id, source_id, channel)
+                VALUES ($1, $2, $3)
+                ON CONFLICT (user_id, source_id, channel) DO NOTHING
+                """,
+                user_id, source_id, channel,
+            )
+        except asyncpg.exceptions.UndefinedTableError:
+            logger.warning("[DB] alert_dispatch_log not found — run schema.sql.")
 
 
 async def start_tick() -> Optional[int]:
@@ -568,30 +700,32 @@ async def _fetch_stage_history(conn, deal_ids: List[str]) -> Dict[str, List[Dict
     return history
 
 
-async def get_deals_for_tenant(tenant_id: str, product_id: Optional[str] = None) -> Optional[List[Dict[str, Any]]]:
+# Every deal read and write below is scoped by (user_id, deal_id), never
+# by deal_id alone. That is not redundant now that the user comes from the
+# JWT: deal ids are guessable (`DEAL-<10 hex>`) and arrive in a request
+# body, so without the owner in the WHERE clause any authenticated caller
+# could read or advance a stranger's deal by guessing an id. This pair is
+# what replaces the deleted require_tenant_membership for this table.
+
+
+async def get_deals_for_user(user_id: str) -> Optional[List[Dict[str, Any]]]:
     """None means "couldn't read from Postgres" (caller should fall back to
     the in-memory dict) — a real, empty pipeline is returned as []."""
     async with with_connection() as conn:
         if conn is None:
             return None
         try:
-            if product_id:
-                rows = await conn.fetch(
-                    "SELECT * FROM product_bidding_deals WHERE tenant_id = $1 AND product_id = $2 ORDER BY created_at",
-                    tenant_id, product_id,
-                )
-            else:
-                rows = await conn.fetch(
-                    "SELECT * FROM product_bidding_deals WHERE tenant_id = $1 ORDER BY created_at",
-                    tenant_id,
-                )
+            rows = await conn.fetch(
+                "SELECT * FROM saved_deals WHERE user_id = $1 ORDER BY created_at",
+                user_id,
+            )
             deals = [_deal_row_to_dict(r) for r in rows]
             history = await _fetch_stage_history(conn, [d["deal_id"] for d in deals])
             for d in deals:
                 d["stage_history"] = history.get(d["deal_id"], [])
             return deals
         except asyncpg.exceptions.UndefinedTableError:
-            logger.warning("[DB] product_bidding_deals not found — run pipeline_schema.sql. Falling back to in-memory pipeline.")
+            logger.warning("[DB] saved_deals not found — run schema.sql. Falling back to in-memory pipeline.")
             return None
 
 
@@ -602,30 +736,30 @@ async def add_deal(deal: Dict[str, Any]) -> bool:
         try:
             await conn.execute(
                 """
-                INSERT INTO product_bidding_deals (
-                    deal_id, tenant_id, product_id, opportunity_id, project_title, stage,
-                    assigned_to, target_margin_pct, estimated_value_ron, notes, created_at
-                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+                INSERT INTO saved_deals (
+                    deal_id, user_id, opportunity_id, project_title, stage,
+                    target_margin_pct, estimated_value_ron, notes, created_at
+                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
                 """,
-                deal["deal_id"], deal["tenant_id"], deal.get("product_id"), deal.get("opportunity_id"),
-                deal.get("project_title", ""), deal.get("stage", "discovery"), deal.get("assigned_to"),
-                deal.get("target_margin_pct"), deal.get("estimated_value_ron") or 0.0, deal.get("notes", ""),
-                _parse_timestamp(deal.get("created_at")),
+                deal["deal_id"], deal["user_id"], deal.get("opportunity_id"),
+                deal.get("project_title", ""), deal.get("stage", "discovery"),
+                deal.get("target_margin_pct"), deal.get("estimated_value_ron") or 0.0,
+                deal.get("notes", ""), _parse_timestamp(deal.get("created_at")),
             )
             return True
         except asyncpg.exceptions.UndefinedTableError:
-            logger.warning("[DB] product_bidding_deals not found — run pipeline_schema.sql. Falling back to in-memory pipeline.")
+            logger.warning("[DB] saved_deals not found — run schema.sql. Falling back to in-memory pipeline.")
             return False
 
 
-async def get_deal(tenant_id: str, deal_id: str) -> Optional[Dict[str, Any]]:
+async def get_deal(user_id: str, deal_id: str) -> Optional[Dict[str, Any]]:
     async with with_connection() as conn:
         if conn is None:
             return None
         try:
             row = await conn.fetchrow(
-                "SELECT * FROM product_bidding_deals WHERE tenant_id = $1 AND deal_id = $2",
-                tenant_id, deal_id,
+                "SELECT * FROM saved_deals WHERE user_id = $1 AND deal_id = $2",
+                user_id, deal_id,
             )
         except asyncpg.exceptions.UndefinedTableError:
             return None
@@ -639,7 +773,7 @@ async def get_deal(tenant_id: str, deal_id: str) -> Optional[Dict[str, Any]]:
 
 
 async def update_deal(
-    tenant_id: str,
+    user_id: str,
     deal_id: str,
     new_stage: str,
     notes: Optional[str],
@@ -652,18 +786,18 @@ async def update_deal(
         try:
             row = await conn.fetchrow(
                 """
-                UPDATE product_bidding_deals
+                UPDATE saved_deals
                 SET stage = $3,
                     notes = COALESCE($4, notes),
                     proposed_price = COALESCE($5, proposed_price),
                     updated_at = $6
-                WHERE tenant_id = $1 AND deal_id = $2
+                WHERE user_id = $1 AND deal_id = $2
                 RETURNING *
                 """,
-                tenant_id, deal_id, new_stage, notes, proposed_price, _parse_timestamp(updated_at),
+                user_id, deal_id, new_stage, notes, proposed_price, _parse_timestamp(updated_at),
             )
         except asyncpg.exceptions.UndefinedTableError:
-            logger.warning("[DB] product_bidding_deals not found — run pipeline_schema.sql. Falling back to in-memory pipeline.")
+            logger.warning("[DB] saved_deals not found — run schema.sql. Falling back to in-memory pipeline.")
             return None
     if row is None:
         return None
@@ -698,91 +832,95 @@ def _parse_timestamp(value: Any) -> Optional[datetime]:
 
 
 # ---------------------------------------------------------------------------
-# Real tenant config + user->tenant membership (tenants_schema.sql).
+# The user profile — the core entity.
 #
-# Replaces matching_engine.py's hardcoded TENANT_ORGANIZATIONS dict and
-# closes the "any authenticated user can address any tenant_id" gap. See
-# tenants_schema.sql's header for why this is a from-scratch design rather
-# than a resumption of the dead multi_tenancy_schema.sql artifact (and of
-# scripts/seed_tenants.py, since deleted).
-#
-# get_tenant_organizations() is deliberately NOT called on the read-request
-# hot path: matching_engine.TenantMatchingEngine.evaluate_opportunity_for_
-# tenant() runs synchronously, once per (signal, tenant) pair, inside
-# orchestrator.py's tick loop — up to several thousand calls per tick. A
-# Postgres round-trip per call there would reintroduce exactly the pool-
-# pressure problem the max_size increase above exists to relieve. Instead
-# matching_engine.py loads this once (at API startup, and whenever an
-# operator re-runs scripts/provision_tenant.py) into its own in-process
-# dict, the same way it already worked before this table existed — this
-# function is the loader, not a per-lookup query.
+# There is no tenant, no organisation and no product line. A person signs
+# up, sets their own matching criteria, and owns their own data. The
+# previous model wrapped that in a tenants -> tenant_products ->
+# user_profiles chain that never held more than one row at each level, and
+# cost an entire authorization layer to police a {tenant_id} path param
+# that could only ever be your own.
 # ---------------------------------------------------------------------------
 
-async def get_tenant_organizations() -> Optional[Dict[str, Any]]:
-    """Returns the TENANT_ORGANIZATIONS-shaped dict built from Postgres, or
-    None if there's no database or the migration hasn't been applied yet —
-    callers should keep their own hardcoded fallback in that case, same
-    convention as get_deals_for_tenant()."""
+# The columns every profile read returns. Kept in one place because four
+# separate queries below select them and drifting between those is how a
+# KeyError reaches a route handler.
+_PROFILE_COLUMNS = (
+    "id, email, display_name, domain, target_counties, keywords, "
+    "exclude_keywords, min_value_ron, company_name, cui, alert_email, "
+    "telegram_chat_id, min_alert_score, onboarded_at"
+)
+
+
+def _profile_row_to_dict(row: Any) -> Dict[str, Any]:
+    """Normalises a profile row for JSON and for the matcher: arrays become
+    real lists, NUMERIC becomes float, UUID and timestamps become strings."""
+    if row is None:
+        return {}
+    d = dict(row)
+    if d.get("id") is not None:
+        d["id"] = str(d["id"])
+    for key in ("target_counties", "keywords", "exclude_keywords"):
+        d[key] = list(d.get(key) or [])
+    d["min_value_ron"] = float(d.get("min_value_ron") or 0.0)
+    if d.get("min_alert_score") is not None:
+        d["min_alert_score"] = float(d["min_alert_score"])
+    if isinstance(d.get("onboarded_at"), datetime):
+        d["onboarded_at"] = d["onboarded_at"].isoformat()
+    return d
+
+
+async def get_profile(user_id: str) -> Optional[Dict[str, Any]]:
+    """None means "no row for this user" OR "couldn't reach Postgres".
+
+    Both are treated as "not signed up yet" by the routes. Unlike the old
+    membership check this is no longer a security boundary — no request can
+    name anyone else's profile, because the id comes from the verified JWT
+    and never from the URL — so returning None here denies nothing; it just
+    sends the caller to onboarding.
+    """
     async with with_connection() as conn:
         if conn is None:
             return None
         try:
-            tenant_rows = await conn.fetch("SELECT * FROM tenants ORDER BY id")
-            product_rows = await conn.fetch("SELECT * FROM tenant_products ORDER BY tenant_id, id")
+            row = await conn.fetchrow(
+                f"SELECT {_PROFILE_COLUMNS} FROM user_profiles WHERE id = $1", user_id
+            )
         except asyncpg.exceptions.UndefinedTableError:
-            logger.warning("[DB] tenants/tenant_products not found — run tenants_schema.sql. Using hardcoded fallback.")
+            logger.warning("[DB] user_profiles not found — run schema.sql.")
             return None
-
-    products_by_tenant: Dict[str, List[Dict[str, Any]]] = {}
-    for row in product_rows:
-        products_by_tenant.setdefault(row["tenant_id"], []).append({
-            "product_id": row["id"],
-            "name": row["name"],
-            "domain": row["domain"],
-            "target_counties": list(row["target_counties"] or []),
-            "min_value_ron": float(row["min_value_ron"] or 0.0),
-            "keywords": list(row["keywords"] or []),
-            "exclude_keywords": list(row["exclude_keywords"] or []),
-        })
-
-    return {
-        row["id"]: {
-            "name": row["company_name"],
-            "primary_domain": row["primary_domain"],
-            "alert_emails": list(row["alert_emails"] or []),
-            "telegram_chat_id": row["telegram_chat_id"],
-            "min_alert_score": float(row["min_alert_score"]) if row["min_alert_score"] is not None else None,
-            "products": products_by_tenant.get(row["id"], []),
-        }
-        for row in tenant_rows
-    }
+    return _profile_row_to_dict(row) if row else None
 
 
-async def get_user_profile(user_id: str) -> Optional[Dict[str, Any]]:
-    """None means "no row for this user" OR "couldn't reach Postgres" —
-    both are treated as "not provisioned" by security.py's tenant-
-    membership check, which fails closed either way. This is a security
-    boundary, not a feed read: unlike every other degrade-gracefully path
-    in this module, an unreachable database here must not be treated as
-    "let the request through"."""
+async def get_onboarded_profiles() -> List[Dict[str, Any]]:
+    """Every profile the ingestion tick should match new signals against.
+
+    Read ONCE per tick into a local, never cached in a module-level dict.
+    The previous design kept exactly such a cache (TENANT_ORGANIZATIONS)
+    and had to be mutated in place with .clear()/.update() forever after,
+    because two modules had bound the object by reference at import time —
+    reassigning it would have left them iterating stale config with no
+    error. A local passed down the call chain has none of that hazard, and
+    one SELECT against a tick that already runs for 100-370s is free.
+    """
     async with with_connection() as conn:
         if conn is None:
-            return None
+            return []
         try:
-            row = await conn.fetchrow("SELECT id, email, tenant_id, role FROM user_profiles WHERE id = $1", user_id)
+            rows = await conn.fetch(
+                f"SELECT {_PROFILE_COLUMNS} FROM user_profiles "
+                "WHERE onboarded_at IS NOT NULL ORDER BY created_at"
+            )
         except asyncpg.exceptions.UndefinedTableError:
-            logger.warning("[DB] user_profiles not found — run tenants_schema.sql.")
-            return None
-    return dict(row) if row else None
+            logger.warning("[DB] user_profiles not found — run schema.sql.")
+            return []
+    return [_profile_row_to_dict(r) for r in rows]
 
 
 async def upsert_user_profile_email(user_id: str, email: str) -> Optional[Dict[str, Any]]:
-    """Called from /api/v1/auth/sync on every login. Never assigns
-    tenant_id itself — that is scripts/provision_tenant.py (admin) or
-    create_self_provisioned_tenant (self-serve onboarding) — so a genuinely
-    new person lands with tenant_id NULL, reported honestly as "not
-    provisioned yet". Returns the current row so the caller can read back
-    whatever tenant_id already exists, if any.
+    """Called from /api/v1/auth/sync on every login. Creates the bare row if
+    this is a new person; never sets matching criteria, so a genuinely new
+    user lands with onboarded_at NULL and is sent to the onboarding form.
 
     One human can hold SEVERAL Supabase auth identities for one email:
     signing in with Google and with a magic link can mint different
@@ -795,22 +933,19 @@ async def upsert_user_profile_email(user_id: str, email: str) -> Optional[Dict[s
     That case used to be a hard 500 on EVERY login, taking the whole
     product down: the statement was a bare `INSERT ... ON CONFLICT (id)`,
     which handles only an id collision, so a second identity for a known
-    email sailed past it and hit the live `user_profiles_email_key` unique
-    index — a constraint no schema file in this repo declares, i.e.
-    undocumented drift on the hand-applied database. The API returned 500,
-    the frontend could not decode it, and the user got an infinite
-    sign-in loop.
+    email sailed past it and hit the `user_profiles_email_key` unique
+    index. The API returned 500, the frontend could not decode it, and the
+    user got an infinite sign-in loop.
 
     So the email, not the auth id, is treated as the identity: it is
-    verified by Supabase in both flows (Google and magic link), which makes
-    "same email" a trustworthy "same person". An existing row is re-pointed
-    at the current auth identity rather than duplicated, which also
-    preserves their tenant — they land straight back in their account
-    instead of being asked to onboard again. Nothing FK-references
-    user_profiles.id, so re-pointing is safe.
+    verified by Supabase in both flows, which makes "same email" a
+    trustworthy "same person". An existing row is re-pointed onto the
+    current auth identity rather than duplicated, so the user keeps their
+    criteria and their saved deals instead of being asked to start over.
 
-    Correct whether or not the unique index is present, so no migration is
-    required to recover from this.
+    KEEP THIS LOGIC. It reads like tenant-era plumbing and is not — it is
+    the fix for a live outage, and tests/test_auth_sync_identity.py is its
+    only guard.
     """
     async with with_connection() as conn:
         if conn is None:
@@ -819,13 +954,12 @@ async def upsert_user_profile_email(user_id: str, email: str) -> Optional[Dict[s
             async with conn.transaction():
                 # Serialises two concurrent logins for the same person
                 # (double-submit, a client retry, two tabs) so they can't
-                # both decide to insert. Mirrors the advisory lock
-                # create_self_provisioned_tenant takes, keyed on the email
-                # here since that is the identity this function resolves.
+                # both decide to insert. Keyed on the email, since that is
+                # the identity this function resolves.
                 await conn.execute("SELECT pg_advisory_xact_lock(hashtext(lower($1)))", email)
 
                 row = await conn.fetchrow(
-                    "SELECT id, email, tenant_id, role FROM user_profiles WHERE id = $1", user_id
+                    f"SELECT {_PROFILE_COLUMNS} FROM user_profiles WHERE id = $1", user_id
                 )
                 if row is not None:
                     if row["email"] != email:
@@ -833,17 +967,16 @@ async def upsert_user_profile_email(user_id: str, email: str) -> Optional[Dict[s
                             "UPDATE user_profiles SET email = $1, updated_at = now() WHERE id = $2",
                             email, user_id,
                         )
-                    return {**dict(row), "email": email}
+                    return {**_profile_row_to_dict(row), "email": email}
 
                 # No row for this auth identity. Adopt one already held by
-                # this email, preferring a provisioned row so a person with
-                # both a stale empty profile and a real one keeps the real
-                # tenant.
+                # this email, preferring a completed profile so someone with
+                # both a stale empty row and a real one keeps the real one.
                 existing = await conn.fetchrow(
-                    """
-                    SELECT id, email, tenant_id, role FROM user_profiles
+                    f"""
+                    SELECT {_PROFILE_COLUMNS} FROM user_profiles
                     WHERE lower(email) = lower($1)
-                    ORDER BY (tenant_id IS NULL), created_at
+                    ORDER BY (onboarded_at IS NULL), created_at
                     LIMIT 1
                     """,
                     email,
@@ -854,296 +987,175 @@ async def upsert_user_profile_email(user_id: str, email: str) -> Optional[Dict[s
                         user_id, email, existing["id"],
                     )
                     logger.info(
-                        f"[DB] Re-pointed the profile for {email} onto a new Supabase auth identity "
-                        f"(tenant={existing['tenant_id']})."
+                        f"[DB] Re-pointed the profile for {email} onto a new Supabase auth identity."
                     )
-                    return {**dict(existing), "id": user_id, "email": email}
+                    return {**_profile_row_to_dict(existing), "id": user_id, "email": email}
 
                 row = await conn.fetchrow(
-                    """
+                    f"""
                     INSERT INTO user_profiles (id, email)
                     VALUES ($1, $2)
-                    RETURNING id, email, tenant_id, role
+                    RETURNING {_PROFILE_COLUMNS}
                     """,
                     user_id, email,
                 )
-                return dict(row) if row else None
+                return _profile_row_to_dict(row) if row else None
         except asyncpg.exceptions.UndefinedTableError:
-            logger.warning("[DB] user_profiles not found — run tenants_schema.sql.")
+            logger.warning("[DB] user_profiles not found — run schema.sql.")
             return None
 
 
-# Self-serve signup means anyone with a free Supabase account (Google
-# OAuth or a magic-link email, no cost and no human review) can call
-# create_self_provisioned_tenant once per account — and nothing stops the
-# same person scripting many accounts to create many tenants. Every
-# tenant added here is one more iteration of orchestrator.py:run_tick's
-# `for tenant_id in TENANT_ORGANIZATIONS` loop, which runs once per
-# newly-ingested signal — unbounded growth there degrades ingestion
-# latency for *every* tenant, not just the abuser's own feed. This cap is
-# deliberately generous (a few hundred, comfortably above any real growth
-# this product has seen) rather than tuned tight: the goal is to catch
-# scripted tenant-farming, not to constrain genuine adoption. A human
-# should revisit the number once real signup volume exists — there is
-# nothing principled about 300 beyond "obviously more than legitimate
-# usage, obviously less than a farming script would otherwise create".
-async def _attach_profile_to_tenant(conn, user_id: str, email: str, tenant_id: str) -> None:
-    """Binds this auth identity to `tenant_id`, tolerating the same
-    several-identities-per-email case upsert_user_profile_email documents.
-
-    A bare `INSERT ... ON CONFLICT (id)` is not enough on its own: if this
-    email already sits on a row under a DIFFERENT auth id, the id conflict
-    never fires and the statement hits the live user_profiles_email_key
-    unique index instead, 500-ing onboarding exactly the way it used to
-    500 login. In the normal flow /api/v1/auth/sync has already re-pointed
-    that row, so this is defence in depth rather than the primary guard —
-    but it is the same bug class, and it has already cost one outage.
-    """
-    existing = await conn.fetchrow(
-        """
-        SELECT id FROM user_profiles
-        WHERE lower(email) = lower($1) AND id <> $2
-        ORDER BY (tenant_id IS NULL), created_at
-        LIMIT 1
-        """,
-        email, user_id,
-    )
-    # Only re-point when this identity has no row of its own; otherwise the
-    # update would collide with it on the primary key.
-    if existing is not None:
-        mine = await conn.fetchrow("SELECT 1 FROM user_profiles WHERE id = $1", user_id)
-        if mine is None:
-            await conn.execute(
-                "UPDATE user_profiles SET id = $1, updated_at = now() WHERE id = $2",
-                user_id, existing["id"],
-            )
-
-    await conn.execute(
-        """
-        INSERT INTO user_profiles (id, email, tenant_id, role)
-        VALUES ($1, $2, $3, 'owner')
-        ON CONFLICT (id) DO UPDATE SET
-            email = EXCLUDED.email, tenant_id = EXCLUDED.tenant_id, updated_at = now()
-        """,
-        user_id, email, tenant_id,
-    )
+# Signup is self-serve: anyone with a free Supabase account (Google OAuth
+# or a magic-link email, no cost and no human review) can complete
+# onboarding, and nothing stops one person scripting many accounts. Every
+# completed profile is one more iteration of the tick's per-signal
+# matching loop, and unbounded growth there degrades ingestion latency for
+# everyone, not just the abuser. The cap is deliberately generous — the
+# goal is to catch scripted farming, not to constrain real adoption — and
+# there is nothing principled about the number beyond "obviously more than
+# legitimate usage, obviously less than a script would create".
+#
+# The env var keeps its old name so the value already set on the deployed
+# service continues to apply; renaming it in code alone would silently
+# reset the cap to the default on the next restart.
+MAX_USER_PROFILES = int(os.getenv("MAX_SELF_PROVISIONED_TENANTS", "300"))
 
 
-MAX_SELF_PROVISIONED_TENANTS = int(os.getenv("MAX_SELF_PROVISIONED_TENANTS", "300"))
+class UserCapacityError(Exception):
+    """Raised by complete_onboarding when MAX_USER_PROFILES is reached.
 
-
-class TenantCapacityError(Exception):
-    """Raised by create_self_provisioned_tenant when
-    MAX_SELF_PROVISIONED_TENANTS has been reached.
-
-    Deliberately a real exception rather than folding into this
-    function's existing `return None` convention: None already means two
-    ordinary, expected outcomes here (no database configured; caller
-    already has a tenant) that api.py reacts to quietly. Hitting the cap
-    is an operational anomaly — worth the operator finding out about
-    (api.py fires an admin alert on it), not something to silently
-    swallow alongside the routine cases.
+    A real exception rather than folding into this module's `return None`
+    convention: None already means two ordinary, expected outcomes here (no
+    database; already onboarded). Hitting the cap is an operational anomaly
+    worth the operator finding out about — api.py fires an admin alert on
+    it — so it must be distinguishable from the routine cases.
     """
 
 
-async def create_self_provisioned_tenant(
+async def complete_onboarding(
     user_id: str,
     email: str,
-    display_name: str,
+    display_name: Optional[str],
     domain: str,
     target_counties: List[str],
     min_value_ron: float,
     keywords: List[str],
     exclude_keywords: List[str],
 ) -> Optional[Dict[str, Any]]:
-    """Self-serve counterpart to scripts/provision_tenant.py: a signed-in
-    user with no tenant_id yet creates their own individual tenant, a
-    single product line, and their own membership row, in one transaction
-    — no admin action required. This is the real fix for the "signed in
-    but not associated with any company" dead end: that message was correct
-    behavior for an admin-provisioned model, but this product now sells to
-    individuals, and an individual has no one to email to get unblocked.
+    """Turns a bare signed-in row into a configured profile.
 
-    One tenant per person, one product row per tenant (id derived as
-    f"{tenant_id}_prod_main") — update_own_tenant_product below assumes the
-    same shape. A tenant that later needs multiple product lines (the
-    original company-style shape) still goes through
-    scripts/provision_tenant.py, which is unaffected by this function.
-
-    Returns None — never raises for either ordinary case — when no
-    database is configured, or when this user already has a tenant (the
-    caller should route them to update_own_tenant_product instead of
-    calling this again, since it never overwrites an existing
-    membership). Raises TenantCapacityError (see above) when
-    MAX_SELF_PROVISIONED_TENANTS has been reached. On success, returns
-    {"tenant_id", "product_id", "linked_existing"} — the last is True when
-    this call didn't create a new tenant at all, instead linking a second
-    Supabase auth identity (same email, different user_id — see the
-    email-collision comment below) onto an existing one."""
+    Returns the profile on success, None when there is no database or the
+    user has already onboarded (the route turns the latter into a 409 and
+    points them at PUT /api/v1/me/profile instead). Raises
+    UserCapacityError at the cap.
+    """
     async with with_connection() as conn:
         if conn is None:
             return None
         try:
             async with conn.transaction():
-                # Serializes two concurrent onboarding attempts for the
-                # SAME user against the SELECT-then-INSERT check just
-                # below: under READ COMMITTED, a double-click submit or a
-                # client retry after a slow response could otherwise have
-                # both requests see "no tenant yet", both proceed to
-                # create a *distinct* tenant, and leave one permanently
-                # orphaned — real in Postgres with no user ever pointing
-                # at it, since only whichever one's user_profiles upsert
-                # commits last actually "wins" the membership. A
-                # transaction-scoped advisory lock keyed by this user_id
-                # makes the second attempt block here until the first
-                # commits or rolls back, then re-read `existing` and
-                # correctly see the just-committed row. hashtext() turns
-                # the UUID into the bigint key pg_advisory_xact_lock
-                # wants; the lock releases automatically at transaction
-                # end, no explicit unlock needed.
+                # Closes a real race: under READ COMMITTED two concurrent
+                # onboarding calls for one user (double-submit, a client
+                # retry) could both read "not onboarded yet" and both
+                # proceed. Transaction-scoped, so it releases on commit.
                 await conn.fetchval("SELECT pg_advisory_xact_lock(hashtext($1))", user_id)
 
                 existing = await conn.fetchrow(
-                    "SELECT tenant_id FROM user_profiles WHERE id = $1", user_id
+                    "SELECT onboarded_at FROM user_profiles WHERE id = $1", user_id
                 )
-                if existing and existing["tenant_id"]:
+                if existing is not None and existing["onboarded_at"] is not None:
                     return None
 
-                # Whether the same real person signing in via Google once
-                # and a magic link another time gets ONE Supabase auth
-                # identity (sub claim) or two is entirely a function of
-                # that project's own identity-linking configuration — not
-                # something this code can see or control. If it forks,
-                # each sign-in method mints a distinct user_id, and without
-                # this check each would happily create its OWN tenant: two
-                # billable accounts, two operator-alert emails, for one
-                # customer. This closes it at the one place we CAN see the
-                # collision — our own table — regardless of what Supabase
-                # does under the hood: a second identity claiming an email
-                # that already owns a tenant is linked to that SAME tenant
-                # instead of getting a new one. Safe because email here
-                # comes from the caller's own verified JWT (security.py),
-                # never client-supplied, so this can't be spoofed into
-                # hijacking a stranger's tenant.
-                existing_by_email = await conn.fetchrow(
-                    "SELECT tenant_id FROM user_profiles WHERE lower(email) = lower($1) AND tenant_id IS NOT NULL LIMIT 1",
-                    email,
+                count = await conn.fetchval(
+                    "SELECT COUNT(*) FROM user_profiles WHERE onboarded_at IS NOT NULL"
                 )
-                if existing_by_email and existing_by_email["tenant_id"]:
-                    linked_tenant_id = existing_by_email["tenant_id"]
-                    await _attach_profile_to_tenant(conn, user_id, email, linked_tenant_id)
-                    return {
-                        "tenant_id": linked_tenant_id,
-                        "product_id": f"{linked_tenant_id}_prod_main",
-                        "linked_existing": True,
-                    }
-
-                # Self-provisioned ids are namespaced with a "u_" prefix
-                # (below); admin-provisioned ones (scripts/provision_tenant.py)
-                # use human-chosen ids like "t1_infra_transilvania" and are
-                # never counted here — hand-onboarding the next 10-20 real
-                # companies never competes with this cap.
-                self_provisioned_count = await conn.fetchval(
-                    "SELECT COUNT(*) FROM tenants WHERE left(id, 2) = 'u_'"
-                )
-                if self_provisioned_count is not None and self_provisioned_count >= MAX_SELF_PROVISIONED_TENANTS:
-                    raise TenantCapacityError(
-                        f"Self-provisioned tenant cap reached ({self_provisioned_count}/{MAX_SELF_PROVISIONED_TENANTS})."
+                if count is not None and count >= MAX_USER_PROFILES:
+                    raise UserCapacityError(
+                        f"{count} profiles already exist (cap {MAX_USER_PROFILES})."
                     )
 
-                tenant_id = f"u_{uuid.uuid4().hex[:12]}"
-                product_id = f"{tenant_id}_prod_main"
-                name = display_name.strip() or email.split("@")[0]
-
-                await conn.execute(
-                    """
-                    INSERT INTO tenants (id, company_name, primary_domain, alert_emails, min_alert_score)
-                    VALUES ($1, $2, $3, $4, $5)
-                    """,
-                    tenant_id, name, domain, [email], 7.5,
-                )
-                await conn.execute(
-                    """
-                    INSERT INTO tenant_products
-                        (id, tenant_id, name, domain, target_counties, min_value_ron, keywords, exclude_keywords)
-                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-                    """,
-                    product_id, tenant_id, name, domain,
-                    target_counties, min_value_ron, keywords, exclude_keywords,
-                )
-                await _attach_profile_to_tenant(conn, user_id, email, tenant_id)
-        except asyncpg.exceptions.UndefinedTableError:
-            logger.warning("[DB] tenants/tenant_products/user_profiles not found — run tenants_schema.sql.")
-            return None
-    return {"tenant_id": tenant_id, "product_id": product_id, "linked_existing": False}
-
-
-async def update_own_tenant_product(
-    tenant_id: str,
-    domain: str,
-    target_counties: List[str],
-    min_value_ron: float,
-    keywords: List[str],
-    exclude_keywords: List[str],
-) -> bool:
-    """Lets an already-provisioned individual edit their own watch criteria
-    (domain, counties, keywords, budget floor) without admin involvement.
-    Assumes the single-product-per-person shape create_self_provisioned_tenant
-    establishes (product id = f"{tenant_id}_prod_main"); upserts rather than
-    requiring the row to already exist, so it also works for a tenant
-    provisioned the old way via scripts/provision_tenant.py with a
-    differently-named product, which simply gains a second, main product line."""
-    async with with_connection() as conn:
-        if conn is None:
-            return False
-        try:
-            product_id = f"{tenant_id}_prod_main"
-            async with conn.transaction():
-                await conn.execute(
-                    """
-                    INSERT INTO tenant_products
-                        (id, tenant_id, name, domain, target_counties, min_value_ron, keywords, exclude_keywords)
-                    VALUES ($1, $2, 'Profilul meu', $3, $4, $5, $6, $7)
+                row = await conn.fetchrow(
+                    f"""
+                    INSERT INTO user_profiles (
+                        id, email, display_name, domain, target_counties,
+                        min_value_ron, keywords, exclude_keywords,
+                        alert_email, min_alert_score, onboarded_at
+                    ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $2, 7.5, now())
                     ON CONFLICT (id) DO UPDATE SET
+                        email = EXCLUDED.email,
+                        display_name = EXCLUDED.display_name,
                         domain = EXCLUDED.domain,
                         target_counties = EXCLUDED.target_counties,
                         min_value_ron = EXCLUDED.min_value_ron,
                         keywords = EXCLUDED.keywords,
-                        exclude_keywords = EXCLUDED.exclude_keywords
+                        exclude_keywords = EXCLUDED.exclude_keywords,
+                        -- Alerts default to the signup address, but never
+                        -- overwrite one the user has already chosen.
+                        alert_email = COALESCE(user_profiles.alert_email, EXCLUDED.alert_email),
+                        onboarded_at = now(),
+                        updated_at = now()
+                    RETURNING {_PROFILE_COLUMNS}
                     """,
-                    product_id, tenant_id, domain, target_counties, min_value_ron, keywords, exclude_keywords,
+                    user_id, email, display_name, domain, target_counties,
+                    min_value_ron, keywords, exclude_keywords,
                 )
-                await conn.execute("UPDATE tenants SET primary_domain = $1 WHERE id = $2", domain, tenant_id)
+                return _profile_row_to_dict(row) if row else None
         except asyncpg.exceptions.UndefinedTableError:
-            logger.warning("[DB] tenants/tenant_products not found — run tenants_schema.sql.")
-            return False
-    return True
+            logger.warning("[DB] user_profiles not found — run schema.sql.")
+            return None
 
 
-async def update_tenant_alert_settings(
-    tenant_id: str,
-    alert_emails: List[str],
+async def update_profile(user_id: str, fields: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Partial update of whatever the caller actually sent.
+
+    Built dynamically rather than as one fixed UPDATE so that editing only
+    the keyword list cannot blank out the county list — a PUT that always
+    wrote every column would do exactly that for any client sending a
+    partial body.
+    """
+    allowed = (
+        "display_name", "domain", "target_counties", "keywords",
+        "exclude_keywords", "min_value_ron", "company_name", "cui",
+    )
+    sets: List[str] = []
+    params: List[Any] = [user_id]
+    for key in allowed:
+        if key in fields:
+            params.append(fields[key])
+            sets.append(f"{key} = ${len(params)}")
+    if not sets:
+        return await get_profile(user_id)
+
+    async with with_connection() as conn:
+        if conn is None:
+            return None
+        try:
+            row = await conn.fetchrow(
+                f"""
+                UPDATE user_profiles SET {', '.join(sets)}, updated_at = now()
+                WHERE id = $1
+                RETURNING {_PROFILE_COLUMNS}
+                """,
+                *params,
+            )
+        except asyncpg.exceptions.UndefinedTableError:
+            logger.warning("[DB] user_profiles not found — run schema.sql.")
+            return None
+    return _profile_row_to_dict(row) if row else None
+
+
+async def update_alert_settings(
+    user_id: str,
+    alert_email: str,
     min_alert_score: float,
     telegram_chat_id: Optional[str] = None,
 ) -> bool:
-    """Lets a tenant change where automated alerts actually go and at what
-    score they fire — the real dispatch-side counterpart to
-    update_own_tenant_product (which only ever touched matching criteria,
-    never the tenants.alert_emails/min_alert_score columns notifier.py's
-    dispatch_lead_alert_to_tenant reads). Before this existed, the
-    frontend's Settings modal wrote a notification email/threshold to
-    localStorage only — it looked saved, but automated alerts kept using
-    whatever create_self_provisioned_tenant set once at signup ([email],
-    7.5), forever.
+    """Where automated alerts go and at what score they fire.
 
-    telegram_chat_id closes the other half of that gap: the column existed
-    and notifier.py read it, but only scripts/provision_tenant.py's
-    --telegram-chat-id flag could ever set it, so Telegram alerts were
-    unreachable for every self-provisioned individual. None means "leave
-    whatever is stored alone" (the caller didn't submit the field);
-    clearing it is done by submitting an empty string, which is
-    normalised to SQL NULL so notifier.py's `if not chat_id` skip works
-    rather than the dispatcher trying to send to "".
+    telegram_chat_id None means "leave whatever is stored alone" (the
+    caller didn't submit the field); an empty string clears it to SQL NULL,
+    so notifier.py's `if not chat_id` skip works rather than the dispatcher
+    trying to send to "".
     """
     async with with_connection() as conn:
         if conn is None:
@@ -1151,72 +1163,43 @@ async def update_tenant_alert_settings(
         try:
             if telegram_chat_id is None:
                 await conn.execute(
-                    "UPDATE tenants SET alert_emails = $1, min_alert_score = $2 WHERE id = $3",
-                    alert_emails, min_alert_score, tenant_id,
+                    "UPDATE user_profiles SET alert_email = $1, min_alert_score = $2, "
+                    "updated_at = now() WHERE id = $3",
+                    alert_email, min_alert_score, user_id,
                 )
             else:
                 await conn.execute(
-                    "UPDATE tenants SET alert_emails = $1, min_alert_score = $2, telegram_chat_id = $3 WHERE id = $4",
-                    alert_emails, min_alert_score, telegram_chat_id.strip() or None, tenant_id,
+                    "UPDATE user_profiles SET alert_email = $1, min_alert_score = $2, "
+                    "telegram_chat_id = $3, updated_at = now() WHERE id = $4",
+                    alert_email, min_alert_score, telegram_chat_id.strip() or None, user_id,
                 )
         except asyncpg.exceptions.UndefinedTableError:
-            logger.warning("[DB] tenants not found — run tenants_schema.sql.")
+            logger.warning("[DB] user_profiles not found — run schema.sql.")
             return False
     return True
 
 
-async def delete_own_account(user_id: str) -> Dict[str, Any]:
-    """GDPR right-to-erasure path: a signed-in individual deleting their
-    own account. Removes their user_profiles row and, only if no other
-    identity still needs it, the tenant they own and everything keyed to
-    it (product line via tenants' ON DELETE CASCADE, pipeline deals and
-    their cascaded stage history, alert dispatch log).
+async def delete_own_account(user_id: str) -> bool:
+    """GDPR erasure of everything this app owns for one person.
 
-    "Only if no other identity still needs it" matters because
-    create_self_provisioned_tenant can link a second Supabase auth
-    identity (same email, different user_id) onto an existing tenant
-    instead of creating a duplicate — so more than one user_profiles row
-    can legitimately point at one tenant. Deleting account A must not
-    silently destroy account B's data.
+    A single DELETE is now sufficient: saved_deals and alert_dispatch_log
+    both carry `REFERENCES user_profiles(id) ON DELETE CASCADE`, and
+    deal_stage_history cascades from saved_deals, so the database does the
+    cleanup rather than a hand-maintained list of statements that drifts
+    every time a table is added.
 
-    product_bidding_deals/tenant_alert_dispatch_log are plain TEXT
-    tenant_id columns with no FK into tenants (see pipeline_schema.sql's
-    own comment on why), so they neither block nor cascade from the
-    tenants DELETE below — checked via to_regclass rather than
-    try/except, since Postgres aborts the whole transaction on the first
-    error and either table may not exist yet in every environment.
-
-    Returns {"deleted", "tenant_deleted", "tenant_id"}. "deleted" is False
-    only when there was no account to delete at all (already gone, or no
-    database configured) — this function does not raise for that case,
-    matching every other function in this module's convention. Does NOT
-    touch the Supabase Auth identity itself (the auth.users row); see
-    security.delete_supabase_auth_identity for that half."""
+    Does NOT remove the Supabase Auth identity itself — see
+    security.delete_supabase_auth_identity for that half. Note the reverse
+    direction is also wired: user_profiles.id references auth.users with
+    ON DELETE CASCADE, so deleting the auth user removes all of this too.
+    """
     async with with_connection() as conn:
         if conn is None:
-            return {"deleted": False, "tenant_deleted": False, "tenant_id": None}
+            return False
         try:
-            async with conn.transaction():
-                profile = await conn.fetchrow("SELECT tenant_id FROM user_profiles WHERE id = $1", user_id)
-                if profile is None:
-                    return {"deleted": False, "tenant_deleted": False, "tenant_id": None}
-                tenant_id = profile["tenant_id"]
-
-                await conn.execute("DELETE FROM user_profiles WHERE id = $1", user_id)
-
-                tenant_deleted = False
-                if tenant_id:
-                    remaining = await conn.fetchval(
-                        "SELECT COUNT(*) FROM user_profiles WHERE tenant_id = $1", tenant_id
-                    )
-                    if remaining == 0:
-                        if await conn.fetchval("SELECT to_regclass('tenant_alert_dispatch_log') IS NOT NULL"):
-                            await conn.execute("DELETE FROM tenant_alert_dispatch_log WHERE tenant_id = $1", tenant_id)
-                        if await conn.fetchval("SELECT to_regclass('product_bidding_deals') IS NOT NULL"):
-                            await conn.execute("DELETE FROM product_bidding_deals WHERE tenant_id = $1", tenant_id)
-                        await conn.execute("DELETE FROM tenants WHERE id = $1", tenant_id)  # cascades tenant_products
-                        tenant_deleted = True
+            result = await conn.execute("DELETE FROM user_profiles WHERE id = $1", user_id)
         except asyncpg.exceptions.UndefinedTableError:
-            logger.warning("[DB] user_profiles/tenants not found — run tenants_schema.sql.")
-            return {"deleted": False, "tenant_deleted": False, "tenant_id": None}
-    return {"deleted": True, "tenant_deleted": tenant_deleted, "tenant_id": tenant_id}
+            logger.warning("[DB] user_profiles not found — run schema.sql.")
+            return False
+    # asyncpg returns the command tag, e.g. "DELETE 1" / "DELETE 0".
+    return result.rsplit(" ", 1)[-1] != "0"

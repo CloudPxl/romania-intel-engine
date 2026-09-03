@@ -23,22 +23,24 @@ def run_suite():
         t0 = time.time()
         conn = psycopg2.connect(DB_URL, connect_timeout=5)
         cursor = conn.cursor()
-        cursor.execute("SELECT count(*) FROM tenants;")
-        t_cnt = cursor.fetchone()[0]
-        cursor.execute("SELECT count(*) FROM structured_intel;")
+        cursor.execute("SELECT count(*) FROM user_profiles;")
+        u_cnt = cursor.fetchone()[0]
+        cursor.execute("SELECT count(*) FROM opportunities;")
         l_cnt = cursor.fetchone()[0]
         conn.close()
-        results.append(("Supabase PostgreSQL", "PASS", f"{t_cnt} tenants, {l_cnt} structured leads", f"{(time.time()-t0)*1000:.1f}ms"))
+        results.append(("Supabase PostgreSQL", "PASS", f"{u_cnt} users, {l_cnt} opportunities", f"{(time.time()-t0)*1000:.1f}ms"))
     except Exception as e:
         results.append(("Supabase PostgreSQL", "FAIL", str(e)[:40], "-"))
 
     endpoints = [
         ("Root API Status", "GET", f"{RENDER_API}/", None),
-        ("List All Tenants", "GET", f"{RENDER_API}/api/v1/tenants", None),
-        ("Tenant Feed (Infra Transilvania)", "GET", f"{RENDER_API}/api/v1/tenants/t1_infra_transilvania/feed", None),
-        ("xAI Grok Market Analytics", "GET", f"{RENDER_API}/api/v1/tenants/t1_infra_transilvania/analytics", None),
-        ("CSV Export Stream", "GET", f"{RENDER_API}/api/v1/tenants/t1_infra_transilvania/export/csv", None),
-        ("User Auth Profile (/me)", "GET", f"{RENDER_API}/api/v1/auth/me?email=andrei.muresan@infraconstruct.ro", None),
+        # Every user-scoped route now takes its identity from the bearer
+        # token, so an unauthenticated probe can only assert that they
+        # reject it — which is itself the check worth making.
+        ("System Status", "GET", f"{RENDER_API}/api/v1/system/status", None),
+        ("Market Trends (public)", "GET", f"{RENDER_API}/api/v1/analysis/market-trends", None),
+        ("My Feed (expects 401)", "GET", f"{RENDER_API}/api/v1/me/feed", None),
+        ("My Profile (expects 401)", "GET", f"{RENDER_API}/api/v1/me", None),
     ]
 
     with httpx.Client(timeout=15.0) as client:

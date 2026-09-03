@@ -23,7 +23,7 @@ from scrapers.matrix.municipal_scrapers import (
 from scrapers.matrix.municipal_matrix import CountyRegistryScraper
 from scrapers.ted_scraper import TedRomaniaScraper
 from ai_refinery import IntelligenceRefineryEngine
-from matching_engine import TENANT_ORGANIZATIONS, TenantMatchingEngine
+from matching_engine import RelevanceEngine
 from notifier import LeadAlertDispatcher
 
 logger = logging.getLogger("OpportunityOrchestrator")
@@ -152,7 +152,7 @@ class OpportunityOrchestrator:
         cutover (/api/v1/system/tick): only scrapers whose own
         poll_interval_minutes has elapsed are run, results are processed as
         each scraper finishes (asyncio.as_completed, not gather-then-wait),
-        and each genuinely new opportunity is matched + alerted per tenant
+        and each genuinely new opportunity is matched + alerted per user
         immediately rather than in a final batch loop.
 
         The tick enforces its own soft deadline and always records its
@@ -171,6 +171,15 @@ class OpportunityOrchestrator:
             return deadline_seconds - (time.monotonic() - started)
 
         tick_id = await db.start_tick()
+
+        # Read once per tick and passed down, never held in a module-level
+        # cache. The previous design cached this config in matching_engine
+        # and had to mutate it in place forever after, because two modules
+        # had bound the dict by reference at import time — reassigning it
+        # would have left them matching against stale config with no error
+        # anywhere. A local has no aliasing hazard, and one SELECT against
+        # a run that already takes minutes costs nothing.
+        profiles = await db.get_onboarded_profiles()
         due = []
         for scraper in self.scrapers:
             if await circuit_breaker.is_open(scraper.name):
@@ -235,16 +244,16 @@ class OpportunityOrchestrator:
                     if not is_new:
                         continue
                     new_count += 1
-                    for tenant_id in TENANT_ORGANIZATIONS:
-                        match = TenantMatchingEngine.evaluate_opportunity_for_tenant(refined, tenant_id)
+                    for profile in profiles:
+                        match = RelevanceEngine.evaluate(refined, profile)
                         if match["is_match"]:
                             try:
-                                await LeadAlertDispatcher.dispatch_lead_alert_to_tenant(refined, tenant_id, match)
+                                await LeadAlertDispatcher.dispatch_lead_alert_to_user(refined, profile, match)
                             except Exception as e:
                                 # A failing mail/Telegram transport must not
                                 # abort ingestion of the remaining signals.
                                 errors += 1
-                                logger.error(f"[Tick] Alert dispatch failed for {tenant_id}: {e}")
+                                logger.error(f"[Tick] Alert dispatch failed for {profile.get('id')}: {e}")
 
                 if truncated:
                     break

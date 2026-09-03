@@ -44,10 +44,10 @@ STAGE_WIN_PROBABILITY: Dict[str, float] = {
 # an id from old fixture data that no longer exists in any source. It
 # appeared in the live pipeline as though a real bid were in progress,
 # with a real assignee email and an 18.2M RON value attached to nothing.
-# Starting empty is both accurate and what a new tenant should see.
+# Starting empty is both accurate and what a new user should see.
 #
-# The real store is Postgres (pipeline_schema.sql: product_bidding_deals,
-# deal_stage_history), via db.py's get_deals_for_tenant/add_deal/
+# The real store is Postgres (schema.sql: saved_deals,
+# deal_stage_history), via db.py's get_deals_for_user/add_deal/
 # update_deal/record_stage_transition. This dict is only touched when
 # those return "not available" (DATABASE_URL unset, or the migration
 # hasn't been applied yet) — every write also lands here so a session
@@ -61,25 +61,20 @@ class ConcurrentWorkflowEngine:
         return PIPELINE_STAGES
 
     @staticmethod
-    async def get_tenant_pipeline(tenant_id: str, product_id: Optional[str] = None) -> List[Dict[str, Any]]:
-        deals = await db.get_deals_for_tenant(tenant_id, product_id)
+    async def get_pipeline_for_user(user_id: str) -> List[Dict[str, Any]]:
+        deals = await db.get_deals_for_user(user_id)
         if deals is not None:
             return deals
-        deals = CONCURRENT_DEAL_PIPELINE.get(tenant_id, [])
-        if product_id:
-            return [d for d in deals if d.get("product_id") == product_id]
-        return deals
+        return CONCURRENT_DEAL_PIPELINE.get(user_id, [])
 
     @staticmethod
-    async def add_lead_to_pipeline(tenant_id: str, lead_data: Dict[str, Any]) -> Dict[str, Any]:
+    async def add_lead_to_pipeline(user_id: str, lead_data: Dict[str, Any]) -> Dict[str, Any]:
         deal = {
             "deal_id": f"DEAL-{uuid.uuid4().hex[:10].upper()}",
-            "tenant_id": tenant_id,
-            "product_id": lead_data.get("product_id"),
+            "user_id": user_id,
             "opportunity_id": lead_data.get("source_id") or lead_data.get("opportunity_id"),
             "project_title": lead_data.get("project_title", ""),
             "stage": "discovery",
-            "assigned_to": lead_data.get("assigned_to"),
             "target_margin_pct": lead_data.get("target_margin_pct"),
             "estimated_value_ron": lead_data.get("estimated_value_ron") or lead_data.get("financial_value_ron", 0.0),
             "notes": lead_data.get("notes", ""),
@@ -87,13 +82,13 @@ class ConcurrentWorkflowEngine:
         }
         persisted = await db.add_deal(deal)
         if not persisted:
-            CONCURRENT_DEAL_PIPELINE.setdefault(tenant_id, []).append(deal)
-        logger.info(f"➕ Lead added to pipeline for {tenant_id}: {deal['deal_id']} (persisted={persisted})")
+            CONCURRENT_DEAL_PIPELINE.setdefault(user_id, []).append(deal)
+        logger.info(f"➕ Lead added to pipeline for {user_id}: {deal['deal_id']} (persisted={persisted})")
         return {"status": "success", "deal": deal}
 
     @staticmethod
     async def update_deal_stage(
-        tenant_id: str,
+        user_id: str,
         deal_id: str,
         new_stage: str,
         notes: Optional[str] = None,
@@ -114,11 +109,11 @@ class ConcurrentWorkflowEngine:
         if proposed_price is not None and proposed_price < 0:
             return {"status": "error", "message": "Prețul propus nu poate fi negativ."}
 
-        existing = await db.get_deal(tenant_id, deal_id)
+        existing = await db.get_deal(user_id, deal_id)
         if existing is not None:
             updated_at = datetime.now().isoformat()
             previous_stage = existing.get("stage")
-            updated_deal = await db.update_deal(tenant_id, deal_id, new_stage, notes, proposed_price, updated_at)
+            updated_deal = await db.update_deal(user_id, deal_id, new_stage, notes, proposed_price, updated_at)
             if updated_deal is not None:
                 await db.record_stage_transition(deal_id, previous_stage, new_stage, updated_at)
                 updated_deal.setdefault("stage_history", []).append({
@@ -129,7 +124,7 @@ class ConcurrentWorkflowEngine:
 
         # Fallback: in-memory (also the path for a deal added while
         # Postgres was unavailable, which never made it into the DB).
-        deals = CONCURRENT_DEAL_PIPELINE.get(tenant_id, [])
+        deals = CONCURRENT_DEAL_PIPELINE.get(user_id, [])
         for d in deals:
             if d.get("deal_id") == deal_id:
                 previous_stage = d.get("stage")
@@ -194,14 +189,14 @@ class ConcurrentWorkflowEngine:
         return durations
 
     @staticmethod
-    async def get_pipeline_metrics(tenant_id: str, product_id: Optional[str] = None) -> Dict[str, Any]:
-        """Real pipeline analytics over the tenant's current deals: value
+    async def get_pipeline_metrics(user_id: str) -> Dict[str, Any]:
+        """Real pipeline analytics over the user's current deals: value
         weighted by stage-based win probability, actual time spent per
         stage (from transition timestamps, not estimated), and funnel
         conversion rates derived from which stages each deal has actually
         reached — not fixed/seeded numbers.
         """
-        deals = await ConcurrentWorkflowEngine.get_tenant_pipeline(tenant_id, product_id)
+        deals = await ConcurrentWorkflowEngine.get_pipeline_for_user(user_id)
         now = datetime.now()
 
         total_deals = len(deals)
@@ -251,8 +246,6 @@ class ConcurrentWorkflowEngine:
         closed = len(won) + len(lost)
 
         return {
-            "tenant_id": tenant_id,
-            "product_id": product_id,
             "total_deals": total_deals,
             "active_deals": len(active),
             "won_deals": len(won),
