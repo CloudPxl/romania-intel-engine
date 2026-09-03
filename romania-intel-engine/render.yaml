@@ -35,11 +35,12 @@ services:
       # NOT the anon key. Powers the one Admin API call
       # security.delete_supabase_auth_identity makes: removing the
       # auth.users row itself when a user deletes their own account via
-      # DELETE /api/v1/account. Unset is a real, supported state (that
+      # DELETE /api/v1/me. Unset is a real, supported state (that
       # function returns False and logs it rather than raising) — the
-      # app-side data (tenant/product/profile) is still fully deleted
-      # either way, only the login credential is left needing manual
-      # removal from the dashboard until this is configured.
+      # app-side data (the profile row, and everything the database
+      # cascades from it) is still fully deleted either way, only the
+      # login credential is left needing manual removal from the
+      # dashboard until this is configured.
       - key: SUPABASE_SERVICE_ROLE_KEY
         sync: false
       - key: GROK_API_KEY

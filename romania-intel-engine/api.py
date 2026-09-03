@@ -681,7 +681,7 @@ async def sync_user_auth(payload: AuthSyncRequest, user: dict = Depends(require_
         "profile": profile,
     }
 
-@app.delete("/api/v1/account")
+@app.delete("/api/v1/me")
 async def delete_own_account_route(user: dict = Depends(require_auth)):
     """Self-serve GDPR erasure — this identity's own account, on their own
     request, no admin involved. Splits into two independent halves and is
