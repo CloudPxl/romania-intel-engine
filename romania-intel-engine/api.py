@@ -820,6 +820,13 @@ async def complete_onboarding(
     if profile is None:
         raise HTTPException(status_code=409, detail="Contul dvs. este deja configurat.")
 
+    # A /me/feed call issued before onboarding finished (e.g. the UI
+    # peeking at the market while criteria don't exist yet) can leave a
+    # pre-onboarding, unranked snapshot cached under this exact user_id.
+    # Without dropping it, the first post-onboarding feed load can still
+    # serve that stale entry instead of the newly-ranked one.
+    global_cache.invalidate(prefix=f"feed:{user['user_id']}:")
+
     try:
         await LeadAlertDispatcher.dispatch_admin_alert(
             "🆕 Cont nou pe RO-INTEL\n"
@@ -854,6 +861,11 @@ async def update_my_profile(payload: OnboardingRequest, user: dict = Depends(req
     })
     if profile is None:
         raise HTTPException(status_code=503, detail="Nu s-a putut salva profilul — baza de date este indisponibilă.")
+
+    # Without this, a changed county/keyword/domain can still rank via the
+    # old criteria for up to 60s (get_my_feed's cache TTL) after saving.
+    global_cache.invalidate(prefix=f"feed:{user['user_id']}:")
+
     return {"status": "updated", "profile": profile}
 
 

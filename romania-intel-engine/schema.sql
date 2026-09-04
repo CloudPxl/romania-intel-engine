@@ -170,6 +170,14 @@ CREATE INDEX IF NOT EXISTS idx_opportunities_last_seen ON opportunities(last_see
 CREATE INDEX IF NOT EXISTS idx_opportunities_county_lower ON opportunities(lower(county));
 CREATE INDEX IF NOT EXISTS idx_opportunities_category_lower ON opportunities(lower(category));
 
+-- get_ranked_opportunities runs `search_blob ~ ANY(...)` on every
+-- /me/feed request (keyword and exclusion matching) — without an index
+-- that's a sequential scan over the whole table on every call. pg_trgm's
+-- GIN opclass lets Postgres use the index for '~'/'~*' pattern matches.
+CREATE EXTENSION IF NOT EXISTS pg_trgm;
+CREATE INDEX IF NOT EXISTS idx_opportunities_search_blob_trgm
+    ON opportunities USING gin (search_blob gin_trgm_ops);
+
 
 -- Per-scraper scheduling and circuit-breaker state. One row per source.
 CREATE TABLE IF NOT EXISTS source_run_log (
