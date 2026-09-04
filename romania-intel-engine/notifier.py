@@ -50,17 +50,30 @@ class LeadAlertDispatcher:
             if sent:
                 return True
         recipients = [e.strip() for e in NOTIFICATION_EMAIL_TO.split(",") if e.strip()]
-        if not recipients:
-            return False
-        return await asyncio.to_thread(
-            cls._send_email_sync, recipients, "[RO-INTEL] Alertă Sistem", f"<pre>{text}</pre>", text
-        )
+        if recipients:
+            sent = await asyncio.to_thread(
+                cls._send_email_sync, recipients, "[RO-INTEL] Alertă Sistem", f"<pre>{text}</pre>", text
+            )
+            if sent:
+                return True
+        # Every live channel is unconfigured or failed. Every caller of this
+        # method only wraps it in try/except and never inspects the boolean
+        # return, so without this the alert would vanish with nothing to
+        # show for it anywhere — persist it so GET /api/v1/system/sources
+        # still surfaces it to whoever checks later.
+        logger.error(f"[AlertDispatcher] All admin-alert channels failed/unconfigured: {text[:200]}")
+        import db
+        try:
+            await db.record_system_alert(text)
+        except Exception as e:
+            logger.error(f"[AlertDispatcher] Failed to persist undelivered admin alert: {e}")
+        return False
 
     @staticmethod
     def _send_email_sync(to_emails: List[str], subject: str, html_body: str, text_body: str) -> bool:
         if not SMTP_HOST or not SMTP_USER or not SMTP_PASSWORD:
-            logger.info(f"📧 [Email Alert Local Engine Simulated] To: {to_emails} | Subject: {subject}")
-            return True
+            logger.warning(f"[Email] SMTP_HOST/SMTP_USER/SMTP_PASSWORD not set — email alert not sent. To: {to_emails} | Subject: {subject}")
+            return False
         try:
             msg = MIMEMultipart("alternative")
             msg["Subject"] = subject

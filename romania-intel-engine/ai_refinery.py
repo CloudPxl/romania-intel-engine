@@ -1,5 +1,6 @@
 import logging
-from datetime import date, datetime
+import os
+from datetime import date, datetime, timedelta
 from typing import Any, Dict, Optional
 
 from scrapers.models import RawInstitutionalSignal
@@ -14,6 +15,23 @@ logger = logging.getLogger("AIRefinery")
 # every signal 7.5-10.0, so callers still testing `>= 9.2` would have
 # quietly stopped alerting altogether once the scale was corrected).
 HIGH_PRIORITY_SCORE = 7.0
+
+# Upper sanity bound in RON. No live parser can currently produce a value
+# this large from a real notice — the biggest individual Romanian public
+# contracts (motorway mega-lots, hospital builds) sit one to two orders of
+# magnitude below this — so a value at or above it means a parser misread
+# a field (wrong currency scale, a decimal point, the wrong JSON key), not
+# a genuinely enormous contract. Configurable so a real outlier doesn't
+# need a redeploy to accept.
+MAX_PLAUSIBLE_VALUE_RON = float(os.getenv("MAX_PLAUSIBLE_VALUE_RON", "10000000000"))  # 10bn RON
+
+# Plausibility bounds for source-published dates. This pipeline only
+# ingests currently-live announcements, so nothing genuine predates this
+# floor; the ceilings catch a mis-parsed/transposed year rather than a
+# genuinely long-dated deadline.
+MIN_PLAUSIBLE_DATE = date(2015, 1, 1)
+MAX_FUTURE_DEADLINE_DAYS = 365 * 5   # action_deadline: up to 5 years out
+MAX_FUTURE_PUBLISHED_DAYS = 7        # published_date: essentially "not in the future"
 
 # Value bands in RON. Unknown (0.0) is treated as unknown, not as "small":
 # most genuinely early signals (CNI register rows, ministry notices, EU
@@ -113,6 +131,26 @@ def _parse_date(value: Any) -> Optional[date]:
         return None
 
 
+def _plausible_date(
+    value: Any, *, max_future_days: int, field: str, signal: RawInstitutionalSignal
+) -> Optional[date]:
+    """Parses, then rejects anything implausibly old or far in the future —
+    a mis-parsed/transposed year rather than a genuinely long-dated
+    deadline. Rejection nulls just this field (matching this file's
+    existing convention for a missing deadline) rather than discarding an
+    otherwise-good signal over one bad date."""
+    parsed = _parse_date(value)
+    if parsed is None:
+        return None
+    if parsed < MIN_PLAUSIBLE_DATE or parsed > date.today() + timedelta(days=max_future_days):
+        logger.warning(
+            f"[AIRefinery] Implausible {field} ({parsed.isoformat()}) from "
+            f"{signal.source_type}/{signal.source_id} — dropping field, keeping the rest of the signal."
+        )
+        return None
+    return parsed
+
+
 class IntelligenceRefineryEngine:
     @staticmethod
     def _infer_stage(signal: RawInstitutionalSignal) -> str:
@@ -201,6 +239,19 @@ class IntelligenceRefineryEngine:
                 f"{signal.source_id} — treating as unpublished; check that scraper's value parser."
             )
             value = 0.0
+        elif value > MAX_PLAUSIBLE_VALUE_RON:
+            # A wildly-wrong number is worse than a missing one for a
+            # product whose whole pitch is "the value you see is the value
+            # the source published" — treated as unpublished, same as the
+            # negative-value branch above, not clamped to the ceiling
+            # (which would display a figure the source never published
+            # either).
+            logger.warning(
+                f"[AIRefinery] Implausible estimated_value_ron ({value:,.0f} RON) from "
+                f"{signal.source_type}/{signal.source_id} — treating as unpublished; "
+                f"check that scraper's value parser/currency handling."
+            )
+            value = 0.0
         stage = IntelligenceRefineryEngine._infer_stage(signal)
         stage_profile = STAGE_PROFILES.get(stage, STAGE_PROFILES["unknown"])
 
@@ -224,8 +275,19 @@ class IntelligenceRefineryEngine:
         drivers.append(stage_profile["label"])
 
         # Deadline urgency, computed from the real deadline when the source
-        # published one.
-        deadline = _parse_date(signal.action_deadline)
+        # published one. Both dates go through the same plausibility bound
+        # (a mis-parsed/transposed year rather than a genuinely long-dated
+        # deadline) so a parser regression can't put an implausible date in
+        # front of a user — published_date previously wasn't parsed or
+        # validated at this layer at all.
+        deadline = _plausible_date(
+            signal.action_deadline, max_future_days=MAX_FUTURE_DEADLINE_DAYS,
+            field="action_deadline", signal=signal,
+        )
+        published = _plausible_date(
+            signal.published_date, max_future_days=MAX_FUTURE_PUBLISHED_DAYS,
+            field="published_date", signal=signal,
+        )
         days_left: Optional[int] = None
         if deadline:
             days_left = (deadline - date.today()).days
@@ -280,8 +342,12 @@ class IntelligenceRefineryEngine:
             "entity_name": signal.entity_name,
             "financial_value_ron": value,
             "value_is_published": value > 0.0,
-            "published_date": signal.published_date,
-            "action_deadline": signal.action_deadline,
+            # Routed through the plausibility-checked local values, not the
+            # raw signal strings — db.upsert_opportunity re-parses whatever
+            # is in this dict independently, so without this an implausible
+            # date rejected above would still reach persistence unchanged.
+            "published_date": published.isoformat() if published else None,
+            "action_deadline": deadline.isoformat() if deadline else None,
             "executive_summary": signal.raw_description,
             "sales_pitch_angle": IntelligenceRefineryEngine._build_pitch(signal, stage),
             "funding_source": IntelligenceRefineryEngine._infer_funding(signal),

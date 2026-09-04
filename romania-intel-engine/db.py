@@ -245,6 +245,34 @@ async def upsert_opportunity(record: Dict[str, Any]) -> bool:
                 $15, $16, $17, $18, $19, $20, $21, now()
             )
             ON CONFLICT (source_id) DO UPDATE SET
+                -- Every column except source_id (the conflict key) and
+                -- first_seen_at (never read anywhere in this codebase —
+                -- confirmed by grep — and must stay the true first-seen
+                -- timestamp) refreshes unconditionally on every re-scrape.
+                -- These 15 used to freeze at whatever was scraped on first
+                -- sighting, so a source correcting a typo'd title, county
+                -- or entity name on a later poll was silently ignored
+                -- forever. "Latest scrape wins" is already the policy for
+                -- the other 6 columns below; a partial list here would be
+                -- an arbitrary asymmetry, and a "keep old value if new one
+                -- is blank" guard would put search_blob (always recomputed
+                -- from the *current* raw fields) out of sync with whatever
+                -- field it's supposed to index.
+                source_type = EXCLUDED.source_type,
+                category = EXCLUDED.category,
+                sub_category = EXCLUDED.sub_category,
+                county = EXCLUDED.county,
+                locality = EXCLUDED.locality,
+                entity_name = EXCLUDED.entity_name,
+                project_title = EXCLUDED.project_title,
+                caen_codes = EXCLUDED.caen_codes,
+                cpv_code = EXCLUDED.cpv_code,
+                published_date = EXCLUDED.published_date,
+                executive_summary = EXCLUDED.executive_summary,
+                sales_pitch_angle = EXCLUDED.sales_pitch_angle,
+                funding_source = EXCLUDED.funding_source,
+                source_url = EXCLUDED.source_url,
+                document_url = EXCLUDED.document_url,
                 estimated_value_ron = EXCLUDED.estimated_value_ron,
                 action_deadline = EXCLUDED.action_deadline,
                 opportunity_score = EXCLUDED.opportunity_score,
@@ -543,25 +571,41 @@ async def record_source_run(
     records: int,
     error: Optional[str] = None,
     poll_interval_minutes: int = 360,
-) -> None:
+) -> Optional[Dict[str, Any]]:
+    """Returns the post-write zero-streak state on SUCCESS (None on ERROR or
+    no database) so circuit_breaker.record_result can decide whether to fire
+    the independent "gone quiet without erroring" alert — see
+    scrapers/circuit_breaker.py's STALE_ZERO_STREAK_* constants."""
     async with with_connection() as conn:
         if conn is None:
-            return
+            return None
         if status == "SUCCESS":
-            await conn.execute(
+            row = await conn.fetchrow(
                 """
                 INSERT INTO source_run_log (source_name, poll_interval_minutes, last_run_at,
-                    last_success_at, last_error, consecutive_failures, records_last_run)
-                VALUES ($1, $2, now(), now(), NULL, 0, $3)
+                    last_success_at, last_error, consecutive_failures, records_last_run,
+                    consecutive_zero_result_runs, stale_alert_fired_at)
+                VALUES ($1, $2, now(), now(), NULL, 0, $3, CASE WHEN $3 = 0 THEN 1 ELSE 0 END, NULL)
                 ON CONFLICT (source_name) DO UPDATE SET
                     last_run_at = now(),
                     last_success_at = now(),
                     last_error = NULL,
                     consecutive_failures = 0,
-                    records_last_run = EXCLUDED.records_last_run
+                    records_last_run = EXCLUDED.records_last_run,
+                    -- Refreshed on every run (previously frozen at first
+                    -- insert) so a code-level poll_interval_minutes change
+                    -- takes effect without a manual DB reset — the
+                    -- staleness math below depends on it being current.
+                    poll_interval_minutes = EXCLUDED.poll_interval_minutes,
+                    consecutive_zero_result_runs = CASE WHEN EXCLUDED.records_last_run = 0
+                        THEN source_run_log.consecutive_zero_result_runs + 1 ELSE 0 END,
+                    stale_alert_fired_at = CASE WHEN EXCLUDED.records_last_run = 0
+                        THEN source_run_log.stale_alert_fired_at ELSE NULL END
+                RETURNING consecutive_zero_result_runs, poll_interval_minutes, stale_alert_fired_at
                 """,
                 source_name, poll_interval_minutes, records,
             )
+            return dict(row) if row else None
         else:
             await conn.execute(
                 """
@@ -629,6 +673,20 @@ async def close_circuit(source_name: str) -> None:
         )
 
 
+async def mark_stale_alert_fired(source_name: str) -> None:
+    """Marks the current zero-result streak as already alerted on, so
+    circuit_breaker's staleness watchdog fires once per streak rather than
+    once per tick past the threshold. Cleared automatically (via
+    record_source_run's UPDATE) the moment the source returns a non-zero
+    result again."""
+    async with with_connection() as conn:
+        if conn is None:
+            return
+        await conn.execute(
+            "UPDATE source_run_log SET stale_alert_fired_at = now() WHERE source_name = $1", source_name
+        )
+
+
 async def has_alert_been_dispatched(user_id: str, source_id: str, channel: str) -> bool:
     """False when there is no database — so an outage re-sends an alert
     rather than dropping it. Duplicates are recoverable; a lead nobody was
@@ -665,6 +723,54 @@ async def record_alert_dispatch(user_id: str, source_id: str, channel: str) -> N
             )
         except asyncpg.exceptions.UndefinedTableError:
             logger.warning("[DB] alert_dispatch_log not found — run schema.sql.")
+
+
+async def record_system_alert(message: str) -> None:
+    """Last-resort durable record for an admin alert that reached no live
+    channel (see notifier.py:dispatch_admin_alert). Prunes to the most
+    recent 200 rows — this is a visibility backstop, not an audit log."""
+    async with with_connection() as conn:
+        if conn is None:
+            return
+        try:
+            await conn.execute("INSERT INTO system_alerts (message) VALUES ($1)", message)
+            await conn.execute(
+                """
+                DELETE FROM system_alerts WHERE id NOT IN (
+                    SELECT id FROM system_alerts ORDER BY created_at DESC LIMIT 200
+                )
+                """
+            )
+        except asyncpg.exceptions.UndefinedTableError:
+            logger.warning("[DB] system_alerts not found — run schema.sql.")
+
+
+async def get_recent_system_alerts(limit: int = 20) -> List[Dict[str, Any]]:
+    async with with_connection() as conn:
+        if conn is None:
+            return []
+        try:
+            rows = await conn.fetch(
+                "SELECT created_at, message FROM system_alerts ORDER BY created_at DESC LIMIT $1", limit
+            )
+        except asyncpg.exceptions.UndefinedTableError:
+            logger.warning("[DB] system_alerts not found — run schema.sql.")
+            return []
+    return [dict(r) for r in rows]
+
+
+async def get_source_health() -> List[Dict[str, Any]]:
+    """Per-source ingestion health — the row-level detail behind
+    /api/v1/system/status's single fleet-wide is_stale number."""
+    async with with_connection() as conn:
+        if conn is None:
+            return []
+        try:
+            rows = await conn.fetch("SELECT * FROM source_run_log ORDER BY source_name")
+        except asyncpg.exceptions.UndefinedTableError:
+            logger.warning("[DB] source_run_log not found — run schema.sql.")
+            return []
+    return [dict(r) for r in rows]
 
 
 async def start_tick() -> Optional[int]:

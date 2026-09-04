@@ -192,6 +192,15 @@ CREATE TABLE IF NOT EXISTS source_run_log (
     records_last_run INT DEFAULT 0
 );
 
+-- A source can go quiet (return an honest but empty result) without ever
+-- throwing, which is invisible to the circuit breaker above — it only
+-- reacts to exceptions. These track a second, independent staleness
+-- signal: how many consecutive successful runs in a row returned zero
+-- records, and whether that streak has already been alerted on (so the
+-- alert fires once per streak, not once per tick past the threshold).
+ALTER TABLE source_run_log ADD COLUMN IF NOT EXISTS consecutive_zero_result_runs INT NOT NULL DEFAULT 0;
+ALTER TABLE source_run_log ADD COLUMN IF NOT EXISTS stale_alert_fired_at TIMESTAMPTZ;
+
 
 -- One row per ingestion run. `is_stale` on /api/v1/system/status reads
 -- the most recent error-free completed row; without this the watchdog
@@ -206,6 +215,20 @@ CREATE TABLE IF NOT EXISTS system_ticks (
 );
 
 CREATE INDEX IF NOT EXISTS idx_system_ticks_completed ON system_ticks(completed_at DESC);
+
+
+-- Last-resort durable record for admin alerts (circuit-breaker trips,
+-- source-staleness watchdog) that reached no live channel — Telegram
+-- unset/failed AND SMTP unset/failed. Visible via GET
+-- /api/v1/system/sources so an operator finds out even though nobody
+-- saw it in Telegram/email in real time. Not a full audit log —
+-- db.record_system_alert prunes to the most recent 200 rows.
+CREATE TABLE IF NOT EXISTS system_alerts (
+    id BIGSERIAL PRIMARY KEY,
+    created_at TIMESTAMPTZ DEFAULT now(),
+    message TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_system_alerts_created ON system_alerts(created_at DESC);
 
 
 -- Richer SEAP notices, additive to `opportunities` rather than replacing

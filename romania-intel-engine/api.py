@@ -535,6 +535,57 @@ async def system_status():
         ),
     }
 
+
+@app.get("/api/v1/system/sources")
+async def system_sources():
+    """Per-source ingestion health — the row-level counterpart to
+    /system/status's single fleet-wide is_stale number. source_run_log
+    already tracks this (last success, consecutive failures, circuit
+    state, zero-result streak); this is the first route that reads it.
+    Public and degrade-not-500 for the same reason /system/status is: no
+    user data, and a DB blip must not take down whoever is watching it."""
+    try:
+        rows = await db.get_source_health()
+    except Exception as e:
+        logger.error(f"[SystemSources] Could not read source_run_log: {e}")
+        return {"sources": [], "undelivered_admin_alerts": [], "degraded": True, "detail": "database unavailable"}
+
+    def _health(row: Dict[str, Any]) -> str:
+        if row["circuit_state"] == "open":
+            return "broken"
+        if row["circuit_state"] == "half_open" or row.get("stale_alert_fired_at") is not None:
+            return "degraded"
+        return "healthy"
+
+    sources = [
+        {
+            "source_name": r["source_name"],
+            "poll_interval_minutes": r["poll_interval_minutes"],
+            "last_run_at": r["last_run_at"].isoformat() if r["last_run_at"] else None,
+            "last_success_at": r["last_success_at"].isoformat() if r["last_success_at"] else None,
+            "last_error": r["last_error"],
+            "consecutive_failures": r["consecutive_failures"],
+            "circuit_state": r["circuit_state"],
+            "records_last_run": r["records_last_run"],
+            "consecutive_zero_result_runs": r.get("consecutive_zero_result_runs", 0),
+            "health": _health(r),
+        }
+        for r in rows
+    ]
+
+    try:
+        alerts = await db.get_recent_system_alerts(limit=20)
+    except Exception as e:
+        logger.error(f"[SystemSources] Could not read system_alerts: {e}")
+        alerts = []
+
+    return {
+        "sources": sources,
+        "undelivered_admin_alerts": [
+            {"created_at": a["created_at"].isoformat(), "message": a["message"]} for a in alerts
+        ],
+    }
+
 def _row_to_lead(row: Dict[str, Any]) -> Dict[str, Any]:
     """Converts a Postgres row into the JSON-serialisable lead shape the API
     already returns from the file cache.
