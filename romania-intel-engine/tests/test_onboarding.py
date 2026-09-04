@@ -138,6 +138,31 @@ class TestCompleteOnboarding:
         result = await db.complete_onboarding("u1", "a@b.ro", None, "sanatate", [], 0.0, ["rmn"], [])
         assert result is not None
 
+    @pytest.mark.asyncio
+    async def test_defaults_alert_score_and_leaves_telegram_null_when_omitted(self, monkeypatch):
+        """Callers written before these two params existed (and any caller
+        that just doesn't set alerts) must keep getting today's defaults."""
+        conn = FakeConnection(existing_onboarded_at=None)
+        monkeypatch.setattr(db, "with_connection", _with_connection(conn))
+        await db.complete_onboarding("u1", "ana@test.ro", "Ana", "sanatate", ["Cluj"], 0.0, ["rmn"], [])
+        _, args = conn.executed[0]
+        assert args[-2:] == (7.5, None)
+
+    @pytest.mark.asyncio
+    async def test_persists_supplied_alert_settings(self, monkeypatch):
+        """The whole point of folding these into onboarding: a value the
+        user actually chose must reach the same columns
+        PUT /api/v1/me/alert-settings writes, not silently fall back to the
+        default because onboarding forgot to pass it through."""
+        conn = FakeConnection(existing_onboarded_at=None)
+        monkeypatch.setattr(db, "with_connection", _with_connection(conn))
+        await db.complete_onboarding(
+            "u1", "ana@test.ro", "Ana", "sanatate", ["Cluj"], 0.0, ["rmn"], [],
+            9.0, "123456789",
+        )
+        _, args = conn.executed[0]
+        assert args[-2:] == (9.0, "123456789")
+
 
 class TestUpdateProfile:
     @pytest.mark.asyncio
@@ -281,6 +306,39 @@ class TestOnboardingRoute:
         r = self._post(min_value_ron=-1)
         assert r.status_code == 400
         assert "bugetului" in r.json()["detail"]
+
+    def test_rejects_out_of_range_alert_score(self):
+        r = self._post(min_alert_score=15)
+        assert r.status_code == 400
+        assert "Pragul de alertă" in r.json()["detail"]
+
+    def test_rejects_telegram_username_at_onboarding(self):
+        """Same rule as PUT /api/v1/me/alert-settings — validated by the
+        same shared helper, so this must fail identically here."""
+        r = self._post(telegram_chat_id="@ionpopescu")
+        assert r.status_code == 400
+        assert "numeric" in r.json()["detail"]
+
+    def test_valid_alert_settings_reach_the_db_layer(self, monkeypatch):
+        """The point of folding alert settings into onboarding: a value the
+        user actually chose must reach db.complete_onboarding, not get
+        silently dropped on the way from the request model."""
+        captured = {}
+
+        async def fake_complete_onboarding(user_id, email, display_name, domain,
+                                            target_counties, min_value_ron,
+                                            keywords, exclude_keywords,
+                                            min_alert_score=7.5, telegram_chat_id=None):
+            captured["min_alert_score"] = min_alert_score
+            captured["telegram_chat_id"] = telegram_chat_id
+            return {"onboarded_at": "2026-01-01T00:00:00", "domain": domain}
+
+        monkeypatch.setattr(db, "DATABASE_URL", "postgres://fake")
+        monkeypatch.setattr(db, "complete_onboarding", fake_complete_onboarding)
+        r = self._post(min_alert_score=9.0, telegram_chat_id=" 123456789 ")
+        assert r.status_code == 200
+        assert captured["min_alert_score"] == 9.0
+        assert captured["telegram_chat_id"] == "123456789"
 
     def test_rate_limited_after_repeated_attempts(self):
         """The global 180/60s budget is no obstacle to a script cycling

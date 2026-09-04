@@ -485,6 +485,15 @@ async def get_ranked_opportunities(
             ($4::numeric > 0 AND estimated_value_ron >= $4) AS value_hit,
             (COALESCE(search_blob, '') ~ ANY($5::text[])) AS excluded_hit,
             (
+                (
+                     COALESCE(search_blob, '') ~ ANY($1::text[])
+                  OR {_PG_COUNTY_KEY.format(col='county')} = ANY($2::text[])
+                  OR ($3::text IS NOT NULL AND lower(category) = $3)
+                  OR ($4::numeric > 0 AND estimated_value_ron >= $4)
+                )
+                AND NOT (COALESCE(search_blob, '') ~ ANY($5::text[]))
+            ) AS is_match,
+            (
                 CASE WHEN COALESCE(search_blob, '') ~ ANY($1::text[]) THEN {w['keyword']} ELSE 0 END
               + CASE WHEN {_PG_COUNTY_KEY.format(col='county')} = ANY($2::text[]) THEN {w['county']} ELSE 0 END
               + CASE WHEN $3::text IS NOT NULL AND lower(category) = $3 THEN {w['domain']} ELSE 0 END
@@ -493,7 +502,16 @@ async def get_ranked_opportunities(
               + COALESCE(opportunity_score, 0)
             ) AS relevance
         FROM opportunities
-        ORDER BY relevance DESC, last_seen_at DESC
+        -- A blended numeric score only makes a match LIKELY to rank first —
+        -- a non-match with a high enough opportunity_score can still
+        -- outscore a weak match (e.g. a county-only hit is +20; a non-match
+        -- with opportunity_score 9 vs a match's 3 wins on the old ORDER BY
+        -- relevance DESC alone). is_match is a strict partition: every real
+        -- match (any hit, not excluded — same definition api.py's
+        -- _ranked_row_to_lead uses for the UI's is_match badge) outranks
+        -- every non-match, unconditionally. relevance still orders within
+        -- each half.
+        ORDER BY is_match DESC, relevance DESC, last_seen_at DESC
         LIMIT $6
     """
     # `~ ANY('{}')` on an empty array is false for every row, so a user who
@@ -1065,8 +1083,17 @@ async def complete_onboarding(
     min_value_ron: float,
     keywords: List[str],
     exclude_keywords: List[str],
+    min_alert_score: float = 7.5,
+    telegram_chat_id: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
     """Turns a bare signed-in row into a configured profile.
+
+    Alert settings are collected on the same form now (matching criteria +
+    how the user gets notified, in one sitting) rather than requiring a
+    second visit to the criteria editor — so this writes them too, not just
+    the matching criteria. There is no COALESCE-guard on these two the way
+    there is on alert_email below: onboarding is gated on `onboarded_at IS
+    NULL`, so there is never a prior user choice here to protect.
 
     Returns the profile on success, None when there is no database or the
     user has already onboarded (the route turns the latter into a 409 and
@@ -1103,8 +1130,8 @@ async def complete_onboarding(
                     INSERT INTO user_profiles (
                         id, email, display_name, domain, target_counties,
                         min_value_ron, keywords, exclude_keywords,
-                        alert_email, min_alert_score, onboarded_at
-                    ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $2, 7.5, now())
+                        alert_email, min_alert_score, telegram_chat_id, onboarded_at
+                    ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $2, $9, $10, now())
                     ON CONFLICT (id) DO UPDATE SET
                         email = EXCLUDED.email,
                         display_name = EXCLUDED.display_name,
@@ -1116,12 +1143,15 @@ async def complete_onboarding(
                         -- Alerts default to the signup address, but never
                         -- overwrite one the user has already chosen.
                         alert_email = COALESCE(user_profiles.alert_email, EXCLUDED.alert_email),
+                        min_alert_score = EXCLUDED.min_alert_score,
+                        telegram_chat_id = EXCLUDED.telegram_chat_id,
                         onboarded_at = now(),
                         updated_at = now()
                     RETURNING {_PROFILE_COLUMNS}
                     """,
                     user_id, email, display_name, domain, target_counties,
                     min_value_ron, keywords, exclude_keywords,
+                    min_alert_score, telegram_chat_id,
                 )
                 return _profile_row_to_dict(row) if row else None
         except asyncpg.exceptions.UndefinedTableError:

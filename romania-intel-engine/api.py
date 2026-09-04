@@ -140,6 +140,7 @@ ALLOWED_ORIGIN_REGEX = r"https://.*\.vercel\.app"
 app.include_router(eligibility.router)
 app.include_router(drafting.router)
 app.include_router(analysis.router)
+app.include_router(analysis.me_router)
 
 
 def _cors_headers(request: Request) -> Dict[str, str]:
@@ -265,6 +266,16 @@ class OnboardingRequest(BaseModel):
     min_value_ron: float = 0.0
     keywords: List[str] = []
     exclude_keywords: List[str] = []
+    # The full customization surface — matching criteria AND how the user
+    # gets notified — is set in one sitting now, rather than requiring a
+    # second visit to the criteria editor just to turn on alerts. Same
+    # defaults as AlertSettingsRequest below; validated by the same shared
+    # helper (_validate_alert_fields) so the two routes can't drift.
+    # PUT /api/v1/me/profile also accepts this model but ignores both —
+    # editing alert settings after onboarding still goes through the
+    # dedicated PUT /api/v1/me/alert-settings route.
+    min_alert_score: float = 7.5
+    telegram_chat_id: Optional[str] = None
     # Only meaningful on the initial POST /api/v1/me/onboarding (see the
     # check there) — an existing user re-editing their criteria via
     # PUT /api/v1/me/profile isn't asked to re-accept anything, so this
@@ -336,6 +347,31 @@ def _validated_domain(payload: "OnboardingRequest") -> str:
             detail="Adăugați cel puțin un cuvânt-cheie, altfel nu veți primi nicio oportunitate relevantă.",
         )
     return domain
+
+
+def _validate_alert_fields(min_alert_score: float, telegram_chat_id: Optional[str]) -> Optional[str]:
+    """Shared by PUT /api/v1/me/alert-settings and onboarding — both accept
+    the same two fields and must reject the same bad input the same way,
+    rather than two hand-copied checks drifting apart.
+
+    Returns the normalized (stripped) chat id.
+    """
+    if min_alert_score < 0 or min_alert_score > 10:
+        raise HTTPException(status_code=400, detail="Pragul de alertă trebuie să fie între 0 și 10.")
+    chat_id = telegram_chat_id
+    if chat_id is not None:
+        chat_id = chat_id.strip()
+        # Telegram chat ids are numeric (negative for groups/channels). A
+        # @username is the single most likely thing to be pasted here and
+        # is NOT accepted by the Bot API's sendMessage chat_id, so reject
+        # it with an explanation rather than storing a value that would
+        # silently fail on every future alert.
+        if chat_id and not re.fullmatch(r"-?\d{1,20}", chat_id):
+            raise HTTPException(
+                status_code=400,
+                detail="ID-ul de chat Telegram trebuie să fie numeric (ex: 123456789), nu un @nume de utilizator.",
+            )
+    return chat_id
 
 
 class AlertSettingsRequest(BaseModel):
@@ -749,6 +785,7 @@ async def complete_onboarding(
         )
     domain = _validated_domain(payload)
     _validate_onboarding_payload(payload)
+    chat_id = _validate_alert_fields(payload.min_alert_score, payload.telegram_chat_id)
     if not db.DATABASE_URL:
         raise HTTPException(
             status_code=503,
@@ -762,6 +799,7 @@ async def complete_onboarding(
             user["user_id"], email, display_name or None, domain,
             payload.target_counties, payload.min_value_ron,
             payload.keywords, payload.exclude_keywords,
+            payload.min_alert_score, chat_id,
         )
     except db.UserCapacityError as e:
         logger.warning(f"[Onboarding] {e}")
@@ -829,21 +867,7 @@ async def update_my_alert_settings(payload: AlertSettingsRequest, user: dict = D
     real signup kept getting alerts at their signup address forever no
     matter what they changed here.
     """
-    if payload.min_alert_score < 0 or payload.min_alert_score > 10:
-        raise HTTPException(status_code=400, detail="Pragul de alertă trebuie să fie între 0 și 10.")
-    chat_id = payload.telegram_chat_id
-    if chat_id is not None:
-        chat_id = chat_id.strip()
-        # Telegram chat ids are numeric (negative for groups/channels). A
-        # @username is the single most likely thing to be pasted here and
-        # is NOT accepted by the Bot API's sendMessage chat_id, so reject
-        # it with an explanation rather than storing a value that would
-        # silently fail on every future alert.
-        if chat_id and not re.fullmatch(r"-?\d{1,20}", chat_id):
-            raise HTTPException(
-                status_code=400,
-                detail="ID-ul de chat Telegram trebuie să fie numeric (ex: 123456789), nu un @nume de utilizator.",
-            )
+    chat_id = _validate_alert_fields(payload.min_alert_score, payload.telegram_chat_id)
     ok = await db.update_alert_settings(
         user["user_id"], payload.alert_email, payload.min_alert_score, chat_id
     )
@@ -1089,7 +1113,7 @@ def _ranked_row_to_lead(row: Dict[str, Any]) -> Dict[str, Any]:
 # into a lead so the payload keeps exactly the fields the frontend types.
 _RANKING_KEYS = {
     "kw_hit", "county_hit", "domain_hit", "value_hit", "excluded_hit",
-    "relevance", "search_blob",
+    "is_match", "relevance", "search_blob",
 }
 
 

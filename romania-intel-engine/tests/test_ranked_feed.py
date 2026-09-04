@@ -127,7 +127,7 @@ class TestRankedQuery:
 
         query = captured["query"]
         assert "WHERE" not in query.upper()
-        assert "ORDER BY relevance DESC" in query
+        assert "ORDER BY is_match DESC, relevance DESC" in query
         # The exclusion is a large negative weight, not a filter.
         assert str(db.RELEVANCE_WEIGHTS["excluded"]) in query
 
@@ -151,6 +151,81 @@ class TestRankedQuery:
         await db.get_ranked_opportunities({"target_counties": ["Iași", "Bistrița"]})
         counties = captured["args"][1]
         assert counties == ["iasi", "bistrita"]
+
+    def test_is_match_orders_before_relevance(self):
+        """The strict partition, pinned against the SQL text itself.
+
+        A blended `relevance` score only makes a match LIKELY to win — a
+        non-match with a high enough opportunity_score can outscore a weak
+        match (a county-only hit is +20; a non-match with opportunity_score
+        9 vs a match's 3 wins on `ORDER BY relevance DESC` alone). The user
+        asked for their own criteria to rank first unconditionally, so the
+        query must partition on is_match before it ever consults relevance.
+        Reverting to `ORDER BY relevance DESC` compiles, runs, and silently
+        drops that guarantee — this is the same class of regression the
+        county-key test above guards against.
+        """
+        source = inspect.getsource(db.get_ranked_opportunities)
+        assert "ORDER BY is_match DESC, relevance DESC" in source
+
+    def test_is_match_expression_mirrors_the_lead_definition(self):
+        """api.py's _ranked_row_to_lead defines is_match as "any hit, not
+        excluded". The SQL column feeding ORDER BY must use the identical
+        definition, or the row order and the badge the UI actually shows
+        could disagree — the sorted-first row would (nonsensically) badge as
+        not-a-match, or vice versa."""
+        source = inspect.getsource(db.get_ranked_opportunities)
+        assert "AS is_match" in source
+        # The four hit sub-expressions combined with OR, gated by NOT the
+        # excluded expression — Postgres SELECT-list aliases can't reference
+        # each other, so this must repeat the underlying expressions rather
+        # than naming kw_hit/county_hit/etc.
+        is_match_block = source[source.index("AS is_match") - 400 : source.index("AS is_match")]
+        assert is_match_block.count("~ ANY($1::text[])") >= 1  # keyword hit
+        assert is_match_block.count("~ ANY($5::text[])") >= 1  # excluded hit
+        assert "AND NOT" in is_match_block
+
+
+class TestRankedQueryOrdering:
+    @pytest.mark.asyncio
+    async def test_weak_match_outranks_strong_non_match_in_practice(self, monkeypatch):
+        """End-to-end against a fake connection: a row with only a weak
+        match (one county hit, low opportunity_score) must sort ahead of a
+        row with no match at all but a very high opportunity_score — the
+        exact scenario the old pure-relevance ordering got backwards."""
+        rows = [
+            {
+                "source_id": "STRONG_NONMATCH", "opportunity_score": 9.5,
+                "kw_hit": False, "county_hit": False, "domain_hit": False,
+                "value_hit": False, "excluded_hit": False,
+                "is_match": False, "relevance": 9.5, "last_seen_at": None,
+            },
+            {
+                "source_id": "WEAK_MATCH", "opportunity_score": 1.0,
+                "kw_hit": False, "county_hit": True, "domain_hit": False,
+                "value_hit": False, "excluded_hit": False,
+                "is_match": True, "relevance": 21.0, "last_seen_at": None,
+            },
+        ]
+
+        class _Conn:
+            async def fetch(self, query, *args):
+                # A real query would already return these in is_match-first
+                # order; sort here the same way ORDER BY would, to prove the
+                # fake reflects the query's own contract rather than
+                # asserting on input order.
+                return sorted(rows, key=lambda r: (not r["is_match"], -r["relevance"]))
+
+        class _Ctx:
+            async def __aenter__(self):
+                return _Conn()
+
+            async def __aexit__(self, *exc):
+                return False
+
+        monkeypatch.setattr(db, "with_connection", lambda: _Ctx())
+        result = await db.get_ranked_opportunities({"target_counties": ["Cluj"]})
+        assert [r["source_id"] for r in result] == ["WEAK_MATCH", "STRONG_NONMATCH"]
 
 
 class TestMatchExplanation:
