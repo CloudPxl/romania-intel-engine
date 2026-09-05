@@ -5,6 +5,8 @@ from typing import Dict, Any, List, Optional
 from pypdf import PdfReader
 import docx
 
+import legal_kb
+
 logger = logging.getLogger("CaietAnalyzer")
 
 # ISO/SR EN standard numbers as they actually appear in Romanian caiete de
@@ -59,6 +61,7 @@ _EQUIPMENT_TRIGGER_PATTERN = re.compile(
 RESTRICTIVE_PATTERNS = [
     {
         "keyword": "experienta similara",
+        "legal_topic": "qualification_criteria",
         # Romanian is inflected and legal drafting uses the genitive freely
         # ("dovada experienței similare"), so the declined forms are listed
         # explicitly. Whole-word matching will not reach them from the
@@ -73,24 +76,28 @@ RESTRICTIVE_PATTERNS = [
     },
     {
         "keyword": "termen de livrare scurt",
+        "legal_topic": "principles",
         "variants": ["termen de livrare sub", "livrare in maxim", "termen de executie sub"],
         "risk": "Ridicat",
         "warning": "Termen de livrare neobișnuit de scurt, care poate favoriza un operator cu stoc pre-constituit.",
     },
     {
         "keyword": "standard proprietar",
+        "legal_topic": "technical_specifications",
         "variants": ["certificare specifica", "certificat specific", "standard propriu"],
         "risk": "Ridicat",
         "warning": "Cerință de standard tehnic proprietar fără mențiunea „sau echivalent”.",
     },
     {
         "keyword": "autorizatie de producator",
+        "legal_topic": "qualification_criteria",
         "variants": ["autorizatie producator", "autorizatie de producator", "scrisoare de autorizare", "certificat de autorizare producator"],
         "risk": "Critic",
         "warning": "Obligativitatea prezentării autorizației directe de producător la depunerea ofertei este frecvent calificată drept clauză restrictivă în practica CNSC.",
     },
     {
         "keyword": "marca sau producator indicat",
+        "legal_topic": "technical_specifications",
         "variants": ["marca", "marci", "producator anume", "model anume"],
         "risk": "Critic",
         "warning": "Indicarea unei mărci, a unui producător sau a unui model fără sintagma „sau echivalent” restrânge concurența (art. 156 din Legea nr. 98/2016 privind specificațiile tehnice).",
@@ -263,6 +270,13 @@ class CaietDeSarciniAnalyzer:
                     "matched_terms": hits,
                     "severity": item["risk"],
                     "tactical_advisory": item["warning"],
+                    # The provision this clause offends, quoted from the
+                    # consolidated text rather than paraphrased. A finding
+                    # that reproduces the statutory sentence is one the
+                    # bidder can put straight into a clarification request;
+                    # a bare severity label is not. Empty when the
+                    # knowledge base has not been built.
+                    "legal_basis": legal_kb.topic(item["legal_topic"])["articles"],
                 })
                 if item["risk"] == "Critic":
                     overall_risk_score += 3.5

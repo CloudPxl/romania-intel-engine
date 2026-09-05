@@ -198,6 +198,14 @@ def search(term: str, law_keys: Optional[List[str]] = None, limit: int = 8) -> L
 # relied on for, so a reviewer can check the mapping without re-reading the
 # statute.
 TOPICS: Dict[str, Dict[str, Any]] = {
+    "principles": {
+        "label": "Scopul legii și principiile atribuirii",
+        "articles": ["L98/2016:2"],
+        "note": (
+            "Scopul legii și principiile — inclusiv proporționalitatea, pe care se sprijină "
+            "orice contestare a unei cerințe excesive raportate la obiectul contractului."
+        ),
+    },
     "technical_specifications": {
         "label": "Specificații tehnice și interdicția favorizării",
         "articles": ["L98/2016:155", "L98/2016:156"],
