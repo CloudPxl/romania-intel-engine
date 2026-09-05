@@ -3,7 +3,7 @@ from typing import Any, Dict, Optional
 from fastapi import APIRouter, Depends
 from pydantic import BaseModel
 
-from addons import company_registry
+from addons import company_registry, qualification_scenarios
 from addons.business_eligibility import BusinessEligibilityEngine
 from security import require_auth
 
@@ -14,6 +14,18 @@ class CompanyLookupRequest(BaseModel):
     cui_fiscal: str
     # Optional: when supplied it is compared against the registry's own
     # name, which is how a CUI belonging to somebody else gets caught.
+    company_name: Optional[str] = None
+
+
+class QualificationRequest(BaseModel):
+    cui_fiscal: str
+    estimated_value_ron: float
+    # The turnover the documentation actually demands. It lives in the fișa
+    # de date and exists in no machine-readable source, so it is optional:
+    # supplied, it is compared against both the company and the art. 175
+    # alin. (2) lit. a) ceiling; absent, the analysis reports against the
+    # ceiling and says which question it could not answer.
+    required_turnover_ron: Optional[float] = None
     company_name: Optional[str] = None
 
 
@@ -55,6 +67,40 @@ async def verify_company_route(payload: CompanyLookupRequest, _user: dict = Depe
     return await company_registry.verify_company(
         payload.cui_fiscal, declared_name=payload.company_name
     )
+
+
+@router.post("/qualification-scenarios")
+async def qualification_scenarios_route(
+    payload: QualificationRequest, _user: dict = Depends(require_auth)
+):
+    """Which participation routes are open for THIS company on THIS contract.
+
+    Distinct from /evaluate, which scores a company against grant
+    programmes. This one answers the procurement question — can you bid
+    alone, and if not, what does the law leave open — from the company's
+    real ANAF profile rather than what was typed into a form, with every
+    threshold quoted from the ingested consolidated texts.
+    """
+    verification = await company_registry.verify_company(
+        payload.cui_fiscal, declared_name=payload.company_name
+    )
+    if not verification.get("found"):
+        # No invented profile to reason over. The caller gets the lookup's
+        # own reason rather than a scenario map built on nothing.
+        return {
+            "available": False,
+            "reason": verification.get("reason") or "Compania nu a putut fi identificată la ANAF.",
+            "verification": verification,
+        }
+    return {
+        "available": True,
+        "verification": verification,
+        **qualification_scenarios.evaluate_qualification(
+            verification,
+            estimated_value_ron=payload.estimated_value_ron,
+            required_turnover_ron=payload.required_turnover_ron,
+        ),
+    }
 
 
 @router.post("/evaluate")

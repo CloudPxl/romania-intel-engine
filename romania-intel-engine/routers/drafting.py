@@ -172,3 +172,96 @@ async def export_clarification_docx(payload: ClarificationLetterRequest, _user: 
         media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
         headers={"Content-Disposition": f'attachment; filename="{filename}"'},
     )
+
+
+# ---------------------------------------------------------------------------
+# Which legal instrument the timeline actually allows.
+#
+# The brief this implements asked for a "Notificare Prealabilă under Art. 6-8
+# Legea 101/2016" for the urgent case. That instrument no longer exists:
+# **art. 6 and art. 7 of Legea 101/2016 were both repealed** by OUG 45/2018,
+# and a full-text search of the consolidated law returns no "notificare
+# prealabilă" at all. The mandatory pre-notification step was abolished in
+# 2018 — a bidder who spends two of their ten days sending one is not
+# preserving a right, they are burning the contestation deadline.
+#
+# What is actually in force, and what this selects between:
+#   * before the deadline, with time to spare — solicitare de clarificări
+#     (art. 160-161 Legea 98/2016), which is free and often sufficient;
+#   * when the deadline is close — contestație to the CNSC or the court
+#     (art. 8 Legea 101/2016), 10 days above the JOUE publication
+#     thresholds and 7 days below them, counted per art. 5 from the day
+#     after you learned of the act.
+# ---------------------------------------------------------------------------
+
+CLARIFICATION_COMFORTABLE_DAYS = 10
+
+
+class LegalInstrumentRequest(BaseModel):
+    project_title: str
+    days_until_deadline: int
+    # Above the JOUE publication thresholds the contestation window is 10
+    # days; below it is 7. The caller knows which applies to their
+    # procedure; defaulting to the shorter one is the safe direction to be
+    # wrong in.
+    above_eu_thresholds: Optional[bool] = False
+    issue_summary: Optional[str] = None
+
+
+@router.post("/select-legal-instrument")
+async def select_legal_instrument(
+    payload: LegalInstrumentRequest, _user: dict = Depends(require_auth)
+):
+    """Names the right instrument for the time actually left, with the real
+    deadline attached."""
+    import legal_kb
+
+    days = payload.days_until_deadline
+    contest_window = 10 if payload.above_eu_thresholds else 7
+
+    if days > CLARIFICATION_COMFORTABLE_DAYS:
+        instrument = {
+            "instrument": "clarification_request",
+            "label": "Solicitare de clarificări",
+            "urgency": "normal",
+            "rationale": (
+                f"Mai sunt {days} zile până la termenul de depunere. Solicitarea de clarificări este "
+                "instrumentul potrivit: nu costă nimic, obligă autoritatea să răspundă și rezolvă "
+                "majoritatea cerințelor restrictive fără contestație."
+            ),
+            "endpoint": "/api/v1/drafting/generate-clarification",
+            "legal_basis": legal_kb.topic("clarification_requests")["articles"],
+        }
+    else:
+        instrument = {
+            "instrument": "cnsc_contestation",
+            "label": "Contestație la CNSC sau instanță",
+            "urgency": "urgent",
+            "rationale": (
+                f"Au mai rămas {days} zile. O solicitare de clarificări nu mai suspendă nimic — "
+                f"dacă vizați actul autorității, termenul de contestare este de {contest_window} zile "
+                "de la luarea la cunoștință (art. 8 din Legea 101/2016), calculat din ziua următoare "
+                "(art. 5). Consultați un specialist înainte de depunere."
+            ),
+            "contestation_window_days": contest_window,
+            "legal_basis": legal_kb.topic("remedies")["articles"],
+        }
+
+    return {
+        **instrument,
+        "days_until_deadline": days,
+        "project_title": payload.project_title,
+        "issue_summary": payload.issue_summary,
+        # Stated because it is the single most common piece of stale advice
+        # in Romanian procurement guidance, and following it costs days a
+        # bidder does not have.
+        "repealed_instrument_notice": (
+            "Notificarea prealabilă NU mai există: art. 6 și art. 7 din Legea nr. 101/2016 au fost "
+            "abrogate prin OUG nr. 45/2018. Nu este un pas obligatoriu înainte de contestație și nu "
+            "prelungește niciun termen. Ghidurile care o menționează sunt depășite."
+        ),
+        "disclaimer": (
+            "Acesta este un instrument de orientare, nu asistență juridică. Termenele se calculează "
+            "pe procedura concretă și se confirmă în documentația de atribuire."
+        ),
+    }

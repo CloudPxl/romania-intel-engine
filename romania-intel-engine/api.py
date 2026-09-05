@@ -37,6 +37,7 @@ from security import (
 
 from addons.caiet_analyzer import CaietDeSarciniAnalyzer, TextExtractionError
 from addons.win_probability import WinProbabilityEngine
+from addons import price_strategy
 from addons.competitor_tracker import CompetitorTrackerEngine
 from ai_copilot import ProcurementAICopilot
 from routers import eligibility, drafting, analysis, legal
@@ -432,12 +433,38 @@ class CaietAnalysisRequest(BaseModel):
     specification_text: Optional[str] = None
     doc_id: Optional[str] = None
     notice_id: Optional[str] = None
+    # Turns the turnover rule from a reminder into a measurement: with the
+    # contract's estimated value the scanner can read the threshold out of
+    # the document and check it against the art. 175 alin. (2) lit. a)
+    # ceiling of 2x, reporting a concrete quotable finding instead of a
+    # generic "verify proportionality" note.
+    estimated_value_ron: Optional[float] = None
 
 class WinProbabilityRequest(BaseModel):
     estimated_budget_ron: float
     proposed_price_ron: float
     has_local_partnership: Optional[bool] = False
     lead_time_days: Optional[int] = 30
+    # How the procedure actually scores offers. Defaults to lowest price
+    # because that is the common case, and because it is the conservative
+    # assumption: it is the criterion under which a technical advantage
+    # buys nothing.
+    award_criterion: Optional[Literal["lowest_price", "best_value"]] = "lowest_price"
+    price_weight_pct: Optional[float] = 100.0
+    your_technical_score_pct: Optional[float] = None
+    # Used to pull real winning-discount data for the same county, which
+    # replaces the internal heuristic trigger when a usable sample exists.
+    county: Optional[str] = None
+
+
+class JustificationDossierRequest(BaseModel):
+    company_name: str
+    project_title: str
+    estimated_value_ron: float
+    proposed_price_ron: float
+    authority_name: Optional[str] = None
+    cost_notes: Optional[str] = None
+    use_ai_expansion: Optional[bool] = True
 
 @app.get("/")
 def root_index():
@@ -1277,13 +1304,67 @@ async def analyze_caiet_sarcini(payload: CaietAnalysisRequest, _user: dict = Dep
             )
     if not text:
         raise HTTPException(status_code=400, detail="Trebuie furnizat specification_text sau doc_id/notice_id.")
-    return CaietDeSarciniAnalyzer.analyze_specification_text(text, payload.project_title)
+    return CaietDeSarciniAnalyzer.analyze_specification_text(
+        text, payload.project_title, estimated_value_ron=payload.estimated_value_ron
+    )
 
 @app.post("/api/v1/addons/predict-win-rate")
-def predict_win_rate(payload: WinProbabilityRequest, _user: dict = Depends(require_auth)):
-    return WinProbabilityEngine.calculate_win_odds(
-        payload.estimated_budget_ron, payload.proposed_price_ron, payload.has_local_partnership, payload.lead_time_days
+async def predict_win_rate(payload: WinProbabilityRequest, _user: dict = Depends(require_auth)):
+    """Bid positioning under the procedure's own award criterion.
+
+    Keeps the original qualitative assessment (the frontend reads
+    `assessment`/`competitiveness_band`/`factors`) and adds the
+    criterion-aware scoring model and the abnormally-low-price exposure
+    alongside it, so this stays backward-compatible while carrying the
+    part that actually differs between procedures.
+    """
+    legacy = WinProbabilityEngine.calculate_win_odds(
+        payload.estimated_budget_ron, payload.proposed_price_ron,
+        payload.has_local_partnership, payload.lead_time_days,
     )
+    awards = await procurement_notices.get_award_statistics(county=payload.county)
+    strategy = price_strategy.analyze_pricing(
+        estimated_value_ron=payload.estimated_budget_ron,
+        proposed_price_ron=payload.proposed_price_ron,
+        award_criterion=payload.award_criterion or "lowest_price",
+        price_weight_pct=payload.price_weight_pct if payload.price_weight_pct is not None else 100.0,
+        your_technical_score_pct=payload.your_technical_score_pct,
+        award_stats=awards,
+    )
+    return {**legacy, "strategy": strategy, "award_intelligence": awards}
+
+
+@app.post("/api/v1/addons/price-justification-dossier")
+async def price_justification_dossier(
+    payload: JustificationDossierRequest, _user: dict = Depends(require_auth)
+):
+    """The Art. 210 defence: a structured *Fundamentare economică a prețului*.
+
+    The outline is deterministic and complete on its own — chapters a)-f)
+    from art. 210 alin. (2), evidence lines from art. 136 alin. (2) of the
+    HG 395/2016 norms, both quoted from the ingested consolidated texts.
+    The AI pass drafts the narrative and is always additive: if no provider
+    answers, `narrative` is null and the outline still stands.
+    """
+    outline = price_strategy.build_justification_outline(
+        company_name=payload.company_name,
+        project_title=payload.project_title,
+        estimated_value_ron=payload.estimated_value_ron,
+        proposed_price_ron=payload.proposed_price_ron,
+        authority_name=payload.authority_name,
+    )
+    narrative = None
+    if payload.use_ai_expansion:
+        narrative = await price_strategy.expand_justification_with_ai(outline, payload.cost_notes)
+    return {
+        **outline,
+        "narrative": narrative,
+        "narrative_available": narrative is not None,
+        "narrative_note": (
+            None if narrative is not None
+            else "Niciun furnizor AI nu a răspuns — structura de mai jos este completă și utilizabilă ca atare."
+        ),
+    }
 
 @app.get("/api/v1/me/export/csv")
 async def export_my_csv(user: dict = Depends(require_auth)):

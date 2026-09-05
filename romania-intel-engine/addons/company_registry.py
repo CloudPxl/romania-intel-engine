@@ -155,6 +155,8 @@ def _parse_anaf_company(entry: Dict[str, Any]) -> Dict[str, Any]:
     vat = entry.get("inregistrare_scop_Tva") or {}
     inactive = entry.get("stare_inactiv") or {}
     address = entry.get("adresa_sediu_social") or {}
+    cash_vat = entry.get("inregistrare_RTVAI") or {}
+    split_vat = entry.get("inregistrare_SplitTVA") or {}
 
     caen_raw = general.get("cod_CAEN")
     # ANAF returns CAEN as an int, dropping any leading zero (610, not
@@ -178,6 +180,20 @@ def _parse_anaf_company(entry: Dict[str, Any]) -> Dict[str, Any]:
         "postal_code": (general.get("codPostal") or "").strip() or None,
         "tax_authority": (general.get("organFiscalCompetent") or "").strip() or None,
         "vat_registered": bool(vat.get("scpTVA")),
+        # The two special VAT regimes ANAF publishes separately from plain
+        # registration. Both change when VAT becomes chargeable and
+        # deductible, so they belong on a bid's cash-flow plan, not just on
+        # an accountant's desk: under TVA la încasare the supplier accounts
+        # for VAT on collection rather than invoice — and public
+        # authorities are slow payers.
+        "cash_vat_scheme": bool(cash_vat.get("statusTvaIncasare")),
+        "cash_vat_start_date": (cash_vat.get("dataInceputTvaInc") or "").strip() or None,
+        "cash_vat_end_date": (cash_vat.get("dataSfarsitTvaInc") or "").strip() or None,
+        # Split VAT was repealed for most taxpayers in 2020; a live status
+        # here is rare and worth surfacing rather than assuming stale.
+        "split_vat_scheme": bool(split_vat.get("statusSplitTVA")),
+        "split_vat_start_date": (split_vat.get("dataInceputSplitTVA") or "").strip() or None,
+        "vat_periods": vat.get("perioade_TVA") or None,
         # The one field here that is itself a procurement exclusion ground:
         # a taxpayer ANAF has declared inactive cannot credibly certify the
         # tax-obligation requirement of Art. 165 Legea 98/2016.

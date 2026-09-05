@@ -101,8 +101,143 @@ RESTRICTIVE_PATTERNS = [
         "variants": ["marca", "marci", "producator anume", "model anume"],
         "risk": "Critic",
         "warning": "Indicarea unei mărci, a unui producător sau a unui model fără sintagma „sau echivalent” restrânge concurența (art. 156 din Legea nr. 98/2016 privind specificațiile tehnice).",
+        # Art. 156 alin. (3) permits naming a brand in exceptional cases
+        # *provided* the words "sau echivalent" accompany it. So the mere
+        # presence of "marcă" is not the violation, and flagging it as one
+        # made this the noisiest rule in the scanner. See
+        # _equivalence_clause_present below: the finding is suppressed when
+        # the document does carry the saving phrase.
+        "suppressed_by_equivalence_clause": True,
+    },
+    # --- The CNSC patterns below were added as a set, because between them
+    # they are what contestations in front of the Consiliu are actually
+    # built on. Each names the provision it offends rather than describing
+    # a "risk", so a hit is directly usable in a clarification request.
+    {
+        "keyword": "personal angajat cu contract de munca",
+        "legal_topic": "qualification_criteria",
+        "variants": [
+            "contract individual de munca", "contracte individuale de munca",
+            "angajat cu norma intreaga", "personal angajat permanent",
+            "angajati proprii", "personal propriu angajat",
+        ],
+        "risk": "Critic",
+        "warning": (
+            "Condiționarea admisibilității ofertei de existența unui contract individual de muncă "
+            "cu personalul-cheie ÎNAINTE de atribuire este una dintre cele mai frecvent anulate "
+            "cerințe la CNSC: art. 182 permite invocarea susținerii unui terț „indiferent de natura "
+            "relațiilor juridice” dintre ofertant și acesta, iar art. 172 alin. (5) impune "
+            "proporționalitatea. Cereți clarificarea acceptării altor forme contractuale."
+        ),
+    },
+    {
+        "keyword": "vizita obligatorie pe amplasament",
+        "legal_topic": "principles",
+        "variants": [
+            "vizita obligatorie", "vizitarea amplasamentului este obligatorie",
+            "certificat de vizitare", "proces verbal de vizitare a amplasamentului",
+            "vizita in teren obligatorie",
+        ],
+        "risk": "Ridicat",
+        "warning": (
+            "Vizita pe amplasament impusă ca obligatorie, cu un singur termen sau într-un interval "
+            "foarte scurt, restrânge participarea operatorilor din alte județe fără o justificare "
+            "legată de obiectul contractului (art. 2 alin. (2) — proporționalitate). Vizita poate fi "
+            "recomandată; condiționarea admisibilității ofertei de ea este contestabilă."
+        ),
+    },
+    {
+        "keyword": "cifra de afaceri disproportionata",
+        "legal_topic": "qualification_criteria",
+        "variants": [
+            "cifra de afaceri anuala", "cifra de afaceri minima", "cifra medie anuala de afaceri",
+        ],
+        "risk": "Mediu",
+        "warning": (
+            "Cerința de cifră de afaceri anuală minimă nu poate depăși de două ori valoarea estimată "
+            "a contractului (art. 175 alin. (2) lit. a)), cu excepția cazurilor temeinic justificate "
+            "de autoritate (alin. (3)). Comparați pragul cerut cu valoarea estimată."
+        ),
     },
 ]
+
+# Phrases that satisfy art. 156 alin. (3). Matched anywhere in the
+# document rather than beside each brand mention: a caiet that states the
+# equivalence principle once, in its general clauses, has complied — and
+# requiring the phrase next to every occurrence produced a flood of false
+# positives on exactly the documents that were drafted correctly.
+EQUIVALENCE_PHRASES = ("sau echivalent", "ori echivalent", "sau echivalente", "sau similar")
+
+# "cifra de afaceri ... 12.000.000 lei" / "... 12.000.000 RON". Romanian
+# documents use '.' as the thousands separator and ',' as the decimal
+# point, which is the reverse of the Python literal — parsed accordingly
+# in _parse_ron_amount rather than fed to float() directly.
+_TURNOVER_AMOUNT_RE = re.compile(
+    r"cifr[aă]\s+(?:medie\s+anual[aă]\s+)?de\s+afaceri[^.]{0,160}?"
+    r"(\d{1,3}(?:[.\s]\d{3})+(?:,\d+)?|\d{4,}(?:,\d+)?)\s*(?:lei|ron)",
+    re.IGNORECASE,
+)
+
+
+def _parse_ron_amount(raw: str) -> Optional[float]:
+    """'12.000.000,50' -> 12000000.50. Returns None on anything ambiguous
+    rather than guessing — a misparsed threshold would produce a confident,
+    wrong claim that a lawful requirement is unlawful."""
+    cleaned = raw.replace(" ", "").replace(".", "").replace(",", ".")
+    try:
+        value = float(cleaned)
+    except ValueError:
+        return None
+    return value if value > 0 else None
+
+
+def _equivalence_clause_present(text: str) -> bool:
+    from text_utils import fold
+
+    folded = fold(text)
+    return any(phrase in folded for phrase in EQUIVALENCE_PHRASES)
+
+
+def check_turnover_requirement(
+    text: str, estimated_value_ron: Optional[float]
+) -> Optional[Dict[str, Any]]:
+    """Reads the turnover threshold out of the document and measures it
+    against the art. 175 alin. (2) lit. a) ceiling.
+
+    Returns None when either half is missing — no stated threshold, or no
+    published estimate — because the comparison is the entire finding and
+    half of it is not a partial answer.
+    """
+    if not estimated_value_ron or estimated_value_ron <= 0:
+        return None
+    match = _TURNOVER_AMOUNT_RE.search(text)
+    if not match:
+        return None
+    required = _parse_ron_amount(match.group(1))
+    if required is None:
+        return None
+
+    ceiling = estimated_value_ron * 2.0
+    exceeds = required > ceiling
+    return {
+        "required_turnover_ron": required,
+        "estimated_value_ron": estimated_value_ron,
+        "legal_ceiling_ron": ceiling,
+        "exceeds_legal_ceiling": exceeds,
+        "matched_text": match.group(0)[:200],
+        "severity": "Critic" if exceeds else "Informativ",
+        "finding": (
+            f"Documentul cere o cifră de afaceri de {required:,.0f} RON, peste plafonul de "
+            f"{ceiling:,.0f} RON (2× valoarea estimată de {estimated_value_ron:,.0f} RON) prevăzut "
+            "la art. 175 alin. (2) lit. a). Depășirea este permisă doar în cazuri temeinic "
+            "justificate, motivate în documentele achiziției (art. 175 alin. (3)) — cereți acea "
+            "motivare printr-o solicitare de clarificări."
+            if exceeds
+            else f"Cerința de cifră de afaceri ({required:,.0f} RON) se încadrează în plafonul legal "
+            f"de {ceiling:,.0f} RON (2× valoarea estimată)."
+        ),
+        "legal_basis": legal_kb.topic("qualification_criteria")["articles"],
+    }
 
 class TextExtractionError(Exception):
     """The document could not be parsed at all (corrupt, encrypted, or not
@@ -251,16 +386,30 @@ class CaietDeSarciniAnalyzer:
         }
 
     @staticmethod
-    def analyze_specification_text(text: str, project_title: str) -> Dict[str, Any]:
-        from text_utils import matching_terms
+    def analyze_specification_text(
+        text: str,
+        project_title: str,
+        estimated_value_ron: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        """`estimated_value_ron`, when known, turns the turnover rule from a
+        reminder into a measurement: the art. 175 alin. (2) lit. a) ceiling
+        is 2x the estimate, so a threshold stated in the document can be
+        checked against it and reported as a concrete, quotable finding."""
+        from text_utils import fold, matching_terms
 
         qualification_criteria = CaietDeSarciniAnalyzer.extract_qualification_criteria(text)
+        equivalence_present = _equivalence_clause_present(text)
 
         flagged_risks = []
         overall_risk_score = 1.0
 
         for item in RESTRICTIVE_PATTERNS:
             hits = matching_terms(text, item["variants"])
+            # Art. 156 alin. (3) makes naming a brand lawful when the words
+            # "sau echivalent" accompany it, so a document that carries the
+            # phrase has complied and must not be flagged for it.
+            if hits and item.get("suppressed_by_equivalence_clause") and equivalence_present:
+                continue
             if hits:
                 flagged_risks.append({
                     "pattern": item["keyword"],
@@ -285,6 +434,21 @@ class CaietDeSarciniAnalyzer:
                 else:
                     overall_risk_score += 1.0
 
+        # The measured finding, when both halves are available: an actual
+        # threshold read out of the document, checked against the actual
+        # ceiling. Scored heavily because unlike the pattern hits above it
+        # is not a "this might be restrictive" — it is arithmetic.
+        turnover_check = check_turnover_requirement(text, estimated_value_ron)
+        if turnover_check and turnover_check["exceeds_legal_ceiling"]:
+            flagged_risks.append({
+                "pattern": "cifra de afaceri peste plafonul legal",
+                "matched_terms": [turnover_check["matched_text"]],
+                "severity": "Critic",
+                "tactical_advisory": turnover_check["finding"],
+                "legal_basis": turnover_check["legal_basis"],
+            })
+            overall_risk_score += 3.5
+
         risk_level = "Scazut (Specificatii Deschise)"
         if overall_risk_score >= 7.0:
             risk_level = "Critic (Risc major de dedicatie / Clauze restrictive)"
@@ -297,6 +461,8 @@ class CaietDeSarciniAnalyzer:
             "bias_score": min(10.0, round(overall_risk_score, 1)),
             "extracted_character_count": len(text),
             "qualification_criteria": qualification_criteria,
+            "equivalence_clause_present": equivalence_present,
+            "turnover_check": turnover_check,
             "detected_red_flags": flagged_risks if flagged_risks else [
                 {"pattern": "Niciunul", "severity": "OK",
                  "tactical_advisory": "Nu au fost identificate tipare restrictive dintre cele verificate."}
