@@ -1,11 +1,55 @@
 import logging
 import uuid
 from typing import Dict, Any, List, Optional
-from datetime import datetime
+from datetime import datetime, timezone
 
 import db
 
 logger = logging.getLogger("WorkflowEngine")
+
+
+def _now() -> datetime:
+    """Always timezone-aware UTC.
+
+    `datetime.now()` returns a *naive* local time. Written into a
+    TIMESTAMPTZ column asyncpg interprets it as UTC, so on any host whose
+    clock is not UTC every deal timestamp was silently shifted; and read
+    back it produced the crash below.
+    """
+    return datetime.now(timezone.utc)
+
+
+def _as_aware(value: Any) -> Optional[datetime]:
+    """Parses a stored timestamp into an offset-aware datetime.
+
+    This is the fix for a 500 on GET /api/v1/me/pipeline/metrics that
+    appeared the moment a user saved their first deal. The two persistence
+    paths disagree about tzinfo: Postgres returns TIMESTAMPTZ, which
+    db._deal_row_to_dict renders with .isoformat() *including* the offset,
+    while the in-memory fallback stores a naive datetime.now().isoformat().
+    Subtracting a naive datetime from an aware one raises
+    `TypeError: can't subtract offset-naive and offset-aware datetimes`,
+    which escaped to the global handler as an opaque "eroare neașteptată".
+
+    It only ever reproduced with a database attached — the in-memory path
+    is naive on both sides and cancels out — which is exactly why the test
+    suite, which runs without DATABASE_URL, stayed green through it.
+
+    A naive value is interpreted as *local* time, not UTC: Postgres never
+    returns one, so the only naive timestamps that can reach here were
+    written by the in-memory fallback's `datetime.now()`, which is local.
+    Reading those as UTC shifted every duration by the host's offset —
+    three hours in Romania, which is enough to misreport a deal's age.
+    """
+    if value is None:
+        return None
+    dt = value if isinstance(value, datetime) else None
+    if dt is None:
+        try:
+            dt = datetime.fromisoformat(str(value))
+        except (TypeError, ValueError):
+            return None
+    return dt if dt.tzinfo is not None else dt.astimezone()
 
 PIPELINE_STAGES = [
     "discovery",
@@ -69,22 +113,59 @@ class ConcurrentWorkflowEngine:
 
     @staticmethod
     async def add_lead_to_pipeline(user_id: str, lead_data: Dict[str, Any]) -> Dict[str, Any]:
+        opportunity_id = lead_data.get("source_id") or lead_data.get("opportunity_id")
+
+        # Saving the same lead twice produced two independent deals that
+        # then diverged in stage and both counted toward pipeline value —
+        # double-counting a contract that can only be won once. Returning
+        # the existing deal is what the user meant anyway.
+        if opportunity_id:
+            existing = await db.find_deal_by_opportunity(user_id, opportunity_id)
+            if existing is None:
+                existing = next(
+                    (d for d in CONCURRENT_DEAL_PIPELINE.get(user_id, [])
+                     if d.get("opportunity_id") == opportunity_id),
+                    None,
+                )
+            if existing is not None:
+                logger.info(f"↩︎ Lead {opportunity_id} already in pipeline for {user_id} as {existing['deal_id']}")
+                return {
+                    "status": "already_saved",
+                    "deal": existing,
+                    "message": "Acest dosar este deja în pipeline.",
+                }
+
         deal = {
             "deal_id": f"DEAL-{uuid.uuid4().hex[:10].upper()}",
             "user_id": user_id,
-            "opportunity_id": lead_data.get("source_id") or lead_data.get("opportunity_id"),
+            "opportunity_id": opportunity_id,
             "project_title": lead_data.get("project_title", ""),
             "stage": "discovery",
             "target_margin_pct": lead_data.get("target_margin_pct"),
             "estimated_value_ron": lead_data.get("estimated_value_ron") or lead_data.get("financial_value_ron", 0.0),
             "notes": lead_data.get("notes", ""),
-            "created_at": datetime.now().isoformat(),
+            "created_at": _now().isoformat(),
         }
         persisted = await db.add_deal(deal)
         if not persisted:
             CONCURRENT_DEAL_PIPELINE.setdefault(user_id, []).append(deal)
         logger.info(f"➕ Lead added to pipeline for {user_id}: {deal['deal_id']} (persisted={persisted})")
-        return {"status": "success", "deal": deal}
+        return {"status": "success", "deal": deal, "persisted": persisted}
+
+    @staticmethod
+    async def remove_deal(user_id: str, deal_id: str) -> Dict[str, Any]:
+        deleted = await db.delete_deal(user_id, deal_id)
+        # Mirror it in the in-memory fallback either way: a deal added
+        # while Postgres was down lives only there.
+        deals = CONCURRENT_DEAL_PIPELINE.get(user_id, [])
+        remaining = [d for d in deals if d.get("deal_id") != deal_id]
+        if len(remaining) != len(deals):
+            CONCURRENT_DEAL_PIPELINE[user_id] = remaining
+            deleted = True
+        if not deleted:
+            return {"status": "error", "message": "Dosarul nu a fost găsit."}
+        logger.info(f"🗑️ Deal {deal_id} removed for {user_id}")
+        return {"status": "success", "deal_id": deal_id}
 
     @staticmethod
     async def update_deal_stage(
@@ -111,15 +192,23 @@ class ConcurrentWorkflowEngine:
 
         existing = await db.get_deal(user_id, deal_id)
         if existing is not None:
-            updated_at = datetime.now().isoformat()
+            updated_at = _now().isoformat()
             previous_stage = existing.get("stage")
             updated_deal = await db.update_deal(user_id, deal_id, new_stage, notes, proposed_price, updated_at)
             if updated_deal is not None:
-                await db.record_stage_transition(deal_id, previous_stage, new_stage, updated_at)
-                updated_deal.setdefault("stage_history", []).append({
-                    "from": previous_stage, "to": new_stage, "at": updated_at,
-                })
-                logger.info(f"📈 Deal {deal_id} moved {previous_stage} -> {new_stage} (Postgres)")
+                # Only a real move is a transition. Editing the price or a
+                # note while the deal stays put used to write a
+                # stage -> same-stage row, which inflated the history and
+                # reset time-in-stage to zero on every keystroke-sized
+                # edit, corrupting the average-days-in-stage figure.
+                if new_stage != previous_stage:
+                    await db.record_stage_transition(deal_id, previous_stage, new_stage, updated_at)
+                    updated_deal.setdefault("stage_history", []).append({
+                        "from": previous_stage, "to": new_stage, "at": updated_at,
+                    })
+                    logger.info(f"📈 Deal {deal_id} moved {previous_stage} -> {new_stage} (Postgres)")
+                else:
+                    updated_deal.setdefault("stage_history", existing.get("stage_history", []))
                 return {"status": "success", "deal": updated_deal}
 
         # Fallback: in-memory (also the path for a deal added while
@@ -133,15 +222,18 @@ class ConcurrentWorkflowEngine:
                     d["notes"] = notes
                 if proposed_price is not None:
                     d["proposed_price"] = proposed_price
-                d["updated_at"] = datetime.now().isoformat()
+                d["updated_at"] = _now().isoformat()
                 # Keep an audit trail: which stages a deal passed through
                 # and when is exactly what a post-mortem on a lost bid needs.
-                d.setdefault("stage_history", []).append({
-                    "from": previous_stage,
-                    "to": new_stage,
-                    "at": d["updated_at"],
-                })
-                logger.info(f"📈 Deal {deal_id} moved {previous_stage} -> {new_stage} (in-memory)")
+                # Same rule as the Postgres branch — a same-stage edit is
+                # not a transition.
+                if new_stage != previous_stage:
+                    d.setdefault("stage_history", []).append({
+                        "from": previous_stage,
+                        "to": new_stage,
+                        "at": d["updated_at"],
+                    })
+                    logger.info(f"📈 Deal {deal_id} moved {previous_stage} -> {new_stage} (in-memory)")
                 return {"status": "success", "deal": d}
         return {"status": "error", "message": "Deal not found"}
 
@@ -167,17 +259,16 @@ class ConcurrentWorkflowEngine:
         transition's timestamp, or `created_at` for the first stage) and
         leaving it (the next transition's timestamp, or `now` if it's the
         deal's current stage)."""
-        try:
-            entered_at = datetime.fromisoformat(deal["created_at"])
-        except (KeyError, ValueError, TypeError):
+        entered_at = _as_aware(deal.get("created_at"))
+        if entered_at is None:
             return {}
+        now = _as_aware(now) or _now()
 
         current_stage = "discovery"
         durations: Dict[str, float] = {}
         for entry in deal.get("stage_history", []):
-            try:
-                left_at = datetime.fromisoformat(entry["at"])
-            except (KeyError, ValueError, TypeError):
+            left_at = _as_aware(entry.get("at"))
+            if left_at is None:
                 continue
             days = max(0.0, (left_at - entered_at).total_seconds() / 86400)
             durations[current_stage] = durations.get(current_stage, 0.0) + days
@@ -197,7 +288,7 @@ class ConcurrentWorkflowEngine:
         reached — not fixed/seeded numbers.
         """
         deals = await ConcurrentWorkflowEngine.get_pipeline_for_user(user_id)
-        now = datetime.now()
+        now = _now()
 
         total_deals = len(deals)
         won = [d for d in deals if d.get("stage") == "won"]

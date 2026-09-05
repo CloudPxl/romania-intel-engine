@@ -898,6 +898,63 @@ async def add_deal(deal: Dict[str, Any]) -> bool:
         except asyncpg.exceptions.UndefinedTableError:
             logger.warning("[DB] saved_deals not found — run schema.sql. Falling back to in-memory pipeline.")
             return False
+        except asyncpg.exceptions.ForeignKeyViolationError:
+            # user_profiles has no row for this auth id — signup did not
+            # complete, or the profile was deleted mid-session. Returning
+            # False sends the deal to the in-memory pipeline rather than
+            # letting an asyncpg error escape as an opaque 500.
+            logger.error(f"[DB] add_deal: no user_profiles row for {deal.get('user_id')}.")
+            return False
+        except asyncpg.PostgresError as e:
+            logger.error(f"[DB] add_deal failed for {deal.get('deal_id')}: {type(e).__name__}: {e}")
+            return False
+
+
+async def find_deal_by_opportunity(user_id: str, opportunity_id: str) -> Optional[Dict[str, Any]]:
+    """The deal this user already has for that opportunity, if any.
+
+    Saving the same lead twice used to create two independent deals with
+    different ids, which then diverged in stage and both counted toward
+    the pipeline's value — double-counting a contract that can only be won
+    once. The button is easy to press twice, so this is the common case,
+    not an edge one.
+    """
+    if not opportunity_id:
+        return None
+    async with with_connection() as conn:
+        if conn is None:
+            return None
+        try:
+            row = await conn.fetchrow(
+                "SELECT * FROM saved_deals WHERE user_id = $1 AND opportunity_id = $2 LIMIT 1",
+                user_id, opportunity_id,
+            )
+        except asyncpg.PostgresError:
+            return None
+    return _deal_row_to_dict(row) if row is not None else None
+
+
+async def delete_deal(user_id: str, deal_id: str) -> bool:
+    """Scoped by (user_id, deal_id) for the same reason every other deal
+    write is: deal ids arrive in a request path and are guessable, so the
+    owner has to be in the WHERE clause or anyone could delete a
+    stranger's deal. deal_stage_history goes with it via ON DELETE
+    CASCADE."""
+    async with with_connection() as conn:
+        if conn is None:
+            return False
+        try:
+            result = await conn.execute(
+                "DELETE FROM saved_deals WHERE user_id = $1 AND deal_id = $2",
+                user_id, deal_id,
+            )
+        except asyncpg.exceptions.UndefinedTableError:
+            return False
+        except asyncpg.PostgresError as e:
+            logger.error(f"[DB] delete_deal failed for {deal_id}: {type(e).__name__}: {e}")
+            return False
+    # asyncpg returns the command tag, e.g. "DELETE 1" / "DELETE 0".
+    return result.rsplit(" ", 1)[-1] != "0"
 
 
 async def get_deal(user_id: str, deal_id: str) -> Optional[Dict[str, Any]]:

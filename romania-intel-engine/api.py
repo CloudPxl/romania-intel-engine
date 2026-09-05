@@ -995,6 +995,15 @@ async def update_pipeline_deal(
         proposed_price=payload.proposed_price
     )
 
+@app.delete("/api/v1/me/pipeline/deals/{deal_id}")
+async def delete_pipeline_deal(deal_id: str, user: dict = Depends(require_auth)):
+    """Same ownership rule as the PATCH above: the delete is scoped by
+    (user_id, deal_id) in SQL, never by the path parameter alone."""
+    result = await ConcurrentWorkflowEngine.remove_deal(user["user_id"], deal_id)
+    if result.get("status") == "error":
+        raise HTTPException(status_code=404, detail=result.get("message", "Dosarul nu a fost găsit."))
+    return result
+
 @app.post("/api/v1/notifications/send-email-alert")
 async def send_manual_email_alert(payload: EmailAlertRequest, _user: dict = Depends(require_auth)):
     success = await LeadAlertDispatcher.dispatch_email_alert(payload.lead_data, [payload.recipient_email])

@@ -85,6 +85,33 @@ LAWS = [
         "title_number": "101",
         "scope": "Notificarea prealabilă, contestația la CNSC, termenele de exercitare a căilor de atac.",
     },
+    # The implementing norms. Note the doc_id: 179009 is the two-article
+    # *decision* that approves the norms; the norms themselves are its
+    # Anexă, published as a separate document (227145, 342 articles). The
+    # decision's page renders only the approving articles, which is why
+    # the "refusing to write a truncated law" guard below fired on it —
+    # working exactly as intended.
+    #
+    # Ingested to settle a question this product answers on every pricing
+    # screen: where the "80% of the estimated value" abnormally-low-price
+    # threshold actually lives. Answer, verified against both consolidated
+    # texts: nowhere. Legea 98/2016 art. 210 states a qualitative test and
+    # six justification headings with no percentage, and art. 136 of these
+    # norms — the article always cited for it — has exactly three
+    # paragraphs and no figure either; the string "80" appears in the
+    # whole document only as article numbers. The 80% rule is a survival
+    # from the repealed OUG 34/2006 regime that procurement guidance (and
+    # every LLM trained on it) still repeats. What art. 136 alin. (2) does
+    # give is the list of evidence a justification must carry, which is
+    # what the generator is built on instead.
+    {
+        "key": "HG395/2016",
+        "doc_id": 227145,
+        "name": "Normele metodologice aprobate prin HG nr. 395/2016",
+        "title_contains": "NORMA",
+        "title_number": "02/06/2016",
+        "scope": "Normele de aplicare a Legii 98/2016 — desfășurarea procedurii, evaluarea ofertelor, regimul ofertei cu preț aparent neobișnuit de scăzut.",
+    },
 ]
 
 HEADERS = {
