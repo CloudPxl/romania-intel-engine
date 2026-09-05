@@ -279,7 +279,11 @@ class ProcurementAICopilot:
     @staticmethod
     def generate_72h_macro_report(leads: List[Dict[str, Any]]) -> Dict[str, Any]:
         telemetry = _build_market_telemetry(leads)
-        return {"period": "Ultimele 72 de ore (Radar Achiziții Publice)", **telemetry}
+        # Short on purpose: the frontend renders this in a fixed, non-
+        # shrinking uppercase eyebrow beside the "Sinteză macro" heading, so
+        # a sentence-length value here squashed the heading out of the
+        # column instead of labelling it.
+        return {"period": "72h", **telemetry}
 
     @staticmethod
     async def generate_custom_market_report(
