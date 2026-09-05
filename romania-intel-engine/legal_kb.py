@@ -234,11 +234,15 @@ TOPICS: Dict[str, Dict[str, Any]] = {
     },
     "abnormally_low_price": {
         "label": "Preț aparent neobișnuit de scăzut",
-        "articles": ["L98/2016:210"],
+        "articles": ["L98/2016:210", "HG395/2016:136"],
         "note": (
             "Obligația autorității de a cere clarificări și cele șase capitole pe care "
-            "justificarea prețului trebuie să le acopere — alin. (2) lit. a)-f). "
-            "Atenție: articolul NU conține un prag procentual de 80%."
+            "justificarea prețului trebuie să le acopere — art. 210 alin. (2) lit. a)-f) — "
+            "plus dovezile concludente pe care explicația trebuie să le însoțească, enumerate "
+            "la art. 136 alin. (2) din norme. Atenție: NICIUNUL dintre cele două articole nu "
+            "conține un prag procentual. Regula „sub 80% din valoarea estimată” provine din "
+            "OUG 34/2006, abrogată; testul în vigoare este calitativ, prin raportare la "
+            "prețurile pieței."
         ),
     },
     "clarification_requests": {
