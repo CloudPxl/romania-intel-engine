@@ -2,6 +2,7 @@ import logging
 from datetime import date
 from typing import Any, Dict, List, Optional
 
+import legal_kb
 from ai_copilot import complete_text, list_llm_providers
 
 logger = logging.getLogger("DossierGenerator")
@@ -263,6 +264,17 @@ class TechnicalDossierGenerator:
             "sections_count": len(structured_sections),
             "status": "ready",
             "disclaimer": disclaimer,
+            # The provisions this dossier's compliance table is built on,
+            # quoted from the consolidated texts rather than paraphrased —
+            # so the bidder can check what the law actually requires of the
+            # section they are filling in, instead of taking a template's
+            # word for it. Empty when the knowledge base has not been built
+            # (scripts/build_legal_kb.py); the document stands on its own
+            # either way.
+            "statutory_basis": {
+                name: legal_kb.topic(name)["articles"]
+                for name in ("technical_specifications", "exclusion_grounds", "qualification_criteria")
+            },
         }
 
     @staticmethod

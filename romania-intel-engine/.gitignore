@@ -19,3 +19,9 @@ data/raw_pdfs/*
 .vscode/
 .idea/
 *.log
+
+# Raw legislation pages cached by scripts/build_legal_kb.py. Rebuildable
+# from legislatie.just.ro and several MB of HTML — the extracted knowledge
+# base (data/legal_kb.json) is what the app reads and IS committed, since
+# render.yaml's build only runs pip install and cannot fetch it.
+data/.legal_source_cache/

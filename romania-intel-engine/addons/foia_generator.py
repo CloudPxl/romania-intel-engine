@@ -2,6 +2,7 @@ import logging
 from datetime import date, timedelta
 from typing import Any, Dict, Optional
 
+import legal_kb
 from ai_copilot import complete_text, list_llm_providers
 
 logger = logging.getLogger("FOIAGenerator")
@@ -131,6 +132,17 @@ CUI: {cui_fiscal}
             "recipient": authority_name,
             "reference_id": source_id,
             "legal_basis": ["Legea nr. 98/2016, art. 160-161", "Legea nr. 98/2016, art. 2 alin. (2)", "HG nr. 395/2016"],
+            # The articles above, quoted from the consolidated text on the
+            # Ministry of Justice portal rather than paraphrased. A
+            # clarification request that reproduces the operative sentence
+            # is materially harder for an authority to brush aside than one
+            # that only names a number — and the quotation is verifiable,
+            # which a paraphrase is not.
+            "legal_basis_verified": legal_kb.topic("clarification_requests")["articles"],
+            # What happens if the authority does not answer, with the real
+            # deadlines: Art. 8 of Legea 101/2016, not the widely-cited
+            # Art. 6, which was repealed by OUG 45/2018.
+            "escalation_path": legal_kb.topic("remedies")["articles"],
             "generated_letter": letter.strip(),
             "disclaimer": (
                 "Schiță generată automat. Verificați termenul exact de depunere a solicitărilor din fișa "
