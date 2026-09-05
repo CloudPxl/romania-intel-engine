@@ -12,8 +12,8 @@ from decimal import Decimal
 from fastapi import FastAPI, HTTPException, Depends, Request, UploadFile, File, Form, Header
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse, JSONResponse
-from pydantic import BaseModel, EmailStr
-from typing import Any, Dict, List, Optional
+from pydantic import BaseModel, EmailStr, Field
+from typing import Any, Dict, List, Literal, Optional
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 import db
@@ -390,8 +390,18 @@ class ProformaRequest(BaseModel):
     billing_email: EmailStr
     billing_address: Optional[str] = "Romania"
 
+class CopilotTurn(BaseModel):
+    role: Literal["user", "assistant"]
+    content: str
+
 class CopilotQueryRequest(BaseModel):
     query: str
+    # Prior turns, oldest first. Bounded here as well as in ai_copilot's
+    # character budget: the transcript is client-supplied, so an unbounded
+    # list would let one caller push arbitrarily many turns into every
+    # provider call. 12 turns is ~6 exchanges, more than the model is
+    # given (it takes the last 8) and far more than a question needs.
+    history: List[CopilotTurn] = Field(default_factory=list, max_length=12)
 
 class PipelineAddRequest(BaseModel):
     lead_data: dict
@@ -1216,7 +1226,11 @@ async def copilot_chat(payload: CopilotQueryRequest, user: dict = Depends(requir
         )
         leads = feed_data.get("leads", [])
         reply = await asyncio.wait_for(
-            copilot_engine.answer_copilot_query(payload.query, leads),
+            copilot_engine.answer_copilot_query(
+                payload.query,
+                leads,
+                history=[t.model_dump() for t in payload.history],
+            ),
             timeout=COPILOT_CHAT_DEADLINE_SECONDS,
         )
         return {"reply": reply}
