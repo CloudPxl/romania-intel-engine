@@ -128,6 +128,38 @@ def _can_row(nid, authority, county, estimated, awarded, winner, offers=2, cpv="
     }
 
 
+def test_equal_estimate_and_award_is_not_a_zero_percent_discount():
+    """The live SEAP direct-acquisition award feed publishes only
+    `awardedValue` — it has no separate pre-award estimate — so the scraper
+    stores the same figure in both fields. Verified live: 300 notices, all
+    with the two equal.
+
+    Treating those as a 0% discount would be the most damaging number this
+    product could publish: "median winning discount 0.0%" across hundreds
+    of real awards, which _classify_pressure would then read as a
+    monopolised market in every sector.
+    """
+    rows = [_can_row(f"N{i}", "Primaria X", "Iasi", 100_000, 100_000, "ACME") for i in range(10)]
+    out = pn.summarize_awards(rows)
+    assert out["available"] is False
+    assert out["sample_size"] == 0
+    assert out["awards_without_estimate"] == 10
+    assert "winning_discount_pct" not in out
+    assert "competitive_pressure" not in out
+    assert "fără o valoare estimată" in out["reason"]
+
+
+def test_winners_are_still_reported_without_any_estimate():
+    """Who keeps winning needs no estimate behind it, so it must survive
+    the exclusion above — otherwise the real data is thrown away with the
+    uncomputable statistic."""
+    rows = [_can_row(f"A{i}", "Primaria X", "Iasi", 100_000, 100_000, "ACME") for i in range(8)]
+    rows += [_can_row(f"B{i}", "Primaria X", "Iasi", 100_000, 100_000, "Beta") for i in range(2)]
+    out = pn.summarize_awards(rows)
+    assert out["recurring_winners"][0] == {"name": "ACME", "awards": 8, "share_pct": 80.0}
+    assert out["authority_profiles"][0]["top_winner_share_pct"] == 80.0
+
+
 def test_award_summary_refuses_to_report_below_the_minimum_sample():
     below = pn.MIN_AWARD_SAMPLE - 1
     rows = [_can_row(f"N{i}", "Primaria X", "Iasi", 100_000, 95_000, "ACME") for i in range(below)]

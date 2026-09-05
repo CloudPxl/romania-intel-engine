@@ -310,6 +310,41 @@ def _award_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return out
 
 
+def _count_winners(awards: List[Dict[str, Any]]):
+    from collections import Counter
+
+    return Counter(a["winner"] for a in awards if a["winner"])
+
+
+def _authority_profiles(awards: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Who keeps winning at each authority.
+
+    Named plainly as a count of observed awards, not an accusation: a firm
+    can legitimately win repeatedly by being the only one qualified in a
+    small county, and the concentration figure is evidence for a question,
+    not an answer to it.
+    """
+    from collections import Counter
+
+    by_authority: Dict[str, Counter] = {}
+    for a in awards:
+        if a["authority_name"] and a["winner"]:
+            by_authority.setdefault(a["authority_name"], Counter())[a["winner"]] += 1
+    profiles = []
+    for authority, winners in by_authority.items():
+        total = sum(winners.values())
+        top_winner, top_count = winners.most_common(1)[0]
+        profiles.append({
+            "authority": authority,
+            "awards_observed": total,
+            "distinct_winners": len(winners),
+            "top_winner": top_winner,
+            "top_winner_share_pct": round(top_count / total * 100, 1),
+        })
+    profiles.sort(key=lambda x: x["awards_observed"], reverse=True)
+    return profiles[:10]
+
+
 def summarize_awards(
     rows: List[Dict[str, Any]],
     cpv_prefix: Optional[str] = None,
@@ -326,25 +361,69 @@ def summarize_awards(
     from collections import Counter
 
     awards = _award_rows(rows)
+
+    # A discount needs two DIFFERENT numbers. SEAP's direct-acquisition
+    # award feed publishes only `awardedValue` — it carries no separate
+    # pre-award estimate — so direct_acquisition_scraper._build_notice
+    # stores that one figure in both `financial.estimated_value_ron` and
+    # `award_details.awarded_value_ron`. Verified live against the feed:
+    # 300 notices, every one of them with the two equal.
+    #
+    # Treating those as a 0% discount would be the single most damaging
+    # number this product could publish: it would report "median winning
+    # discount: 0.0%" over hundreds of real awards, and _classify_pressure
+    # would then label every sector "Monopolizat" on the strength of it.
+    # They are excluded from the priced set and counted separately, so the
+    # response says "we have awards but no estimates to compare them to"
+    # rather than inventing a comparison.
+    no_estimate = [
+        a for a in awards
+        if (a["awarded_value_ron"] or 0) > 0
+        and (a["estimated_value_ron"] or 0) > 0
+        and abs(a["estimated_value_ron"] - a["awarded_value_ron"]) < 0.01
+    ]
     priced = [
         a for a in awards
-        if (a["awarded_value_ron"] or 0) > 0 and (a["estimated_value_ron"] or 0) > 0
+        if (a["awarded_value_ron"] or 0) > 0
+        and (a["estimated_value_ron"] or 0) > 0
+        and abs(a["estimated_value_ron"] - a["awarded_value_ron"]) >= 0.01
     ]
 
     result: Dict[str, Any] = {
         "available": len(priced) >= MIN_AWARD_SAMPLE,
         "sample_size": len(priced),
         "awards_seen": len(awards),
+        "awards_without_estimate": len(no_estimate),
         "min_sample_required": MIN_AWARD_SAMPLE,
         "cpv_prefix": cpv_prefix,
         "county": county,
     }
 
+    # Even without a discount, the winners themselves are real and worth
+    # reporting — who keeps winning at a given authority is an observation
+    # that needs no estimate at all.
+    winners_all = _count_winners(awards)
+    if winners_all:
+        result["recurring_winners"] = [
+            {"name": name, "awards": n, "share_pct": round(n / sum(winners_all.values()) * 100, 1)}
+            for name, n in winners_all.most_common(8)
+        ]
+        result["authority_profiles"] = _authority_profiles(awards)
+
     if not priced:
         result["reason"] = (
-            "Niciun anunț de atribuire cu valoare atribuită și valoare estimată "
-            "pentru acest filtru. Ingerăm anunțuri de atribuire doar pentru "
-            "achizițiile directe (SEAP CAN); pentru licitațiile deschise nu avem încă rezultate."
+            (
+                f"Avem {len(no_estimate)} anunțuri de atribuire pentru acest filtru, dar feedul SEAP "
+                "de achiziții directe publică doar valoarea atribuită, fără o valoare estimată "
+                "separată — deci nu se poate calcula niciun discount câștigător. Câștigătorii "
+                "observați sunt reali și sunt afișați mai jos."
+            )
+            if no_estimate
+            else (
+                "Niciun anunț de atribuire cu valoare atribuită pentru acest filtru. Ingerăm "
+                "anunțuri de atribuire doar pentru achizițiile directe (SEAP CAN); pentru "
+                "licitațiile deschise nu avem încă rezultate."
+            )
         )
         return result
 
@@ -364,30 +443,15 @@ def summarize_awards(
         "max": round(max(discounts), 2),
     }
 
-    # Recurring winners per authority. Named plainly: this is a count of
-    # observed awards, not an accusation — a firm can legitimately win
-    # repeatedly by being the only one qualified in a small county.
-    by_authority: Dict[str, Counter] = {}
-    for a in priced:
-        if a["authority_name"] and a["winner"]:
-            by_authority.setdefault(a["authority_name"], Counter())[a["winner"]] += 1
-    authority_profiles = []
-    for authority, winners in by_authority.items():
-        total = sum(winners.values())
-        top_winner, top_count = winners.most_common(1)[0]
-        authority_profiles.append({
-            "authority": authority,
-            "awards_observed": total,
-            "distinct_winners": len(winners),
-            "top_winner": top_winner,
-            "top_winner_share_pct": round(top_count / total * 100, 1),
-        })
-    authority_profiles.sort(key=lambda x: x["awards_observed"], reverse=True)
-    result["authority_profiles"] = authority_profiles[:10]
-
-    winners = Counter(a["winner"] for a in priced if a["winner"])
+    # Recurring winners are computed over EVERY award, not just the priced
+    # ones — winning repeatedly is an observation that does not need an
+    # estimate behind it, and restricting it to the priced subset would
+    # discard most of the real data.
+    result["authority_profiles"] = _authority_profiles(awards)
+    winners = _count_winners(awards)
+    total_wins = sum(winners.values()) or 1
     result["recurring_winners"] = [
-        {"name": name, "awards": n, "share_pct": round(n / len(priced) * 100, 1)}
+        {"name": name, "awards": n, "share_pct": round(n / total_wins * 100, 1)}
         for name, n in winners.most_common(8)
     ]
 
