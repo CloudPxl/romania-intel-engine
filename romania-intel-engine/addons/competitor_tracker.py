@@ -2,7 +2,15 @@ import logging
 import statistics
 from typing import Any, Dict, List, Optional
 
+from text_utils import normalize_county
+
 logger = logging.getLogger("CompetitorTracker")
+
+# Below this many local procedures a county median is noise, not a
+# measurement — one contract would move it by half its own value. At or
+# above it the analysis is scoped to the county; below, it falls back to
+# the national set and says so.
+MIN_COUNTY_SAMPLE = 3
 
 # What this module used to contain, and why it was removed:
 #
@@ -25,15 +33,20 @@ logger = logging.getLogger("CompetitorTracker")
 # opportunities this system has actually ingested. Where we have no data,
 # the response says so instead of filling the gap.
 
-# Pricing guidance that does not depend on data we lack. Legea 98/2016
-# requires a contracting authority to seek justification for a tender that
-# appears abnormally low; the exact article is deliberately not cited here
-# because it must be confirmed against the version in force, and an
-# incorrect citation in a pricing recommendation is worse than none.
+# Pricing guidance. The article numbers below are no longer withheld: both
+# texts are now ingested from the consolidated versions on
+# legislatie.just.ro (scripts/build_legal_kb.py) and can be quoted rather
+# than recalled. What that ingestion settled, and what this text is careful
+# to say correctly: neither art. 210 of Legea 98/2016 nor art. 136 of the
+# HG 395/2016 norms contains a percentage threshold. The "under 80% of the
+# estimate is automatically abnormally low" rule is a survival from the
+# repealed OUG 34/2006 and is stated nowhere in force.
 UNUSUALLY_LOW_GUIDANCE = (
-    "Ofertele semnificativ sub valoarea estimată pot atrage solicitarea de justificare a prețului "
-    "(regimul ofertei cu preț neobișnuit de scăzut din Legea nr. 98/2016). Pregătiți fundamentarea "
-    "costurilor înainte de a coborî substanțial sub estimarea autorității."
+    "Dacă prețul dvs. pare neobișnuit de scăzut raportat la prețurile pieței, comisia de evaluare "
+    "este obligată să vă ceară explicații (art. 210 din Legea nr. 98/2016, art. 136 din normele "
+    "aprobate prin HG nr. 395/2016) și poate respinge oferta doar dacă dovezile nu justifică "
+    "nivelul prețului. Legea nu prevede un prag procentual — testul este calitativ — dar pregătiți "
+    "fundamentarea costurilor înainte de a coborî substanțial sub estimarea autorității."
 )
 
 SECTOR_QUALITATIVE_NOTES = {
@@ -52,6 +65,7 @@ class CompetitorTrackerEngine:
         county: str,
         budget_ron: float,
         observed_opportunities: Optional[List[Dict[str, Any]]] = None,
+        award_stats: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Builds a sector view from opportunities this system has ingested.
 
@@ -68,25 +82,79 @@ class CompetitorTrackerEngine:
             if (o.get("category") or "").lower() == cat_key
             and (o.get("financial_value_ron") or 0) > 0
         ]
-        values = sorted(o["financial_value_ron"] for o in comparable)
 
-        same_county = [
-            o for o in comparable
-            if (o.get("county") or "").lower() == (county or "").lower()
-        ]
+        # County matching goes through the same normaliser the ranked feed
+        # uses, not `.lower()`. `"Iași".lower()` is `"iași"`, which never
+        # equals the `"iasi"` a user types — so the county the caller asked
+        # for silently matched only those sources that happen to publish
+        # without diacritics, and missed the rest.
+        county_key = normalize_county(county or "")
+        same_county = [o for o in comparable if normalize_county(o.get("county") or "") == county_key]
 
-        authorities = sorted({
-            o.get("entity_name") for o in comparable if o.get("entity_name")
-        })
+        # The analysis is now actually *of* the requested county.
+        #
+        # Previously the county was counted and then thrown away: the value
+        # distribution and the authority list were both computed over the
+        # nationwide `comparable` set. Asking about Iași returned a median
+        # from 54 national procedures and named Compania de Apă Oradea and
+        # Primăria Municipiului București as the authorities observed —
+        # correct numbers answering a question nobody asked, which is
+        # indistinguishable from invented data at the point of use.
+        #
+        # Below the floor there is not enough local data to say anything,
+        # so it falls back to the national set and the response states that
+        # in `scope`, rather than quietly presenting one as the other.
+        scoped_to_county = bool(county_key) and len(same_county) >= MIN_COUNTY_SAMPLE
+        analysed = same_county if scoped_to_county else comparable
+        # Echo the county the way the sources spell it ("Iași"), not the way
+        # it was typed ("iasi") — the whole point of normalising is that the
+        # user should not have to.
+        county_display = (same_county[0].get("county") if same_county else None) or county
+        values = sorted(o["financial_value_ron"] for o in analysed)
+
+        authorities = sorted({o.get("entity_name") for o in analysed if o.get("entity_name")})
 
         observed: Dict[str, Any] = {
             "comparable_procedures_ingested": len(comparable),
             "in_requested_county": len(same_county),
+            "analysed_procedures": len(analysed),
+            # Names, in the payload itself, which set every figure below was
+            # computed over — so a national fallback can never be read as a
+            # local finding.
+            "scope": "county" if scoped_to_county else "national",
+            "scope_note": (
+                f"Cifrele de mai jos sunt calculate din cele {len(same_county)} proceduri "
+                f"din {county_display}."
+                if scoped_to_county
+                else (
+                    f"Doar {len(same_county)} proceduri din {county_display} au valoare publicată — "
+                    f"prea puține pentru o analiză locală, așa că cifrele de mai jos acoperă "
+                    f"întreaga țară ({len(comparable)} proceduri)."
+                    if county_key
+                    else f"Analiză națională: {len(comparable)} proceduri în acest domeniu."
+                )
+            ),
             # These are the authorities we have actually seen publishing in
             # this sector — not a competitor list. We hold no bidder data,
             # and the distinction is stated explicitly because the previous
             # version blurred exactly this line.
             "contracting_authorities_observed": authorities[:10],
+            # The procedures behind the numbers, so the UI can link straight
+            # to each dossier instead of leaving the reader to search a
+            # figure back out of the register by hand.
+            "procedures": [
+                {
+                    "source_id": o.get("source_id"),
+                    "project_title": o.get("project_title"),
+                    "entity_name": o.get("entity_name"),
+                    "county": o.get("county"),
+                    "financial_value_ron": o.get("financial_value_ron"),
+                    "published_date": o.get("published_date"),
+                }
+                for o in sorted(
+                    analysed, key=lambda x: x.get("financial_value_ron") or 0, reverse=True
+                )[:12]
+            ],
         }
         if values:
             observed["value_distribution_ron"] = {
@@ -108,11 +176,13 @@ class CompetitorTrackerEngine:
                 cat_key, "Criteriile tehnice se citesc din fișa de date a achiziției."
             ),
         }
+        awards = award_stats or {"available": False, "sample_size": 0}
+        has_awards = bool(awards.get("available"))
+
         if budget_ron and budget_ron > 0:
-            # Arithmetic reference points, labelled as such. These are not
-            # predictions of a winning bid — we have no award data to
-            # support one — they are simply percentages of the stated
-            # estimate, so the user can reason about their own margin.
+            # Arithmetic reference points, labelled as such. These are
+            # percentages of the stated estimate, so the user can reason
+            # about their own margin.
             pricing["reference_points_ron"] = {
                 "at_estimate_100pct": round(budget_ron, 2),
                 "minus_5pct": round(budget_ron * 0.95, 2),
@@ -120,22 +190,50 @@ class CompetitorTrackerEngine:
                 "minus_15pct": round(budget_ron * 0.85, 2),
             }
             pricing["reference_points_note"] = (
-                "Procente aplicate valorii estimate publicate, nu prognoze de câștig. "
-                "Sistemul nu colectează rezultate de atribuire, deci nu poate estima prețul câștigător."
+                "Procente aplicate valorii estimate publicate — repere de calcul, nu prognoze de câștig."
             )
+            # Where real award data exists, the observed winning discount is
+            # a far better reference point than an arbitrary 5/10/15% ladder,
+            # so it is added as its own labelled figure rather than replacing
+            # the ladder (the two answer different questions: "what did
+            # winners actually bid" vs "what would my margin be at X%").
+            if has_awards:
+                median = awards["winning_discount_pct"]["median"]
+                pricing["observed_winning_price_ron"] = {
+                    "at_median_observed_discount": round(budget_ron * (1 - median / 100), 2),
+                    "median_discount_pct": median,
+                    "sample_size": awards["sample_size"],
+                }
+                pricing["observed_winning_price_note"] = (
+                    f"Calculat din {awards['sample_size']} atribuiri reale ingerate pentru acest filtru "
+                    f"(discount median {median:.1f}%). Este o observație istorică, nu o garanție."
+                )
         else:
             pricing["reference_points_ron"] = None
             pricing["reference_points_note"] = "Valoarea estimată nu este publicată; nu se pot calcula repere de preț."
 
         return {
             "sector": (category or "").capitalize(),
-            "county": county,
+            "county": county_display,
             "estimated_budget_ron": budget_ron or None,
             "observed_market": observed,
             "pricing": pricing,
+            # Real outcomes, where we have them. Always present as a block
+            # so the frontend renders the same shape either way, with
+            # `available` and `sample_size` carrying whether anything in it
+            # can be relied on.
+            "award_intelligence": awards,
             "data_limitations": (
-                "Analiza se bazează exclusiv pe anunțurile colectate de acest sistem. "
-                "Nu includem istoricul atribuirilor, ofertele concurenței sau deciziile CNSC, "
-                "deci nu raportăm rate de contestare, discounturi istorice sau liste de competitori."
+                (
+                    "Rezultatele de atribuire acoperă doar achizițiile directe (anunțuri SEAP de tip CAN) — "
+                    "singurele pentru care acest sistem ingerează câștigători și prețuri. "
+                    "Nu includem deciziile CNSC, deci nu raportăm rate de contestare."
+                )
+                if has_awards
+                else (
+                    "Analiza se bazează pe anunțurile colectate de acest sistem. Pentru filtrul curent "
+                    "nu avem suficiente anunțuri de atribuire, deci nu raportăm discounturi câștigătoare "
+                    "sau competitori. Nu includem deciziile CNSC."
+                )
             ),
         }

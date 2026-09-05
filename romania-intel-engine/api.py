@@ -18,6 +18,7 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 import db
 import document_extractions
+import procurement_notices
 from workers import document_tasks
 from matching_engine import RelevanceEngine
 from workflow_engine import ConcurrentWorkflowEngine
@@ -1014,11 +1015,21 @@ async def analyze_competitor_landscape(payload: CompetitorAnalysisRequest, _user
     # Feed the engine the opportunities actually ingested, so the sector
     # view is computed from real data. It previously received nothing and
     # answered from a hardcoded benchmark table.
+    feed, awards = await asyncio.gather(
+        _load_feed(),
+        # Real award outcomes for the same county, where any have been
+        # ingested. Returns an explicit "not available + why" block rather
+        # than raising when there is nothing, so the analysis degrades to
+        # the market-only view instead of failing.
+        procurement_notices.get_award_statistics(county=payload.county),
+        return_exceptions=False,
+    )
     return CompetitorTrackerEngine.analyze_landscape(
         payload.category,
         payload.county,
         payload.budget_ron,
-        observed_opportunities=(await _load_feed()).get("leads", []),
+        observed_opportunities=feed.get("leads", []),
+        award_stats=awards,
     )
 
 @app.post("/api/v1/addons/upload-caiet")

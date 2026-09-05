@@ -25,6 +25,7 @@ import json
 import re
 from typing import Any, Dict, List, Literal, Optional
 
+import asyncpg
 from pydantic import BaseModel, Field
 
 import db
@@ -189,3 +190,276 @@ async def update_ingest_state(notice_type: NoticeType, last_synced_date, last_it
             """,
             notice_type, last_synced_date, last_item_id,
         )
+
+
+# ---------------------------------------------------------------------------
+# Award intelligence.
+#
+# What separates this from the rest of the analytics in this codebase is
+# that award notices are the ONE place where a real outcome is recorded:
+# who won, at what price, against how many bidders. Everything else the
+# product computes is about procedures that have not been decided yet, so
+# it can describe the market but never the result.
+#
+# That makes the honesty rule here stricter, not looser. Only CAN rows
+# carry an award, and today only direct acquisitions produce them (see this
+# module's docstring), so the coverage is genuinely narrow. Every function
+# below reports the sample it computed from, and returns "no data" rather
+# than a national average dressed up as a local one — a discount figure
+# derived from four notices would otherwise drive a real pricing decision.
+# ---------------------------------------------------------------------------
+
+# Under this many awards, a median discount is an anecdote. Stated as a
+# constant so the response can name the threshold it failed to meet.
+MIN_AWARD_SAMPLE = 5
+
+
+async def get_award_statistics(
+    cpv_prefix: Optional[str] = None,
+    county: Optional[str] = None,
+    limit: int = 500,
+) -> Dict[str, Any]:
+    """Real winning-price behaviour, computed from ingested award notices.
+
+    `cpv_prefix` matches on the leading digits of the CPV code — CPV is
+    hierarchical (45000000 works, 45200000 building works), so a prefix is
+    how you widen from "this exact thing" to "this family of things"
+    without leaving the sector.
+
+    Returns a dict that ALWAYS carries `sample_size` and `available`, so a
+    caller cannot accidentally render a statistic computed from nothing.
+    """
+    empty = {
+        "available": False,
+        "sample_size": 0,
+        "reason": "Nu există anunțuri de atribuire ingerate pentru acest filtru.",
+        "cpv_prefix": cpv_prefix,
+        "county": county,
+    }
+
+    async with db.with_connection() as conn:
+        if conn is None:
+            return {**empty, "reason": "Baza de date nu este disponibilă."}
+        clauses = ["notice_type = 'CAN'", "award_details IS NOT NULL"]
+        params: List[Any] = []
+        if cpv_prefix:
+            params.append(f"{cpv_prefix}%")
+            clauses.append(f"cpv_code LIKE ${len(params)}")
+        if county:
+            # Reuses db._PG_COUNTY_KEY rather than restating the translate()
+            # map: that map's two strings must stay the same length or
+            # Postgres rejects the call at runtime, and a second copy is
+            # exactly how they drift apart.
+            params.append(db._county_key(county))
+            county_expr = db._PG_COUNTY_KEY.format(
+                col="COALESCE(contracting_authority->>'county', '')"
+            )
+            clauses.append(f"{county_expr} = ${len(params)}")
+        params.append(limit)
+        try:
+            rows = await conn.fetch(
+                f"""
+                SELECT notice_id, cpv_code, contracting_authority, financial,
+                       award_details, timeline
+                FROM procurement_notices
+                WHERE {' AND '.join(clauses)}
+                ORDER BY last_seen_at DESC
+                LIMIT ${len(params)}
+                """,
+                *params,
+            )
+        except asyncpg.exceptions.UndefinedTableError:
+            return {**empty, "reason": "Tabela procurement_notices nu există — rulați schema.sql."}
+        except Exception as e:  # pragma: no cover - defensive
+            return {**empty, "reason": f"Interogarea a eșuat: {type(e).__name__}"}
+
+    return summarize_awards([dict(r) for r in rows], cpv_prefix=cpv_prefix, county=county)
+
+
+def _award_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Flattens the JSONB columns into plain dicts, dropping any row whose
+    award is not actually usable.
+
+    A CAN row can exist with `award_details` present but the winning value
+    missing — the notice was published, the figure was not. Those count
+    toward "awards seen" and must not count toward any average, so they are
+    separated here rather than silently coerced to zero.
+    """
+    out: List[Dict[str, Any]] = []
+    for r in rows:
+        award = r.get("award_details") or {}
+        financial = r.get("financial") or {}
+        authority = r.get("contracting_authority") or {}
+        if isinstance(award, str):
+            award = json.loads(award)
+        if isinstance(financial, str):
+            financial = json.loads(financial)
+        if isinstance(authority, str):
+            authority = json.loads(authority)
+        out.append({
+            "notice_id": r.get("notice_id"),
+            "cpv_code": r.get("cpv_code"),
+            "authority_name": authority.get("name"),
+            "county": authority.get("county"),
+            "estimated_value_ron": financial.get("estimated_value_ron") or 0.0,
+            "winner": award.get("winning_bidder_name"),
+            "winner_cui": award.get("winning_bidder_cui"),
+            "awarded_value_ron": award.get("awarded_value_ron"),
+            "offers": award.get("number_of_offers_received"),
+        })
+    return out
+
+
+def summarize_awards(
+    rows: List[Dict[str, Any]],
+    cpv_prefix: Optional[str] = None,
+    county: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Turns raw award rows into the three findings that actually change a
+    bidding decision, or says why it cannot.
+
+    Kept separate from the query so it is directly testable without a
+    database, and so the same summary can be computed over rows obtained
+    any other way.
+    """
+    import statistics as _stats
+    from collections import Counter
+
+    awards = _award_rows(rows)
+    priced = [
+        a for a in awards
+        if (a["awarded_value_ron"] or 0) > 0 and (a["estimated_value_ron"] or 0) > 0
+    ]
+
+    result: Dict[str, Any] = {
+        "available": len(priced) >= MIN_AWARD_SAMPLE,
+        "sample_size": len(priced),
+        "awards_seen": len(awards),
+        "min_sample_required": MIN_AWARD_SAMPLE,
+        "cpv_prefix": cpv_prefix,
+        "county": county,
+    }
+
+    if not priced:
+        result["reason"] = (
+            "Niciun anunț de atribuire cu valoare atribuită și valoare estimată "
+            "pentru acest filtru. Ingerăm anunțuri de atribuire doar pentru "
+            "achizițiile directe (SEAP CAN); pentru licitațiile deschise nu avem încă rezultate."
+        )
+        return result
+
+    # The winning discount: how far below the authority's own estimate the
+    # winner actually bid. This is the number every other "average discount"
+    # in this product refused to state, because until award ingestion there
+    # was nothing to derive it from.
+    discounts = [
+        (1 - (a["awarded_value_ron"] / a["estimated_value_ron"])) * 100
+        for a in priced
+        if a["estimated_value_ron"] > 0
+    ]
+    result["winning_discount_pct"] = {
+        "average": round(_stats.mean(discounts), 2),
+        "median": round(_stats.median(discounts), 2),
+        "min": round(min(discounts), 2),
+        "max": round(max(discounts), 2),
+    }
+
+    # Recurring winners per authority. Named plainly: this is a count of
+    # observed awards, not an accusation — a firm can legitimately win
+    # repeatedly by being the only one qualified in a small county.
+    by_authority: Dict[str, Counter] = {}
+    for a in priced:
+        if a["authority_name"] and a["winner"]:
+            by_authority.setdefault(a["authority_name"], Counter())[a["winner"]] += 1
+    authority_profiles = []
+    for authority, winners in by_authority.items():
+        total = sum(winners.values())
+        top_winner, top_count = winners.most_common(1)[0]
+        authority_profiles.append({
+            "authority": authority,
+            "awards_observed": total,
+            "distinct_winners": len(winners),
+            "top_winner": top_winner,
+            "top_winner_share_pct": round(top_count / total * 100, 1),
+        })
+    authority_profiles.sort(key=lambda x: x["awards_observed"], reverse=True)
+    result["authority_profiles"] = authority_profiles[:10]
+
+    winners = Counter(a["winner"] for a in priced if a["winner"])
+    result["recurring_winners"] = [
+        {"name": name, "awards": n, "share_pct": round(n / len(priced) * 100, 1)}
+        for name, n in winners.most_common(8)
+    ]
+
+    offers = [a["offers"] for a in priced if a["offers"]]
+    result["offers_per_procedure"] = (
+        {"average": round(_stats.mean(offers), 1), "sample": len(offers)} if offers else None
+    )
+
+    result["competitive_pressure"] = _classify_pressure(
+        winners=winners,
+        total_awards=len(priced),
+        median_discount=result["winning_discount_pct"]["median"],
+        avg_offers=(_stats.mean(offers) if offers else None),
+    )
+    return result
+
+
+def _classify_pressure(
+    winners,
+    total_awards: int,
+    median_discount: float,
+    avg_offers: Optional[float],
+) -> Dict[str, Any]:
+    """Names the shape of the competition, from the two signals that
+    actually distinguish them: how concentrated the winners are, and how
+    much of the estimate the winner had to give up.
+
+    The label is a summary of the observed sample and says so — the bands
+    are a stated convention, not a fitted model, and the evidence that
+    produced the label travels with it so the reader can disagree.
+    """
+    top_share = (winners.most_common(1)[0][1] / total_awards * 100) if winners else 0.0
+
+    if top_share >= 60 and median_discount < 5:
+        label, code = "Monopolizat", "monopolized"
+        detail = (
+            f"Un singur ofertant câștigă {top_share:.0f}% din atribuirile observate, "
+            f"cu un discount median de doar {median_discount:.1f}%. Intrarea este dificilă, "
+            "dar marja aparentă este mare — verificați dacă există cerințe de calificare care vă exclud."
+        )
+    elif median_discount >= 20 or (avg_offers is not None and avg_offers >= 6):
+        label, code = "Concurență agresivă", "cutthroat"
+        detail = (
+            f"Discount median de {median_discount:.1f}%"
+            + (f", în medie {avg_offers:.1f} oferte pe procedură" if avg_offers else "")
+            + ". Marja este strânsă; câștigă cine are costurile cele mai mici, nu cine ofertează cel mai des."
+        )
+    elif total_awards < 12 and median_discount < 10:
+        label, code = "Slab acoperit", "under_served"
+        detail = (
+            f"Puține atribuiri observate ({total_awards}) și discount median mic "
+            f"({median_discount:.1f}%) — semn de concurență redusă și marjă disponibilă."
+        )
+    else:
+        label, code = "Concurență normală", "competitive"
+        detail = (
+            f"Discount median de {median_discount:.1f}% pe {total_awards} atribuiri observate, "
+            "fără un câștigător dominant."
+        )
+
+    return {
+        "label": label,
+        "code": code,
+        "detail": detail,
+        "evidence": {
+            "top_winner_share_pct": round(top_share, 1),
+            "median_discount_pct": median_discount,
+            "average_offers": round(avg_offers, 1) if avg_offers else None,
+            "awards_analysed": total_awards,
+        },
+        "method_note": (
+            "Clasificare pe praguri fixe, declarate, aplicate eșantionului observat — "
+            "nu un model statistic. Dovezile sunt afișate ca să puteți verifica încadrarea."
+        ),
+    }
