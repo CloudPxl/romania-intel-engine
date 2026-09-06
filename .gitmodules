@@ -1,0 +1,3 @@
+[submodule "romania-intel-frontend"]
+	path = romania-intel-frontend
+	url = https://github.com/CloudPxl/romania-intel-frontend.git
