@@ -35,7 +35,33 @@ class TestWordPatterns:
         assert db._pg_word_patterns(["reabilitaţi"]) == [r"\mreabilitati\M"]
 
     def test_multi_word_term_becomes_a_phrase(self):
-        assert db._pg_word_patterns(["drum judetean"]) == [r"\mdrum\s+judetean\M"]
+        assert db._pg_word_patterns(["drum judetean"]) == [r"\mdrum[[:space:]-]+judetean\M"]
+
+    def test_hyphenated_term_matches_both_spellings(self):
+        """A `\\s+` join could not match the literal "Cluj-Napoca" it was
+        built from, so the ranked feed silently dropped the keyword boost
+        for every hyphenated term. The separator must accept either."""
+        (pattern,) = db._pg_word_patterns(["Cluj-Napoca"])
+        assert pattern == r"\mcluj[[:space:]-]+napoca\M"
+        # Postgres's \m..\M are its own word boundaries; the rest of the
+        # pattern must behave in Python too, since text_utils runs the
+        # equivalent match in-process for alerting.
+        import re
+        py = pattern.replace(r"\m", r"\b").replace(r"\M", r"\b").replace("[[:space:]-]", r"[\s\-]")
+        assert re.search(py, "modernizare in cluj-napoca")
+        assert re.search(py, "modernizare in cluj napoca")
+
+    def test_python_and_sql_matchers_agree_on_separators(self):
+        """These two implementations decide the same question — one for
+        alerting, one for the feed — and drifting apart means a keyword
+        that alerts but never ranks, or the reverse."""
+        from text_utils import term_pattern
+
+        for term in ("Cluj-Napoca", "drum judetean", "e-guvernare", "spital"):
+            sql = db._pg_word_patterns([term])[0]
+            py = term_pattern(term)
+            normalised_sql = sql.replace(r"\m", r"\b").replace(r"\M", r"\b").replace("[[:space:]-]", r"[\s\-]")
+            assert normalised_sql == py, term
 
     def test_drops_empty_and_punctuation_only_terms(self):
         assert db._pg_word_patterns(["", "   ", "!!!"]) == []

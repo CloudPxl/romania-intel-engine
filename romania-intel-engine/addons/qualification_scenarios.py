@@ -151,13 +151,26 @@ def _scenario_a(
     elif required_turnover is not None:
         # The real requirement is known, so this is a direct comparison
         # rather than an inference.
-        if required_turnover > (ceiling or 0):
+        #
+        # `ceiling is None` whenever the estimated value is unpublished,
+        # which is a first-class state everywhere else in this codebase —
+        # and `(ceiling or 0)` made this branch reachable in exactly that
+        # case, where the f-string then formatted None and raised
+        # TypeError. A 500 after two live ANAF round-trips, from an input
+        # the request model explicitly permits.
+        if ceiling is not None and required_turnover > ceiling:
             findings.append(
                 f"Cerința de cifră de afaceri din documentație ({required_turnover:,.0f} RON) "
                 f"depășește plafonul de {MAX_TURNOVER_REQUIREMENT_MULTIPLIER:g}× valoarea estimată "
                 f"({ceiling:,.0f} RON) prevăzut la art. 175 alin. (2) lit. a). "
                 "Poate fi contestată printr-o solicitare de clarificări, cu excepția cazului în care "
                 "autoritatea a motivat depășirea conform art. 175 alin. (3)."
+            )
+        elif ceiling is None:
+            findings.append(
+                "Valoarea estimată nu este publicată, deci plafonul legal al cerinței de cifră de "
+                "afaceri (art. 175 alin. (2) lit. a)) nu poate fi calculat — cerința documentației "
+                "nu poate fi verificată împotriva lui."
             )
         if turnover >= required_turnover:
             status = "eligible"

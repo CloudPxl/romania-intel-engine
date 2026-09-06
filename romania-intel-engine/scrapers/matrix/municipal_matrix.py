@@ -126,8 +126,16 @@ class CountyRegistryScraper(BaseScraper):
         if adapter is None:
             return []
 
-        county = entry["county"]
-        base_url = entry["base_url"]
+        # .get(), not [] — these two reads sat OUTSIDE the try below, so a
+        # registry entry missing either key raised KeyError before any
+        # isolation applied, and `gather` (see below) propagated it,
+        # discarding all 40 other counties' already-fetched signals. One
+        # typo in a 41-entry JSON file killed the whole source.
+        county = entry.get("county")
+        base_url = entry.get("base_url")
+        if not county or not base_url:
+            self.logger.warning(f"[{self.name}] Registry entry missing county/base_url — skipped: {entry!r:.120}")
+            return []
         signals: List[RawInstitutionalSignal] = []
         async with semaphore:
             try:
@@ -151,9 +159,23 @@ class CountyRegistryScraper(BaseScraper):
             self.logger.info(f"[{self.name}] {skipped}/{len(registry)} registry entries skipped (unreachable/no adapter)")
 
         semaphore = asyncio.Semaphore(MAX_CONCURRENT_COUNTIES)
-        results = await asyncio.gather(*(self._fetch_county(semaphore, e) for e in active_entries))
+        # return_exceptions=True: without it, one county raising takes down
+        # the whole fan-out and loses every other county's results. Partial
+        # coverage is the honest outcome here — the same posture
+        # _run_one_scraper takes for a whole source.
+        results = await asyncio.gather(
+            *(self._fetch_county(semaphore, e) for e in active_entries),
+            return_exceptions=True,
+        )
 
         signals: List[RawInstitutionalSignal] = []
+        failed = 0
         for county_signals in results:
+            if isinstance(county_signals, BaseException):
+                failed += 1
+                self.logger.error(f"[{self.name}] County fetch failed: {county_signals}")
+                continue
             signals.extend(county_signals)
+        if failed:
+            self.logger.warning(f"[{self.name}] {failed}/{len(active_entries)} counties failed; returning the rest.")
         return signals

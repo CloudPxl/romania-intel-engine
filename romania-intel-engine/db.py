@@ -3,7 +3,6 @@ import os
 import re
 import time
 import logging
-import uuid
 from contextlib import asynccontextmanager
 from datetime import date, datetime, timezone
 from decimal import Decimal
@@ -223,7 +222,23 @@ async def with_connection():
     try:
         yield conn
     finally:
-        await pool.release(conn)
+        # Guarded because release() can raise, and an exception raised in a
+        # `finally` REPLACES whatever the body was doing — a successful
+        # query would surface as an InterfaceError, and a real error would
+        # be masked by an unrelated one.
+        #
+        # It is reachable: if another coroutine hits a stale connection
+        # while this one is mid-query, its _reset_pool() calls
+        # _pool.close(), which waits for in-use connections; after 5s that
+        # wait_for times out and falls through to _pool.terminate(),
+        # killing this connection underneath us. release() then hits
+        # asyncpg's _check_init() and raises InterfaceError('pool is
+        # closed'). Nothing can be done about the lost connection at that
+        # point, but it must not corrupt this caller's result.
+        try:
+            await pool.release(conn)
+        except Exception as e:
+            logger.warning(f"[DB] Could not release connection back to the pool: {type(e).__name__}: {e}")
 
 
 async def upsert_opportunity(record: Dict[str, Any]) -> bool:
@@ -480,12 +495,20 @@ def _pg_word_patterns(terms: Optional[List[str]]) -> List[str]:
     "salariu" and "apa" match "apartament", which is how an unrelated
     contract ends up at the top of someone's feed. Postgres spells the
     word boundary \\m ... \\M where Python spells it \\b.
+
+    The separator between the words of a multi-word term must stay in step
+    with text_utils._TERM_SEPARATOR: joining with `\\s+` alone meant
+    "Cluj-Napoca" compiled to a pattern that could not match the literal
+    hyphenated text, so the ranked feed silently dropped the keyword boost
+    for every hyphenated term while Python's own matcher had the same gap.
+    `[[:space:]-]` is the POSIX spelling Postgres wants; `\\s` is not
+    portable inside a bracket expression there.
     """
     patterns: List[str] = []
     for term in terms or []:
         parts = re.findall(r"[a-z0-9]+", fold(str(term)))
         if parts:
-            patterns.append(r"\m" + r"\s+".join(parts) + r"\M")
+            patterns.append(r"\m" + r"[[:space:]-]+".join(parts) + r"\M")
     return patterns
 
 
@@ -1248,6 +1271,8 @@ async def complete_onboarding(
     exclude_keywords: List[str],
     min_alert_score: float = 7.5,
     telegram_chat_id: Optional[str] = None,
+    company_name: Optional[str] = None,
+    cui: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
     """Turns a bare signed-in row into a configured profile.
 
@@ -1293,8 +1318,9 @@ async def complete_onboarding(
                     INSERT INTO user_profiles (
                         id, email, display_name, domain, target_counties,
                         min_value_ron, keywords, exclude_keywords,
-                        alert_email, min_alert_score, telegram_chat_id, onboarded_at
-                    ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $2, $9, $10, now())
+                        alert_email, min_alert_score, telegram_chat_id,
+                        company_name, cui, onboarded_at
+                    ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $2, $9, $10, $11, $12, now())
                     ON CONFLICT (id) DO UPDATE SET
                         email = EXCLUDED.email,
                         display_name = EXCLUDED.display_name,
@@ -1308,13 +1334,18 @@ async def complete_onboarding(
                         alert_email = COALESCE(user_profiles.alert_email, EXCLUDED.alert_email),
                         min_alert_score = EXCLUDED.min_alert_score,
                         telegram_chat_id = EXCLUDED.telegram_chat_id,
+                        -- COALESCE-guarded like alert_email: both are
+                        -- optional, so an onboarding payload that omits
+                        -- them must not blank a value already on the row.
+                        company_name = COALESCE(EXCLUDED.company_name, user_profiles.company_name),
+                        cui = COALESCE(EXCLUDED.cui, user_profiles.cui),
                         onboarded_at = now(),
                         updated_at = now()
                     RETURNING {_PROFILE_COLUMNS}
                     """,
                     user_id, email, display_name, domain, target_counties,
                     min_value_ron, keywords, exclude_keywords,
-                    min_alert_score, telegram_chat_id,
+                    min_alert_score, telegram_chat_id, company_name, cui,
                 )
                 return _profile_row_to_dict(row) if row else None
         except asyncpg.exceptions.UndefinedTableError:

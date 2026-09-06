@@ -50,13 +50,13 @@ from bs4 import BeautifulSoup
 
 from scrapers.adapters.base_adapter import BaseCMSAdapter
 from text_utils import matching_terms
+from ..money import VALUE_WITH_CURRENCY_RE, parse_ro_number, parse_ro_value
 
 ANUNTURI_API_PATH = "/api/public/anunturi"
 HOTARARI_API_PATH = "/api/public/hotarari"
 ANUNTURI_PAGE_PATH = "/achizitii-publice/anunturi/"
 HOTARARI_PAGE_PATH = "/monitorul-oficial-local/hotarari/"
 
-_VALUE_RE = re.compile(r"([\d][\d.,]{2,})\s*lei", re.IGNORECASE)
 _DATE_RE = re.compile(r"\b(\d{4}-\d{2}-\d{2})\b|\b(\d{2}[./]\d{2}[./]\d{4})\b")
 _CPV_RE = re.compile(r"\b(\d{8}-\d)\b")
 
@@ -76,19 +76,28 @@ def _first_key(item: Dict[str, Any], keys: List[str]) -> Any:
     return None
 
 
-def _parse_ro_value(text: str) -> float:
-    match = _VALUE_RE.search(text)
-    if not match:
+# Re-exported from scrapers/money.py. This parser existed as four
+# byte-identical copies, which is how a fifth got hand-written with the
+# separators reversed (see infra_scrapers._parse_ron).
+_VALUE_RE = VALUE_WITH_CURRENCY_RE
+_parse_ro_value = parse_ro_value
+
+
+def _parse_json_value(raw: Any) -> float:
+    """A value straight out of a JSON body, which is a number in the JSON
+    convention — not Romanian-formatted text.
+
+    Strings still go through the Romanian parser, because a JSON API that
+    quotes its numbers is usually quoting the display form ("1.234.567,89").
+    A real int/float is taken as-is.
+    """
+    if raw is None:
         return 0.0
-    raw = match.group(1).strip()
-    if "," in raw:
-        raw = raw.replace(".", "").replace(",", ".")
-    else:
-        raw = raw.replace(".", "")
-    try:
-        return float(raw)
-    except ValueError:
+    if isinstance(raw, bool):
         return 0.0
+    if isinstance(raw, (int, float)):
+        return float(raw) if raw > 0 else 0.0
+    return parse_ro_number(str(raw))
 
 
 def _normalize_date(value: Any) -> str:
@@ -156,7 +165,20 @@ class SobisAdapter(BaseCMSAdapter):
             "locality": county,
             "entity_name": f"Consiliul Județean {county}",
             "project_title": title,
-            "financial_value_ron": _parse_ro_value(f"{_first_key(item, VALUE_KEYS) or ''} lei") or _parse_ro_value(str(item)),
+            # This field arrives from a JSON API, so it is already a
+            # number — `1234567.89`, in the JSON convention where the dot
+            # is the decimal point. It used to be formatted into a string
+            # and fed to the Romanian *text* parser, which reads a dot as a
+            # thousands separator: 1234567.89 came out as 123456789.0, a
+            # 100x inflation that then drove the value score, the
+            # min_value_ron gate and the user's alerts.
+            #
+            # The `or _parse_ro_value(str(item))` fallback went with it: on
+            # a missing or zero value it regex-scanned the repr of the
+            # entire JSON object for "<number> lei" and would lift an
+            # unrelated figure — a penalty clause, a fee — out of a
+            # description field and present it as the contract value.
+            "financial_value_ron": _parse_json_value(_first_key(item, VALUE_KEYS)),
             "published_date": _normalize_date(_first_key(item, PUBLISHED_KEYS)),
             "action_deadline": _normalize_date(_first_key(item, DEADLINE_KEYS)) or None,
             "source_url": doc_url or listing_url,

@@ -138,6 +138,16 @@ class TestCompleteOnboarding:
         result = await db.complete_onboarding("u1", "a@b.ro", None, "sanatate", [], 0.0, ["rmn"], [])
         assert result is not None
 
+    # The INSERT's positional parameters, by name. These assertions used to
+    # index from the end (`args[-2:]`), which silently re-aimed at whatever
+    # two parameters happened to be last — so adding company_name/cui to
+    # the statement made them assert on the wrong columns instead of
+    # failing loudly about the right ones. Named indices break visibly.
+    _P_MIN_ALERT_SCORE = 8
+    _P_TELEGRAM_CHAT_ID = 9
+    _P_COMPANY_NAME = 10
+    _P_CUI = 11
+
     @pytest.mark.asyncio
     async def test_defaults_alert_score_and_leaves_telegram_null_when_omitted(self, monkeypatch):
         """Callers written before these two params existed (and any caller
@@ -146,7 +156,8 @@ class TestCompleteOnboarding:
         monkeypatch.setattr(db, "with_connection", _with_connection(conn))
         await db.complete_onboarding("u1", "ana@test.ro", "Ana", "sanatate", ["Cluj"], 0.0, ["rmn"], [])
         _, args = conn.executed[0]
-        assert args[-2:] == (7.5, None)
+        assert args[self._P_MIN_ALERT_SCORE] == 7.5
+        assert args[self._P_TELEGRAM_CHAT_ID] is None
 
     @pytest.mark.asyncio
     async def test_persists_supplied_alert_settings(self, monkeypatch):
@@ -161,7 +172,40 @@ class TestCompleteOnboarding:
             9.0, "123456789",
         )
         _, args = conn.executed[0]
-        assert args[-2:] == (9.0, "123456789")
+        assert args[self._P_MIN_ALERT_SCORE] == 9.0
+        assert args[self._P_TELEGRAM_CHAT_ID] == "123456789"
+
+    @pytest.mark.asyncio
+    async def test_persists_the_billing_identity(self, monkeypatch):
+        """company_name and cui were absent from OnboardingRequest, so both
+        onboarding and the criteria editor collected them, POSTed them,
+        and had Pydantic drop them silently — a 200 with nothing written.
+        Three features read these columns (the /eligibility prefill, the
+        drafting generators, the proforma) and nothing could ever fill
+        them, which is also why billing.py's hard CUI requirement was
+        unsatisfiable through the UI."""
+        conn = FakeConnection(existing_onboarded_at=None)
+        monkeypatch.setattr(db, "with_connection", _with_connection(conn))
+        await db.complete_onboarding(
+            "u1", "ana@test.ro", "Ana", "sanatate", ["Cluj"], 0.0, ["rmn"], [],
+            company_name="SC Exemplu SRL", cui="RO12345678",
+        )
+        _, args = conn.executed[0]
+        assert args[self._P_COMPANY_NAME] == "SC Exemplu SRL"
+        assert args[self._P_CUI] == "RO12345678"
+
+    @pytest.mark.asyncio
+    async def test_omitted_billing_identity_is_null_not_blank(self, monkeypatch):
+        """Passed as NULL so the statement's COALESCE guard keeps whatever
+        is already on the row, rather than blanking it."""
+        conn = FakeConnection(existing_onboarded_at=None)
+        monkeypatch.setattr(db, "with_connection", _with_connection(conn))
+        await db.complete_onboarding("u1", "ana@test.ro", "Ana", "sanatate", [], 0.0, ["rmn"], [])
+        sql, args = conn.executed[0]
+        assert args[self._P_COMPANY_NAME] is None
+        assert args[self._P_CUI] is None
+        assert "company_name = COALESCE(EXCLUDED.company_name" in sql
+        assert "cui = COALESCE(EXCLUDED.cui" in sql
 
 
 class TestUpdateProfile:
@@ -193,6 +237,70 @@ class TestUpdateProfile:
         # Nothing allowed was supplied, so it falls through to a plain read
         # rather than writing anything.
         assert conn.executed == []
+
+    @pytest.mark.asyncio
+    async def test_billing_identity_is_writable(self, monkeypatch):
+        """db.update_profile always allowed these two; the PUT route built
+        its field dict without them, so the criteria editor's company/CUI
+        inputs saved nothing and reported success."""
+        conn = FakeConnection()
+        monkeypatch.setattr(db, "with_connection", _with_connection(conn))
+        await db.update_profile("u1", {"company_name": "SC Exemplu SRL", "cui": "RO12345678"})
+        query, args = conn.executed[0]
+        set_clause = query.split("SET", 1)[1].split("WHERE", 1)[0]
+        assert "company_name" in set_clause and "cui" in set_clause
+        assert "SC Exemplu SRL" in args and "RO12345678" in args
+
+
+class TestProfileRouteBillingIdentity:
+    """The route layer, which is where the two fields were actually lost."""
+
+    @pytest.fixture(autouse=True)
+    def _auth_override(self):
+        api.app.dependency_overrides[security.require_auth] = lambda: {
+            "user_id": "route-uid-3", "email": "ana@test.ro", "role": "Membru"
+        }
+        yield
+        api.app.dependency_overrides.pop(security.require_auth, None)
+
+    def _put(self, **overrides):
+        body = {
+            "domain": "sanatate",
+            "target_counties": ["Cluj"],
+            "min_value_ron": 0,
+            "keywords": ["rmn"],
+            "exclude_keywords": [],
+        }
+        body.update(overrides)
+        return TestClient(api.app).put("/api/v1/me/profile", json=body)
+
+    def test_company_and_cui_are_forwarded(self, monkeypatch):
+        captured = {}
+
+        async def fake_update_profile(user_id, fields):
+            captured.update(fields)
+            return {"domain": fields.get("domain"), "onboarded_at": "2026-01-01T00:00:00"}
+
+        monkeypatch.setattr(db, "update_profile", fake_update_profile)
+        r = self._put(company_name="  SC Exemplu SRL ", cui=" RO12345678  ")
+        assert r.status_code == 200
+        assert captured["company_name"] == "SC Exemplu SRL"
+        assert captured["cui"] == "RO12345678"
+
+    def test_omitted_fields_are_not_sent_at_all(self, monkeypatch):
+        """db.update_profile builds its UPDATE from the keys present, so
+        passing None unconditionally would blank a stored value for any
+        client posting a partial body."""
+        captured = {}
+
+        async def fake_update_profile(user_id, fields):
+            captured.update({"keys": set(fields)})
+            return {"domain": "sanatate", "onboarded_at": "2026-01-01T00:00:00"}
+
+        monkeypatch.setattr(db, "update_profile", fake_update_profile)
+        assert self._put().status_code == 200
+        assert "company_name" not in captured["keys"]
+        assert "cui" not in captured["keys"]
 
 
 class TestUpdateAlertSettings:
@@ -325,20 +433,55 @@ class TestOnboardingRoute:
         silently dropped on the way from the request model."""
         captured = {}
 
-        async def fake_complete_onboarding(user_id, email, display_name, domain,
-                                            target_counties, min_value_ron,
-                                            keywords, exclude_keywords,
-                                            min_alert_score=7.5, telegram_chat_id=None):
-            captured["min_alert_score"] = min_alert_score
-            captured["telegram_chat_id"] = telegram_chat_id
-            return {"onboarded_at": "2026-01-01T00:00:00", "domain": domain}
+        # **kwargs rather than a mirrored signature: a fake that restates
+        # the real function's parameters turns any signature growth into an
+        # unrelated 500 in this test instead of a clear failure in whatever
+        # actually broke.
+        async def fake_complete_onboarding(*args, **kwargs):
+            captured.update(kwargs)
+            captured["positional"] = args
+            return {"onboarded_at": "2026-01-01T00:00:00", "domain": args[3]}
 
         monkeypatch.setattr(db, "DATABASE_URL", "postgres://fake")
         monkeypatch.setattr(db, "complete_onboarding", fake_complete_onboarding)
         r = self._post(min_alert_score=9.0, telegram_chat_id=" 123456789 ")
         assert r.status_code == 200
-        assert captured["min_alert_score"] == 9.0
-        assert captured["telegram_chat_id"] == "123456789"
+        # min_alert_score and chat_id are still passed positionally (9th/10th).
+        assert captured["positional"][8] == 9.0
+        assert captured["positional"][9] == "123456789"
+
+    def test_billing_identity_reaches_the_db_layer(self, monkeypatch):
+        """The route must forward company_name/cui, trimmed. Both were
+        absent from OnboardingRequest entirely, so the form collected them
+        and the route wrote a profile without them, returning 200."""
+        captured = {}
+
+        async def fake_complete_onboarding(*args, **kwargs):
+            captured.update(kwargs)
+            return {"onboarded_at": "2026-01-01T00:00:00", "domain": args[3]}
+
+        monkeypatch.setattr(db, "DATABASE_URL", "postgres://fake")
+        monkeypatch.setattr(db, "complete_onboarding", fake_complete_onboarding)
+        r = self._post(company_name="  SC Exemplu SRL  ", cui="  RO12345678 ")
+        assert r.status_code == 200
+        assert captured["company_name"] == "SC Exemplu SRL"
+        assert captured["cui"] == "RO12345678"
+
+    def test_blank_billing_identity_becomes_null(self, monkeypatch):
+        """An empty string must not be written as one — the columns are
+        optional and downstream code checks for None."""
+        captured = {}
+
+        async def fake_complete_onboarding(*args, **kwargs):
+            captured.update(kwargs)
+            return {"onboarded_at": "2026-01-01T00:00:00", "domain": args[3]}
+
+        monkeypatch.setattr(db, "DATABASE_URL", "postgres://fake")
+        monkeypatch.setattr(db, "complete_onboarding", fake_complete_onboarding)
+        r = self._post(company_name="   ", cui="")
+        assert r.status_code == 200
+        assert captured["company_name"] is None
+        assert captured["cui"] is None
 
     def test_rate_limited_after_repeated_attempts(self):
         """The global 180/60s budget is no obstacle to a script cycling

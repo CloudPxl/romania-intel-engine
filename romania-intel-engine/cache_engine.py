@@ -8,10 +8,31 @@ from typing import Any, Optional, Dict, List
 
 logger = logging.getLogger("CacheEngine")
 
+# An expired entry used to be dropped only when that exact key was read
+# again — so a user who browsed once and never returned left their cached
+# feed in memory for the life of the process. Each entry is a full feed
+# payload (up to 500 leads), which makes this a much faster leak than the
+# one security.py already fixed in RATE_LIMIT_STORE, and the same fix
+# applies: an opportunistic O(n) sweep every few minutes rather than a
+# scan on every request.
+CACHE_CLEANUP_INTERVAL_SECONDS = 300
+
+
 class MemoryCacheEngine:
     def __init__(self, default_ttl_seconds: int = 90):
         self._cache: Dict[str, Dict[str, Any]] = {}
         self.default_ttl = default_ttl_seconds
+        self._last_cleanup_at = 0.0
+
+    def _purge_expired(self, now: float) -> None:
+        if now - self._last_cleanup_at < CACHE_CLEANUP_INTERVAL_SECONDS:
+            return
+        self._last_cleanup_at = now
+        stale = [k for k, entry in self._cache.items() if now > entry["expires_at"]]
+        for k in stale:
+            del self._cache[k]
+        if stale:
+            logger.info(f"🧹 [Cache] Purged {len(stale)} expired entries ({len(self._cache)} live).")
 
     def get(self, key: str) -> Optional[Any]:
         entry = self._cache.get(key)
@@ -24,10 +45,20 @@ class MemoryCacheEngine:
 
     def set(self, key: str, value: Any, ttl_seconds: Optional[int] = None):
         ttl = ttl_seconds or self.default_ttl
+        now = time.time()
+        # Swept on write rather than on read: a read that misses is exactly
+        # the case that is about to add an entry, and sweeping there would
+        # not bound a store nobody reads from any more.
+        self._purge_expired(now)
         self._cache[key] = {
             "value": value,
-            "expires_at": time.time() + ttl
+            "expires_at": now + ttl
         }
+
+    def stats(self) -> Dict[str, int]:
+        """Entry count only — the keys embed user ids, and /system/status
+        is a public route."""
+        return {"entries": len(self._cache)}
 
     def invalidate(self, prefix: Optional[str] = None):
         if not prefix:

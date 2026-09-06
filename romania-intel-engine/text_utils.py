@@ -44,6 +44,27 @@ def fold(text: str) -> str:
     return folded.lower()
 
 
+# Word separator INSIDE a multi-word term. `_WORD_RE` drops the hyphen as a
+# separator, so joining the surviving tokens with `\s+` produced a pattern
+# that could never match the hyphenated original: "Cluj-Napoca" compiled to
+# `\bcluj\s+napoca\b`, which does not match the literal text
+# "Cluj-Napoca". Keyword evidence is a MANDATORY gate for alerting
+# (matching_engine.evaluate), so a profile keyed on "Cluj-Napoca",
+# "e-guvernare" or "CT-scan" received no alerts at all — silently, and
+# forever. Accepting either separator matches both spellings, which is what
+# normalize_county already does for counties.
+_TERM_SEPARATOR = r"[\s\-]+"
+
+
+def term_pattern(term: str) -> str:
+    """The whole-word regex for one search term, or "" if it has no
+    matchable content (an all-punctuation keyword like "***")."""
+    parts = _WORD_RE.findall(fold(term))
+    if not parts:
+        return ""
+    return r"\b" + _TERM_SEPARATOR.join(re.escape(p) for p in parts) + r"\b"
+
+
 def contains_term(text: str, term: str) -> bool:
     """Whole-word, diacritic-insensitive containment.
 
@@ -52,13 +73,9 @@ def contains_term(text: str, term: str) -> bool:
     how an unrelated opportunity ends up scored as a domain hit.
     Multi-word terms are matched as a phrase.
     """
-    folded_term = fold(term).strip()
-    if not folded_term:
+    pattern = term_pattern(term)
+    if not pattern:
         return False
-    parts = _WORD_RE.findall(folded_term)
-    if not parts:
-        return False
-    pattern = r"\b" + r"\s+".join(re.escape(p) for p in parts) + r"\b"
     return re.search(pattern, fold(text)) is not None
 
 
@@ -67,10 +84,9 @@ def matching_terms(text: str, terms: Iterable[str]) -> List[str]:
     folded_text = fold(text)
     hits: List[str] = []
     for term in terms:
-        parts = _WORD_RE.findall(fold(term))
-        if not parts:
+        pattern = term_pattern(term)
+        if not pattern:
             continue
-        pattern = r"\b" + r"\s+".join(re.escape(p) for p in parts) + r"\b"
         if re.search(pattern, folded_text):
             hits.append(term)
     return hits

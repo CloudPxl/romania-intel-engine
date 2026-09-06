@@ -1,13 +1,39 @@
+import asyncio
 import re
 from typing import List
 from scrapers.base_scraper import BaseScraper
 from scrapers.matrix.cni_common import HEALTH_CATEGORIES, CniRegisterScraper
 from scrapers.models import RawInstitutionalSignal
+from ..money import parse_ro_number
 
 # SICAP market consultations are now covered live by
 # scrapers/matrix/elicitatie_scraper.py:ElicitatieLiveScraper — the old
 # SicapInfraScraper fixture here was redundant and has been removed.
 
+
+
+async def _parse_pdf_offloaded(pdf_bytes: bytes):
+    """Runs the blocking pdfplumber walk on a worker thread.
+
+    `extract_table_rows` walks up to MAX_PAGES=150 pages of
+    `page.extract_tables()` — pure blocking CPU. Called directly from an
+    `async def`, it holds the event loop for the whole parse, and on
+    Render's fractional-CPU tier that is minutes for a big register.
+
+    While the loop is held, `as_completed(tasks, timeout=...)` in
+    orchestrator.run_tick cannot fire its timeout and TICK_DEADLINE_SECONDS
+    is unenforceable; api.py's outer `wait_for` then fires the instant the
+    loop is released and throws CancelledError into the tick. Offloading
+    keeps the deadline real. workers/document_tasks.py already does exactly
+    this for the same library.
+
+    Returns (rows, first_page_text) from a single parse — the annual-plan
+    scraper used to open the same PDF twice.
+    """
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(
+        None, lambda: (extract_table_rows(pdf_bytes), extract_first_page_text(pdf_bytes))
+    )
 
 class CniInfraScraper(CniRegisterScraper):
     """CNI's project register, restricted to public-works categories.
@@ -73,10 +99,13 @@ class UrbanismAcScraper(BaseScraper):
 
     @staticmethod
     def _parse_ron(value: str) -> float:
-        try:
-            return float(value.replace(",", "").strip())
-        except (ValueError, AttributeError):
-            return 0.0
+        """Delegates to the shared parser. The hand-rolled version here did
+        `float(value.replace(",", ""))`, which read Romanian money as if the
+        dot were a decimal point: '9.844.025,00' -> 0.0 (reported as "value
+        not published") and, worse, '150.000' -> 150.0 — a 150k contract
+        that looks legitimate at 150 RON and sinks below every
+        min_value_ron filter. Cluj's PAAP register is parsed with this."""
+        return parse_ro_number(value)
 
     @staticmethod
     def _parse_ro_date(value: str) -> str:
@@ -102,8 +131,8 @@ class UrbanismAcScraper(BaseScraper):
         if not pdf_bytes:
             return []
 
-        rows = extract_table_rows(pdf_bytes)
-        approval_match = self.APPROVAL_DATE_RE.search(extract_first_page_text(pdf_bytes))
+        rows, first_page_text = await _parse_pdf_offloaded(pdf_bytes)
+        approval_match = self.APPROVAL_DATE_RE.search(first_page_text)
         published_date = self._parse_ro_date(approval_match.group(1)) if approval_match else ""
 
         signals: List[RawInstitutionalSignal] = []
@@ -185,8 +214,9 @@ class CountyHclScraper(BaseScraper):
         if not pdf_bytes:
             return []
 
+        rows, _ = await _parse_pdf_offloaded(pdf_bytes)
         signals: List[RawInstitutionalSignal] = []
-        for row in extract_table_rows(pdf_bytes):
+        for row in rows:
             if len(row) < 4 or not (row[0] or "").strip().isdigit():
                 continue
             nr_hcl, data_adoptarii, _data_comunicarii, titlu = [normalize_cell(c) for c in row[:4]]

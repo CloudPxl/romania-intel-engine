@@ -277,7 +277,36 @@ async def complete_chat(
                     },
                 )
                 if resp.status_code == 200:
-                    return resp.json()["choices"][0]["message"]["content"].strip()
+                    choice = (resp.json().get("choices") or [{}])[0]
+                    content = (choice.get("message") or {}).get("content")
+                    finish = choice.get("finish_reason")
+                    # A reasoning model can spend its whole budget on hidden
+                    # thinking and return content: null (see the model notes
+                    # above). `.strip()` on that raised AttributeError, which
+                    # the broad except below then reported as "completion
+                    # call failed" — the right outcome (fail over) reached
+                    # through a misleading path, with the real cause hidden.
+                    if not content or not content.strip():
+                        logger.warning(
+                            f"[LLM] {name} returned 200 with empty content (finish_reason={finish}) "
+                            "— trying next provider."
+                        )
+                        continue
+                    text = content.strip()
+                    # finish_reason=length means the answer was cut off at
+                    # max_tokens. Callers put this text into documents that
+                    # get filed with an evaluation commission, so a truncated
+                    # one must not be handed back as if it were complete.
+                    if finish == "length":
+                        logger.warning(
+                            f"[LLM] {name} truncated its response at max_tokens ({len(text)} chars). "
+                            "Flagging it in the returned text rather than passing it off as complete."
+                        )
+                        text += (
+                            "\n\n[NOTĂ: răspunsul a fost întrerupt la limita de lungime și este "
+                            "incomplet. Completați manual secțiunile lipsă înainte de utilizare.]"
+                        )
+                    return text
                 logger.warning(f"[LLM] {name} ({base_url}) returned {resp.status_code}: {resp.text[:200]} — trying next provider.")
         except Exception as e:
             logger.error(f"[LLM] {name} completion call failed: {e} — trying next provider.")

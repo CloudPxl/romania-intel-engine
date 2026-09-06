@@ -20,7 +20,7 @@ import db
 import document_extractions
 import procurement_notices
 from workers import document_tasks
-from matching_engine import RelevanceEngine
+from text_utils import term_pattern
 from workflow_engine import ConcurrentWorkflowEngine
 from billing import StripeBillingEngine
 from scrapers.orchestrator import OpportunityOrchestrator, TICK_DEADLINE_SECONDS
@@ -285,6 +285,18 @@ class OnboardingRequest(BaseModel):
     # field is simply ignored on that route rather than duplicated onto a
     # second request model.
     consent_accepted: bool = False
+    # The billing identity. These were MISSING from this model, and the
+    # consequence was invisible in both directions: the onboarding form and
+    # the criteria editor both collect them and both POST them, Pydantic
+    # silently drops unknown fields, and the routes then wrote a profile
+    # without them and returned 200. `user_profiles` has both columns,
+    # db.update_profile has always accepted both, and three features read
+    # them (the /eligibility prefill, the drafting generators, and the
+    # proforma) — so the only thing missing was any way to ever set them.
+    # That is also why billing.py's hard requirement for a CUI could never
+    # be satisfied through the UI.
+    company_name: Optional[str] = None
+    cui: Optional[str] = None
 
 # Self-serve callers submit these fields directly — there is no admin
 # reviewing the payload before it's written. None of these caps constrain
@@ -335,6 +347,35 @@ def _validate_onboarding_payload(payload: "OnboardingRequest") -> None:
         )
     if payload.min_value_ron < 0 or payload.min_value_ron > MAX_MIN_VALUE_RON:
         raise HTTPException(status_code=400, detail="Valoarea minimă a bugetului nu este validă.")
+
+    # A keyword with no letters or digits ("***", "---", "!?") compiles to
+    # no pattern at all in text_utils.term_pattern and db._pg_word_patterns.
+    # Keyword evidence is a MANDATORY gate for alerting
+    # (matching_engine.evaluate), so accepting one meant a profile that
+    # looked correctly configured and then matched nothing, forever, with
+    # nothing anywhere reporting why. Reject it at the door instead.
+    unmatchable = [k for k in payload.keywords if k.strip() and not term_pattern(k)]
+    if unmatchable:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Cuvântul-cheie „{unmatchable[0]}” nu conține litere sau cifre, deci nu se poate "
+                "potrivi cu niciun dosar. Folosiți un cuvânt din denumirea lucrării."
+            ),
+        )
+    # Same check for exclusions, but only as a warning-shaped rejection:
+    # an unmatchable exclusion is harmless (it simply never fires), yet it
+    # is still certainly a typo, and silently keeping it is how a user
+    # believes they have filtered something out.
+    unmatchable_ex = [k for k in payload.exclude_keywords if k.strip() and not term_pattern(k)]
+    if unmatchable_ex:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Cuvântul de excludere „{unmatchable_ex[0]}” nu conține litere sau cifre "
+                "și nu ar exclude nimic."
+            ),
+        )
 
 def _validated_domain(payload: "OnboardingRequest") -> str:
     """Shared by onboarding and the later profile edit."""
@@ -567,6 +608,10 @@ async def system_status():
             "tracked_clients": len(RATE_LIMIT_STORE),
             "limit_per_window": RATE_LIMIT_REQUESTS,
         },
+        # Count only — the cache keys embed user ids and this route is
+        # public. A number that climbs and never falls means the purge
+        # below stopped running.
+        "response_cache": global_cache.stats(),
         **(
             {"detail": "no tick recorded because persistence is unavailable — check DATABASE_URL"}
             if last is None and not database["reachable"]
@@ -890,6 +935,8 @@ async def complete_onboarding(
             payload.target_counties, payload.min_value_ron,
             payload.keywords, payload.exclude_keywords,
             payload.min_alert_score, chat_id,
+            company_name=(payload.company_name or "").strip() or None,
+            cui=(payload.cui or "").strip() or None,
         )
     except db.UserCapacityError as e:
         logger.warning(f"[Onboarding] {e}")
@@ -941,14 +988,23 @@ async def update_my_profile(payload: OnboardingRequest, user: dict = Depends(req
     """
     domain = _validated_domain(payload)
     _validate_onboarding_payload(payload)
-    profile = await db.update_profile(user["user_id"], {
+    fields = {
         "display_name": (payload.display_name or "").strip() or None,
         "domain": domain,
         "target_counties": payload.target_counties,
         "min_value_ron": payload.min_value_ron,
         "keywords": payload.keywords,
         "exclude_keywords": payload.exclude_keywords,
-    })
+    }
+    # Only sent through when the client actually supplied them.
+    # db.update_profile builds its UPDATE from the keys present, so
+    # unconditionally including a None here would blank a stored value for
+    # any client that posts a partial body.
+    if payload.company_name is not None:
+        fields["company_name"] = payload.company_name.strip() or None
+    if payload.cui is not None:
+        fields["cui"] = payload.cui.strip() or None
+    profile = await db.update_profile(user["user_id"], fields)
     if profile is None:
         raise HTTPException(status_code=503, detail="Nu s-a putut salva profilul — baza de date este indisponibilă.")
 

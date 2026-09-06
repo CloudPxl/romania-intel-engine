@@ -44,12 +44,12 @@ from bs4 import BeautifulSoup
 
 from scrapers.adapters.base_adapter import BaseCMSAdapter
 from text_utils import fold, matching_terms
+from ..money import VALUE_WITH_CURRENCY_RE, parse_ro_value
 
 MOL_PATH = "/monitorul-oficial-local/"
 ACHIZITII_PATH = "/achizitii-publice/"
 
 _POSTBACK_RE = re.compile(r"__doPostBack\('([^']+)','([^']*)'\)")
-_VALUE_RE = re.compile(r"([\d][\d.,]{2,})\s*lei", re.IGNORECASE)
 _DATE_RE = re.compile(r"\b(\d{2}[./]\d{2}[./]\d{4})\b")
 _CPV_RE = re.compile(r"\b(\d{8}-\d)\b")
 
@@ -69,19 +69,11 @@ _COLUMN_HINTS = {
 }
 
 
-def _parse_ro_value(text: str) -> float:
-    match = _VALUE_RE.search(text)
-    if not match:
-        return 0.0
-    raw = match.group(1).strip()
-    if "," in raw:
-        raw = raw.replace(".", "").replace(",", ".")
-    else:
-        raw = raw.replace(".", "")
-    try:
-        return float(raw)
-    except ValueError:
-        return 0.0
+# Re-exported from scrapers/money.py. This parser existed as four
+# byte-identical copies, which is how a fifth got hand-written with the
+# separators reversed (see infra_scrapers._parse_ron).
+_VALUE_RE = VALUE_WITH_CURRENCY_RE
+_parse_ro_value = parse_ro_value
 
 
 def _parse_ro_date(text: str) -> str:

@@ -121,9 +121,20 @@ class RelevanceEngine:
             reasons.append(f"Sub pragul stabilit ({value:,.0f} < {min_value:,.0f} RON)")
 
         # Pre-tender stages are worth more than a notice already out to bid,
-        # because the specification can still be influenced. Set by the CNI
-        # scrapers (see cni_common.py).
-        stage = (opportunity.get("metadata") or {}).get("procurement_stage")
+        # because the specification can still be influenced.
+        #
+        # Read from the TOP LEVEL first. This only checked `metadata`, which
+        # is where a scraper *declares* a stage — but ai_refinery._infer_stage
+        # writes the resolved stage to the top-level `procurement_stage` key
+        # and passes `metadata` through untouched. So every stage that was
+        # inferred from the title (the majority: "studiu de fezabilitate",
+        # "notă conceptuală", "documentație de avizare") scored 0.8 lower
+        # than the identical signal with the stage declared, which is enough
+        # to drop it under ALERT_THRESHOLD and cancel the alert entirely.
+        # The pre-tender lead is the product's whole reason for existing.
+        stage = opportunity.get("procurement_stage") or (
+            opportunity.get("metadata") or {}
+        ).get("procurement_stage")
         if stage in ("pre_tender_approved_indicators", "pre_tender_documentation_review"):
             score += 0.8
             reasons.append("Fază pre-licitație — specificațiile pot fi încă influențate")

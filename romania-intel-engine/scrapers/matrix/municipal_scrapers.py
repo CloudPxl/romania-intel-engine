@@ -32,25 +32,12 @@ from bs4 import BeautifulSoup
 from scrapers.base_scraper import BaseScraper
 from scrapers.matrix.category_classifier import classify_with_evidence
 from scrapers.models import RawInstitutionalSignal
+from ..money import VALUE_WITH_CURRENCY_RE, parse_ro_value
 
-_VALUE_RE = re.compile(r"([\d][\d.,]{2,})\s*lei", re.IGNORECASE)
-
-
-def _parse_ro_value(text: str) -> float:
-    match = _VALUE_RE.search(text)
-    if not match:
-        return 0.0
-    raw = match.group(1).strip()
-    # Romanian notices render values as "1.234.567,89" (dot thousands,
-    # comma decimal) — the reverse of the JSON/US convention.
-    if "," in raw:
-        raw = raw.replace(".", "").replace(",", ".")
-    else:
-        raw = raw.replace(".", "")
-    try:
-        return float(raw)
-    except ValueError:
-        return 0.0
+# Both re-exported from scrapers/money.py — this parser existed as four
+# byte-identical copies, which is how a fifth got hand-written wrong.
+_VALUE_RE = VALUE_WITH_CURRENCY_RE
+_parse_ro_value = parse_ro_value
 
 
 class PmbAchizitiiScraper(BaseScraper):

@@ -7,9 +7,8 @@ import httpx
 import jwt
 from jwt import PyJWKClient
 from jwt.exceptions import PyJWKClientConnectionError, PyJWKClientError, PyJWKSetError
-from fastapi import Depends, Request, HTTPException
+from fastapi import Request, HTTPException
 
-import db
 
 logger = logging.getLogger("SecurityGuard")
 

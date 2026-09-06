@@ -89,7 +89,11 @@ async def qualification_scenarios_route(
         # own reason rather than a scenario map built on nothing.
         return {
             "available": False,
-            "reason": verification.get("reason") or "Compania nu a putut fi identificată la ANAF.",
+            # `error` is the key verify_company actually sets — `reason` was
+            # never written by it, so the specific diagnostic (including
+            # "CUI-ul nu trece verificarea cifrei de control") was always
+            # replaced by the generic sentence.
+            "reason": verification.get("error") or "Compania nu a putut fi identificată la ANAF.",
             "verification": verification,
         }
     return {
