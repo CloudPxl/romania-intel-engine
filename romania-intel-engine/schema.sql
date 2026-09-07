@@ -188,6 +188,19 @@ ALTER TABLE opportunities ADD COLUMN IF NOT EXISTS cpv_class TEXT;
 -- is fabricated for it now.
 ALTER TABLE opportunities ADD COLUMN IF NOT EXISTS procedure_type TEXT;
 
+-- Contracting-authority fiscal code and the stated evaluation method,
+-- promoted out of `metadata` (where DA/CAN/CN/SC already carried the CUI
+-- as `contracting_authority_cui`) onto real columns. `procurement_notices`
+-- stays the canonical record for both; these are a denormalized read model
+-- for one specific reason — get_ranked_opportunities runs exclusively on
+-- this table, and a JSONB key can neither take the B-Tree index below nor
+-- be filtered efficiently per feed request. Written by
+-- db.upsert_opportunity on every upsert from ai_refinery's promoted
+-- top-level keys, so they refresh with the row rather than freezing.
+ALTER TABLE opportunities ADD COLUMN IF NOT EXISTS authority_cui TEXT;
+ALTER TABLE opportunities ADD COLUMN IF NOT EXISTS award_criterion TEXT;
+
+CREATE INDEX IF NOT EXISTS idx_opportunities_authority_cui ON opportunities(authority_cui);
 CREATE INDEX IF NOT EXISTS idx_opportunities_cpv_division ON opportunities(cpv_division);
 CREATE INDEX IF NOT EXISTS idx_opportunities_cpv_codes_all ON opportunities USING gin (cpv_codes_all);
 

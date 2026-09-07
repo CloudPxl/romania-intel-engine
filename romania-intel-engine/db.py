@@ -11,7 +11,7 @@ from typing import Any, Dict, List, Optional
 import asyncpg
 
 from scrapers import cpv_taxonomy
-from text_utils import fold
+from text_utils import fold, normalize_cui
 
 logger = logging.getLogger("DB")
 
@@ -257,10 +257,12 @@ async def upsert_opportunity(record: Dict[str, Any]) -> bool:
                 sales_pitch_angle, funding_source, opportunity_score, source_url,
                 document_url, metadata, search_blob,
                 cpv_codes_all, cpv_division, cpv_group, cpv_class, procedure_type,
+                authority_cui, award_criterion,
                 last_seen_at
             ) VALUES (
                 $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14,
-                $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, now()
+                $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26,
+                $27, $28, now()
             )
             ON CONFLICT (source_id) DO UPDATE SET
                 -- Every column except source_id (the conflict key) and
@@ -301,6 +303,8 @@ async def upsert_opportunity(record: Dict[str, Any]) -> bool:
                 cpv_group = EXCLUDED.cpv_group,
                 cpv_class = EXCLUDED.cpv_class,
                 procedure_type = EXCLUDED.procedure_type,
+                authority_cui = EXCLUDED.authority_cui,
+                award_criterion = EXCLUDED.award_criterion,
                 last_seen_at = now()
             RETURNING (xmax = 0) AS inserted
         """
@@ -313,6 +317,12 @@ async def upsert_opportunity(record: Dict[str, Any]) -> bool:
         # disagree about what a keyword matches.
         summary = record.get("executive_summary")
         cpv = _cpv_hierarchy_fields(record.get("cpv_code"))
+        # Normalised here as well as in ai_refinery, not instead of it: the
+        # column's whole value is that `authority_cui = $n` matches, and
+        # that only holds if every write path stores the same form. This is
+        # the one place every write path goes through.
+        authority_cui = normalize_cui(record.get("authority_cui"))
+        record = {**record, "authority_cui": authority_cui}  # so the blob folds the normalised form
         row = await conn.fetchrow(
             query,
             record.get("source_id"),
@@ -341,6 +351,8 @@ async def upsert_opportunity(record: Dict[str, Any]) -> bool:
             cpv["group"],
             cpv["class_"],
             record.get("procedure_type"),
+            authority_cui,
+            record.get("award_criterion"),
         )
     return bool(row["inserted"]) if row else True
 
@@ -374,15 +386,27 @@ def build_search_blob(record: Dict[str, Any]) -> str:
     legacy cedilla forms (ş/ţ) that Romanian institutional sites emit
     alongside the correct comma-below ones.
 
-    The field list is deliberately the same one matching_engine reads.
     Exported (not underscore-private) so the matcher can build the same
     string for an in-memory signal that has not been persisted yet.
+
+    `authority_cui` is here so a free-text search for a fiscal code finds
+    that authority's leads without the user having to know about the
+    dedicated CUI filter. It is deliberately NOT read by
+    matching_engine.evaluate: this blob feeds SQL *ranking*, and a tax ID
+    appearing in someone's keyword list should not by itself fire an email
+    alert — the two answer different questions, exactly as the ranked-feed
+    and alert paths already differ elsewhere. (The same is already true of
+    `entity_name`, which this blob has always included and the matcher has
+    always omitted.) Rows written before this column existed pick the CUI
+    up on their next re-scrape, the same way the legacy `search_blob`
+    backfill in schema.sql is superseded.
     """
     parts = (
         record.get("project_title"),
         record.get("executive_summary"),
         record.get("sub_category"),
         record.get("entity_name"),
+        record.get("authority_cui"),
     )
     return fold(" ".join(str(p) for p in parts if p))
 
@@ -546,13 +570,29 @@ def _pg_word_patterns(terms: Optional[List[str]]) -> List[str]:
 
 
 async def get_ranked_opportunities(
-    profile: Dict[str, Any], limit: int = 300
+    profile: Dict[str, Any],
+    limit: int = 300,
+    authority_cui: Optional[str] = None,
+    procedure_type: Optional[str] = None,
+    award_criterion: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     """The whole market, ordered by how well it fits this user.
 
     Returns each row with a `relevance` score plus the individual boolean
     hits that produced it, so the caller can explain the ranking in the UI
     without re-running any matching in Python.
+
+    The three optional arguments are **hard** filters (a real WHERE), which
+    is a deliberate departure from this function's soft-filter doctrine and
+    not a contradiction of it. That doctrine governs the *profile*:
+    keywords, counties, domain and min-value sink a row rather than
+    removing it, because a narrow saved profile must never render as an
+    empty dashboard indistinguishable from a broken product. These three
+    are the opposite situation — an explicit, per-request narrowing the
+    user just performed in the UI ("show me only this hospital's
+    tenders"). Soft-filtering an action like that would ignore it, which
+    is the actual bug. Same reasoning `_load_feed`'s pushdown filters
+    already follow.
     """
     keywords = _pg_word_patterns(profile.get("keywords"))
     excludes = _pg_word_patterns(profile.get("exclude_keywords"))
@@ -586,6 +626,9 @@ async def get_ranked_opportunities(
               + COALESCE(opportunity_score, 0)
             ) AS relevance
         FROM opportunities
+        WHERE ($6::text IS NULL OR authority_cui = $6)
+          AND ($7::text IS NULL OR procedure_type = $7)
+          AND ($8::text IS NULL OR award_criterion = $8)
         -- A blended numeric score only makes a match LIKELY to rank first —
         -- a non-match with a high enough opportunity_score can still
         -- outscore a weak match (e.g. a county-only hit is +20; a non-match
@@ -596,7 +639,7 @@ async def get_ranked_opportunities(
         -- every non-match, unconditionally. relevance still orders within
         -- each half.
         ORDER BY is_match DESC, relevance DESC, last_seen_at DESC
-        LIMIT $6
+        LIMIT $9
     """
     # `~ ANY('{}')` on an empty array is false for every row, so a user who
     # has set no keywords simply gets an unweighted feed rather than an
@@ -604,7 +647,16 @@ async def get_ranked_opportunities(
     async with with_connection() as conn:
         if conn is None:
             return []
-        rows = await conn.fetch(query, keywords, counties, domain, min_value, excludes, limit)
+        rows = await conn.fetch(
+            query, keywords, counties, domain, min_value, excludes,
+            # Normalised through the same rule the column is written with,
+            # so a user pasting "RO 14056826" off an invoice matches a row
+            # stored as "14056826" instead of silently returning nothing.
+            normalize_cui(authority_cui),
+            (procedure_type or "").strip() or None,
+            (award_criterion or "").strip() or None,
+            limit,
+        )
     return [dict(r) for r in rows]
 
 

@@ -4,7 +4,7 @@ from datetime import date, datetime, timedelta
 from typing import Any, Dict, Optional
 
 from scrapers.models import RawInstitutionalSignal
-from text_utils import matching_terms
+from text_utils import matching_terms, normalize_cui
 
 logger = logging.getLogger("AIRefinery")
 
@@ -210,6 +210,33 @@ class IntelligenceRefineryEngine:
         return declared if declared in PROCEDURE_TYPES else None
 
     @staticmethod
+    def _promote_authority_cui(signal: RawInstitutionalSignal) -> Optional[str]:
+        """Lifts the contracting authority's fiscal code out of metadata
+        onto a top-level key so db.upsert_opportunity can persist it to a
+        real, indexable column.
+
+        The metadata key it reads (`contracting_authority_cui`) predates
+        that column — direct_acquisition_scraper.py and notice_scraper.py
+        have been writing it all along — so this is a promotion of data
+        already being collected, not a new extraction. Normalised through
+        the same rule split_cui_and_name applies, since a CUI arrives from
+        SEAP both bare ("4374873") and RO-prefixed ("RO 14056826") and the
+        feed filter has to match one stored form, not two.
+        """
+        raw = (signal.metadata or {}).get("contracting_authority_cui")
+        return normalize_cui(raw)
+
+    @staticmethod
+    def _promote_award_criterion(signal: RawInstitutionalSignal) -> Optional[str]:
+        """Same promotion for the stated evaluation method. No live scraper
+        populates it yet — see notice_scraper.py's docstring for the
+        specific e-licitatie.ro endpoint that was looked for and not found
+        — so this is None in practice today; the plumbing exists so that
+        landing it later is a scraper change, not a schema migration."""
+        value = (signal.metadata or {}).get("award_criterion")
+        return str(value).strip() or None if value else None
+
+    @staticmethod
     def _infer_funding(signal: RawInstitutionalSignal) -> str:
         """Checked most-specific first. The previous order tested PNRR
         before CNI, so a CNI project in the register's own 'Proiecte prin
@@ -388,6 +415,8 @@ class IntelligenceRefineryEngine:
             "funding_source": IntelligenceRefineryEngine._infer_funding(signal),
             "procurement_stage": stage,
             "procedure_type": IntelligenceRefineryEngine._infer_procedure_type(signal),
+            "authority_cui": IntelligenceRefineryEngine._promote_authority_cui(signal),
+            "award_criterion": IntelligenceRefineryEngine._promote_award_criterion(signal),
             "estimated_timeline": timeline,
             "opportunity_score": final_score,
             "score_drivers": drivers,

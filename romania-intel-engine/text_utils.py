@@ -16,7 +16,7 @@ within one page, so both are folded here.
 
 import re
 import unicodedata
-from typing import Iterable, List
+from typing import Iterable, List, Optional
 
 # Explicit map first: NFKD alone does not decompose the legacy cedilla
 # forms consistently across platforms, and Romanian â/î both fold to
@@ -131,3 +131,26 @@ def normalize_county(county: str) -> str:
 
 def counties_match(a: str, b: str) -> bool:
     return bool(a) and bool(b) and normalize_county(a) == normalize_county(b)
+
+
+_CUI_DIGITS_RE = re.compile(r"(\d{2,10})")
+
+
+def normalize_cui(raw: Optional[str]) -> Optional[str]:
+    """One stored form for a Romanian fiscal code, so the feed filter can
+    compare with `=` instead of guessing.
+
+    A CUI is published as bare digits ("4374873"), VAT-prefixed
+    ("RO14056826"), or spaced ("RO 14056826") — sometimes all three within
+    one SEAP response — and `opportunities.authority_cui` has to hold one
+    of those, not whichever the source happened to emit, or an exact-match
+    filter silently misses two thirds of a user's own leads. The prefix is
+    a VAT-registration marker, not part of the identifier, so it is
+    dropped rather than preserved. Returns None for anything with no
+    digit run at all, so a junk value is a NULL column rather than a row
+    that can never be matched.
+    """
+    if not raw:
+        return None
+    match = _CUI_DIGITS_RE.search(str(raw))
+    return match.group(1) if match else None

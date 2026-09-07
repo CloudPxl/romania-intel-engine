@@ -20,7 +20,7 @@ import db
 import document_extractions
 import procurement_notices
 from workers import document_tasks
-from text_utils import term_pattern
+from text_utils import normalize_cui, term_pattern
 from workflow_engine import ConcurrentWorkflowEngine
 from billing import StripeBillingEngine
 from scrapers.orchestrator import OpportunityOrchestrator, TICK_DEADLINE_SECONDS
@@ -1217,9 +1217,19 @@ async def get_document_extraction_route(doc_id: str, _user: dict = Depends(requi
 async def get_my_feed_route(
     category: Optional[str] = None,
     force_refresh: bool = False,
+    authority_cui: Optional[str] = None,
+    procedure_type: Optional[str] = None,
+    award_criterion: Optional[str] = None,
     user: dict = Depends(require_auth),
 ):
-    return await get_my_feed(user["user_id"], category=category, force_refresh=force_refresh)
+    return await get_my_feed(
+        user["user_id"],
+        category=category,
+        force_refresh=force_refresh,
+        authority_cui=authority_cui,
+        procedure_type=procedure_type,
+        award_criterion=award_criterion,
+    )
 
 
 async def get_my_feed(
@@ -1227,6 +1237,9 @@ async def get_my_feed(
     category: Optional[str] = None,
     force_refresh: bool = False,
     min_relevance: Optional[float] = None,
+    authority_cui: Optional[str] = None,
+    procedure_type: Optional[str] = None,
+    award_criterion: Optional[str] = None,
 ):
     """The whole market, ranked so this user's matches come first.
 
@@ -1247,7 +1260,14 @@ async def get_my_feed(
     from "my qualified leads" to "the entire database, sorted", which is
     noise rather than a product. Left None for the dashboard itself.
     """
-    cache_key = f"feed:{user_id}:{category or 'all'}:{min_relevance or 0}"
+    # Every filter that changes the result set has to be in the key. A
+    # per-user cache that ignored these would serve the unfiltered market
+    # to the next filtered request (or the reverse), which reads as the
+    # filter silently not working.
+    cache_key = (
+        f"feed:{user_id}:{category or 'all'}:{min_relevance or 0}"
+        f":{authority_cui or '-'}:{procedure_type or '-'}:{award_criterion or '-'}"
+    )
     if not force_refresh:
         cached_data = global_cache.get(cache_key)
         if cached_data:
@@ -1256,7 +1276,13 @@ async def get_my_feed(
     profile = await db.get_profile(user_id)
 
     if profile and profile.get("onboarded_at") and db.DATABASE_URL:
-        rows = await db.get_ranked_opportunities(profile, limit=500)
+        rows = await db.get_ranked_opportunities(
+            profile,
+            limit=500,
+            authority_cui=authority_cui,
+            procedure_type=procedure_type,
+            award_criterion=award_criterion,
+        )
         leads = [_ranked_row_to_lead(r) for r in rows]
         source, updated_at, degraded = "postgres", None, False
         if rows:
@@ -1274,6 +1300,12 @@ async def get_my_feed(
         source = feed.get("source", "file-cache")
         updated_at = feed.get("updated_at")
         degraded = bool(feed.get("degraded"))
+        # Re-applied in Python because this branch never reached the SQL
+        # WHERE above. Without it a degraded/onboarding response answers a
+        # filtered request with the unfiltered market — same reasoning
+        # _load_feed already re-applies its own pushdown filters to the
+        # file-cache fallback.
+        leads = _apply_lead_filters(leads, authority_cui, procedure_type, award_criterion)
 
     if category and category != "all":
         leads = [l for l in leads if l.get("category") == category]
@@ -1294,6 +1326,45 @@ async def get_my_feed(
         payload["detail"] = "Baza de date nu a răspuns — ordinea după relevanță nu a putut fi calculată."
     global_cache.set(cache_key, payload, ttl_seconds=60)
     return payload
+
+
+def _apply_lead_filters(
+    leads: List[Dict[str, Any]],
+    authority_cui: Optional[str] = None,
+    procedure_type: Optional[str] = None,
+    award_criterion: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    """Python equivalent of get_ranked_opportunities' WHERE clause, for the
+    paths that never reach it (no profile yet, or no database).
+
+    The CUI comparison goes through the same normalize_cui the column is
+    written with, and falls back to `metadata.contracting_authority_cui`
+    for leads served from the file cache — those were written before the
+    promoted column existed, so the value is only in the metadata blob
+    there and an exact top-level check alone would drop every one of them.
+    """
+    wanted_cui = normalize_cui(authority_cui)
+    wanted_procedure = (procedure_type or "").strip() or None
+    wanted_criterion = (award_criterion or "").strip() or None
+    if not (wanted_cui or wanted_procedure or wanted_criterion):
+        return leads
+
+    def keep(lead: Dict[str, Any]) -> bool:
+        metadata = lead.get("metadata") or {}
+        if wanted_cui:
+            found = normalize_cui(
+                lead.get("authority_cui") or metadata.get("contracting_authority_cui")
+            )
+            if found != wanted_cui:
+                return False
+        if wanted_procedure:
+            if (lead.get("procedure_type") or metadata.get("procedure_type")) != wanted_procedure:
+                return False
+        if wanted_criterion and lead.get("award_criterion") != wanted_criterion:
+            return False
+        return True
+
+    return [lead for lead in leads if keep(lead)]
 
 
 def _ranked_row_to_lead(row: Dict[str, Any]) -> Dict[str, Any]:

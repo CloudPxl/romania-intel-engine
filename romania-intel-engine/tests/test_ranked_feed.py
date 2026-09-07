@@ -18,6 +18,7 @@ import pytest
 
 import api
 import db
+from text_utils import normalize_cui
 
 
 class TestWordPatterns:
@@ -125,10 +126,18 @@ class TestRankedQuery:
         assert await db.get_ranked_opportunities({"keywords": ["drum"]}) == []
 
     @pytest.mark.asyncio
-    async def test_nothing_is_excluded_by_the_query(self, monkeypatch):
-        """The soft-filter guarantee, asserted against the SQL itself: an
-        excluded keyword must SINK a row, never remove it, so the statement
-        carries no WHERE clause."""
+    async def test_no_profile_criterion_can_remove_a_row(self, monkeypatch):
+        """The soft-filter guarantee, asserted against the SQL itself.
+
+        This used to be spelled `"WHERE" not in query` — a proxy that
+        stopped meaning what it said once the explicit per-request filters
+        (authority_cui / procedure_type / award_criterion) landed, since
+        those are deliberately hard filters. The actual invariant is
+        narrower and is what's asserted now: whatever WHERE exists must
+        mention *only* those three columns, and never a profile-derived
+        one. An excluded keyword, an unmatched county, a wrong domain or a
+        sub-threshold value must still only ever SINK a row.
+        """
         captured = {}
 
         class _Conn:
@@ -152,10 +161,108 @@ class TestRankedQuery:
         })
 
         query = captured["query"]
-        assert "WHERE" not in query.upper()
         assert "ORDER BY is_match DESC, relevance DESC" in query
         # The exclusion is a large negative weight, not a filter.
         assert str(db.RELEVANCE_WEIGHTS["excluded"]) in query
+
+        # SQL comments are stripped first: the block between WHERE and
+        # ORDER BY carries a long `--` explanation of the is_match
+        # partition that mentions "county" in prose, and a substring scan
+        # over it would fail on the comment rather than on the clause.
+        where = query.upper().split("WHERE", 1)[1].split("ORDER BY", 1)[0]
+        where = "\n".join(line.split("--")[0] for line in where.splitlines())
+        for profile_column in ("SEARCH_BLOB", "COUNTY", "CATEGORY", "ESTIMATED_VALUE_RON"):
+            assert profile_column not in where, f"{profile_column} must never gate the feed"
+        for explicit_filter in ("AUTHORITY_CUI", "PROCEDURE_TYPE", "AWARD_CRITERION"):
+            assert explicit_filter in where
+
+    @pytest.mark.asyncio
+    async def test_unset_explicit_filters_are_null_and_gate_nothing(self, monkeypatch):
+        """Every explicit filter is bound NULL when the caller passes none,
+        and each WHERE arm short-circuits on its own NULL — so the default
+        dashboard request still returns the whole market."""
+        captured = {}
+
+        class _Conn:
+            async def fetch(self, query, *args):
+                captured["query"] = query
+                captured["args"] = args
+                return []
+
+        class _Ctx:
+            async def __aenter__(self):
+                return _Conn()
+
+            async def __aexit__(self, *exc):
+                return False
+
+        monkeypatch.setattr(db, "with_connection", lambda: _Ctx())
+        await db.get_ranked_opportunities({"keywords": ["drum"]})
+
+        # args are (keywords, counties, domain, min_value, excludes,
+        #           authority_cui, procedure_type, award_criterion, limit)
+        assert captured["args"][5] is None
+        assert captured["args"][6] is None
+        assert captured["args"][7] is None
+        for arm in ("$6::text IS NULL", "$7::text IS NULL", "$8::text IS NULL"):
+            assert arm in captured["query"]
+
+    @pytest.mark.asyncio
+    async def test_explicit_filters_are_bound_and_cui_is_normalised(self, monkeypatch):
+        captured = {}
+
+        class _Conn:
+            async def fetch(self, query, *args):
+                captured["args"] = args
+                return []
+
+        class _Ctx:
+            async def __aenter__(self):
+                return _Conn()
+
+            async def __aexit__(self, *exc):
+                return False
+
+        monkeypatch.setattr(db, "with_connection", lambda: _Ctx())
+        await db.get_ranked_opportunities(
+            {"keywords": ["drum"]},
+            # A user pasting a CUI off an invoice types the VAT prefix; the
+            # column stores bare digits. Without normalising here the
+            # filter matches nothing and reads as "no results for this
+            # authority" rather than as a format mismatch.
+            authority_cui="RO 14056826",
+            procedure_type="licitatie_deschisa",
+            award_criterion="Pretul cel mai scazut",
+        )
+        assert captured["args"][5] == "14056826"
+        assert captured["args"][6] == "licitatie_deschisa"
+        assert captured["args"][7] == "Pretul cel mai scazut"
+
+    @pytest.mark.asyncio
+    async def test_blank_filter_strings_are_treated_as_unset(self, monkeypatch):
+        """An empty query-string param (`?procedure_type=`) must not filter
+        the feed down to rows whose column is literally ''."""
+        captured = {}
+
+        class _Conn:
+            async def fetch(self, query, *args):
+                captured["args"] = args
+                return []
+
+        class _Ctx:
+            async def __aenter__(self):
+                return _Conn()
+
+            async def __aexit__(self, *exc):
+                return False
+
+        monkeypatch.setattr(db, "with_connection", lambda: _Ctx())
+        await db.get_ranked_opportunities(
+            {"keywords": ["drum"]}, authority_cui="", procedure_type="   ", award_criterion="",
+        )
+        assert captured["args"][5] is None
+        assert captured["args"][6] is None
+        assert captured["args"][7] is None
 
     @pytest.mark.asyncio
     async def test_counties_are_folded_before_comparison(self, monkeypatch):
@@ -300,3 +407,56 @@ class TestMatchExplanation:
         for key in ("kw_hit", "county_hit", "domain_hit", "value_hit",
                     "excluded_hit", "relevance", "search_blob"):
             assert key not in lead
+
+
+class TestPromotedProcurementColumns:
+    """authority_cui and award_criterion were promoted out of `metadata`
+    onto real, indexable columns so the feed can filter by them —
+    `procurement_notices` stays the canonical record. These pin the write
+    path (they actually reach the INSERT and the ON CONFLICT refresh) and
+    the search-blob behaviour."""
+
+    def test_upsert_persists_and_refreshes_both_columns(self):
+        source = inspect.getsource(db.upsert_opportunity)
+        insert_cols = source.split("VALUES")[0]
+        assert "authority_cui" in insert_cols
+        assert "award_criterion" in insert_cols
+        # A column absent from the ON CONFLICT arm freezes at whatever was
+        # scraped on first sighting — the exact defect the 15 descriptive
+        # columns above it were fixed for.
+        conflict = source.split("DO UPDATE SET")[1].split("RETURNING")[0]
+        assert "authority_cui = EXCLUDED.authority_cui" in conflict
+        assert "award_criterion = EXCLUDED.award_criterion" in conflict
+
+    def test_search_blob_includes_the_cui_so_free_text_finds_an_authority(self):
+        blob = db.build_search_blob({
+            "project_title": "Reabilitare drum",
+            "entity_name": "SPITALUL DE URGENTA PETROSANI",
+            "authority_cui": "4374873",
+        })
+        assert "4374873" in blob
+
+    def test_search_blob_survives_a_missing_cui(self):
+        blob = db.build_search_blob({"project_title": "Reabilitare drum"})
+        assert "reabilitare drum" in blob
+
+    def test_upsert_normalises_the_cui_before_storing_it(self):
+        """The column's whole value is that `authority_cui = $n` matches;
+        that only holds if every write path stores one form."""
+        source = inspect.getsource(db.upsert_opportunity)
+        assert "normalize_cui(record.get(\"authority_cui\"))" in source
+
+
+class TestNormalizeCui:
+    def test_strips_vat_prefix_and_spacing(self):
+        assert normalize_cui("RO 14056826") == "14056826"
+        assert normalize_cui("RO14056826") == "14056826"
+        assert normalize_cui(" 4374873 ") == "4374873"
+
+    def test_already_bare_is_unchanged(self):
+        assert normalize_cui("4374873") == "4374873"
+
+    def test_junk_is_none_rather_than_an_unmatchable_row(self):
+        assert normalize_cui("n/a") is None
+        assert normalize_cui("") is None
+        assert normalize_cui(None) is None
