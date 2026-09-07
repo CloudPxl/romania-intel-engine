@@ -120,5 +120,9 @@ class ElicitatieLiveScraper(BaseScraper):
             caen_codes=caen_codes,
             cpv_code=None,  # not published at the MC stage either
             document_url=view_url,
-            metadata={"notice_no": item.get("noticeNo"), "live_fetch_verified": True},
+            metadata={
+                "notice_no": item.get("noticeNo"),
+                "live_fetch_verified": True,
+                "procedure_type": "consultare_piata",
+            },
         )

@@ -470,7 +470,12 @@ class TedRomaniaScraper(BaseScraper):
         cpv_list = item.get("classification-cpv") or []
         cpv_code = cpv_list[0] if cpv_list else None
 
-        category, evidence = classify_with_evidence(buyer_name, title, "")
+        # cpv_code was fetched and then never used — buyer_name/title text
+        # alone had to carry classification for every TED notice, even
+        # though the notice's own declared CPV code is a stronger signal
+        # than guessing a domain from a cross-border buyer name that isn't
+        # always in Romanian.
+        category, evidence = classify_with_evidence(buyer_name, title, "", cpv_code=cpv_code)
         if category not in ALLOWED_CATEGORIES:
             return None
 

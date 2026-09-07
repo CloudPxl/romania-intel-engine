@@ -13,10 +13,23 @@ diacritics and still match the accented forms that real Romanian notices
 use. The previous copy of this logic used raw substring matching and had
 to list both spellings by hand ("apărăr" and "aparare"), which silently
 missed every form nobody remembered to add.
+
+When a scraper already knows the notice's real CPV code, that code is a
+strictly more reliable signal than guessing a domain from free text — a
+code is what the contracting authority itself declared, not an inference —
+so both entry points below try scrapers.cpv_taxonomy.domain_from_cpv()
+first and only fall back to keyword matching when the code is absent or
+its division isn't in that module's conservative mapping. This closed a
+real gap: direct_acquisition_scraper.py and ted_scraper.py were already
+fetching a real cpv_code and then either discarding it entirely (TED) or
+feeding the raw digit string into the free-text keyword matcher (direct
+acquisitions), where a code like "45233120" cannot match any Romanian
+keyword and so silently contributed nothing.
 """
 
-from typing import Dict, List
+from typing import Dict, List, Optional
 
+from scrapers.cpv_taxonomy import domain_from_cpv
 from text_utils import matching_terms
 
 # Order matters: the first domain with a hit wins, so the more specific
@@ -60,7 +73,10 @@ CATEGORY_KEYWORDS: Dict[str, List[str]] = {
 DEFAULT_CATEGORY = "infrastructura"
 
 
-def classify_category(entity_name: str, title: str, description: str = "") -> str:
+def classify_category(entity_name: str, title: str, description: str = "", cpv_code: Optional[str] = None) -> str:
+    from_cpv = domain_from_cpv(cpv_code)
+    if from_cpv:
+        return from_cpv
     text = f"{entity_name} {title} {description}"
     for category, keywords in CATEGORY_KEYWORDS.items():
         if matching_terms(text, keywords):
@@ -68,10 +84,17 @@ def classify_category(entity_name: str, title: str, description: str = "") -> st
     return DEFAULT_CATEGORY
 
 
-def classify_with_evidence(entity_name: str, title: str, description: str = "") -> tuple:
+def classify_with_evidence(
+    entity_name: str, title: str, description: str = "", cpv_code: Optional[str] = None
+) -> tuple:
     """Same decision, but also returns the terms that drove it, so a
     misclassification can be diagnosed from the stored signal rather than
-    by re-running the classifier by hand."""
+    by re-running the classifier by hand. A CPV-driven decision reports its
+    own single-item evidence list (the code itself) rather than keyword
+    hits, since no keywords were consulted."""
+    from_cpv = domain_from_cpv(cpv_code)
+    if from_cpv:
+        return from_cpv, [f"CPV {cpv_code}"]
     text = f"{entity_name} {title} {description}"
     for category, keywords in CATEGORY_KEYWORDS.items():
         hits = matching_terms(text, keywords)

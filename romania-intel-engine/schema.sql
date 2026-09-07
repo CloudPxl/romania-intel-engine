@@ -162,6 +162,35 @@ SET search_blob = translate(
 )
 WHERE search_blob IS NULL;
 
+-- CPV taxonomy: cpv_code (above) already carries the raw 8-digit code, but
+-- as a single opaque string it can't be searched by hierarchy tier or
+-- indexed for a "give me everything under division 45" query. These four
+-- are derived by scrapers.cpv_taxonomy.cpv_hierarchy() — pure string
+-- slicing on cpv_code, not a second data source — and written by
+-- db.py:upsert_opportunity on every upsert, so they can never drift out of
+-- sync with cpv_code itself. cpv_codes_all is an array specifically so a
+-- future source that reports more than one CPV code per notice (SEAP's
+-- CN/SC forms allow this; today's live scrapers only ever produce one) has
+-- somewhere to put the rest without a migration, matching the same
+-- "schema ready before ingestion lands" precedent as notice_type in
+-- procurement_notices.py.
+ALTER TABLE opportunities ADD COLUMN IF NOT EXISTS cpv_codes_all TEXT[] DEFAULT '{}';
+ALTER TABLE opportunities ADD COLUMN IF NOT EXISTS cpv_division TEXT;
+ALTER TABLE opportunities ADD COLUMN IF NOT EXISTS cpv_group TEXT;
+ALTER TABLE opportunities ADD COLUMN IF NOT EXISTS cpv_class TEXT;
+
+-- The award-procedure type (see ai_refinery.py's PROCEDURE_TYPES) — distinct
+-- from `metadata->>'procurement_stage'`, which is where-in-the-funnel, not
+-- what-kind-of-procedure. Only 'cumparare_directa' and 'consultare_piata'
+-- are ever written today, because no live scraper ingests SEAP's Contract
+-- Notice / Simplified Contract Notice feeds yet — the column exists so
+-- that ingestion, when it lands, needs no migration, not because a value
+-- is fabricated for it now.
+ALTER TABLE opportunities ADD COLUMN IF NOT EXISTS procedure_type TEXT;
+
+CREATE INDEX IF NOT EXISTS idx_opportunities_cpv_division ON opportunities(cpv_division);
+CREATE INDEX IF NOT EXISTS idx_opportunities_cpv_codes_all ON opportunities USING gin (cpv_codes_all);
+
 CREATE INDEX IF NOT EXISTS idx_opportunities_category ON opportunities(category);
 CREATE INDEX IF NOT EXISTS idx_opportunities_county ON opportunities(county);
 CREATE INDEX IF NOT EXISTS idx_opportunities_last_seen ON opportunities(last_seen_at DESC);

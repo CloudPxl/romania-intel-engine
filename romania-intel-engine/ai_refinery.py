@@ -117,6 +117,18 @@ CONSULTATION_TERMS = ["consultare", "dialog tehnic", "punct de vedere"]
 PRE_TENDER_TERMS = ["indicatori", "studiu de fezabilitate", "avizare", "documentatie de avizare", "hotarare"]
 FUNDING_TERMS = ["ghidul solicitantului", "apel", "finantare", "pnrr", "fonduri"]
 
+# The award-procedure type, as distinct from procurement_stage (where in the
+# funnel a notice currently sits). A closed, small vocabulary deliberately:
+# SEAP's Contract Notice / Simplified Contract Notice feeds (which is where
+# "licitatie_deschisa"/"procedura_simplificata" would come from) are not
+# ingested by any scraper today — see direct_acquisition_scraper.py's module
+# docstring — so only the two procedure types this codebase's live scrapers
+# can actually state with certainty are declared here. Same "schema
+# deliberately ready, only known values populate it" convention already
+# established for procurement_notices.py's notice_type accepting all five
+# SEAP categories while only two are ingested.
+PROCEDURE_TYPES = frozenset({"cumparare_directa", "consultare_piata"})
+
 
 def _parse_date(value: Any) -> Optional[date]:
     if not value:
@@ -173,6 +185,18 @@ class IntelligenceRefineryEngine:
         if matching_terms(text, PRE_TENDER_TERMS):
             return "pre_tender_approved_indicators"
         return "unknown"
+
+    @staticmethod
+    def _infer_procedure_type(signal: RawInstitutionalSignal) -> Optional[str]:
+        """Mirrors _infer_stage's declared-in-metadata pattern: a scraper
+        that genuinely knows its procedure type states it in metadata (e.g.
+        direct_acquisition_scraper.py's two classes, elicitatie_scraper.py),
+        and anything else is honestly left unset rather than guessed —
+        unlike procurement_stage, there is no text heuristic here, since a
+        title alone cannot distinguish an open auction from a restricted
+        one."""
+        declared = (signal.metadata or {}).get("procedure_type")
+        return declared if declared in PROCEDURE_TYPES else None
 
     @staticmethod
     def _infer_funding(signal: RawInstitutionalSignal) -> str:
@@ -352,6 +376,7 @@ class IntelligenceRefineryEngine:
             "sales_pitch_angle": IntelligenceRefineryEngine._build_pitch(signal, stage),
             "funding_source": IntelligenceRefineryEngine._infer_funding(signal),
             "procurement_stage": stage,
+            "procedure_type": IntelligenceRefineryEngine._infer_procedure_type(signal),
             "estimated_timeline": timeline,
             "opportunity_score": final_score,
             "score_drivers": drivers,

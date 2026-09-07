@@ -10,6 +10,7 @@ from typing import Any, Dict, List, Optional
 
 import asyncpg
 
+from scrapers import cpv_taxonomy
 from text_utils import fold
 
 logger = logging.getLogger("DB")
@@ -254,10 +255,12 @@ async def upsert_opportunity(record: Dict[str, Any]) -> bool:
                 entity_name, project_title, estimated_value_ron, caen_codes, cpv_code,
                 published_date, action_deadline, executive_summary,
                 sales_pitch_angle, funding_source, opportunity_score, source_url,
-                document_url, metadata, search_blob, last_seen_at
+                document_url, metadata, search_blob,
+                cpv_codes_all, cpv_division, cpv_group, cpv_class, procedure_type,
+                last_seen_at
             ) VALUES (
                 $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14,
-                $15, $16, $17, $18, $19, $20, $21, now()
+                $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, now()
             )
             ON CONFLICT (source_id) DO UPDATE SET
                 -- Every column except source_id (the conflict key) and
@@ -293,6 +296,11 @@ async def upsert_opportunity(record: Dict[str, Any]) -> bool:
                 opportunity_score = EXCLUDED.opportunity_score,
                 metadata = EXCLUDED.metadata,
                 search_blob = EXCLUDED.search_blob,
+                cpv_codes_all = EXCLUDED.cpv_codes_all,
+                cpv_division = EXCLUDED.cpv_division,
+                cpv_group = EXCLUDED.cpv_group,
+                cpv_class = EXCLUDED.cpv_class,
+                procedure_type = EXCLUDED.procedure_type,
                 last_seen_at = now()
             RETURNING (xmax = 0) AS inserted
         """
@@ -304,6 +312,7 @@ async def upsert_opportunity(record: Dict[str, Any]) -> bool:
         # Python matcher reads, or SQL ranking and Python alerting would
         # disagree about what a keyword matches.
         summary = record.get("executive_summary")
+        cpv = _cpv_hierarchy_fields(record.get("cpv_code"))
         row = await conn.fetchrow(
             query,
             record.get("source_id"),
@@ -327,8 +336,32 @@ async def upsert_opportunity(record: Dict[str, Any]) -> bool:
             record.get("document_url"),
             _to_jsonb(record.get("metadata") or {}),
             build_search_blob(record),
+            cpv["codes_all"],
+            cpv["division"],
+            cpv["group"],
+            cpv["class_"],
+            record.get("procedure_type"),
         )
     return bool(row["inserted"]) if row else True
+
+
+def _cpv_hierarchy_fields(cpv_code: Optional[str]) -> Dict[str, Any]:
+    """Derives the cpv_codes_all/cpv_division/cpv_group/cpv_class columns
+    from a single already-trusted cpv_code — pure string slicing via
+    scrapers.cpv_taxonomy.cpv_hierarchy(), computed at write time the same
+    way build_search_blob() derives search_blob, so these can never drift
+    out of sync with the cpv_code a scraper actually reported. Absent or
+    unrecognizable codes get an empty array and null tiers rather than a
+    guess."""
+    hierarchy = cpv_taxonomy.cpv_hierarchy(cpv_code)
+    if hierarchy is None:
+        return {"codes_all": [], "division": None, "group": None, "class_": None}
+    return {
+        "codes_all": [cpv_code],
+        "division": hierarchy["division"],
+        "group": hierarchy["group"],
+        "class_": hierarchy["class_"],
+    }
 
 
 def build_search_blob(record: Dict[str, Any]) -> str:

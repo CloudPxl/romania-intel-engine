@@ -239,8 +239,12 @@ class DirectAcquisitionScraper(_BaseDirectAcqScraper):
         # Direct purchases carry no county/locality field on this endpoint
         # at all (unlike MC/CN, which at least name the authority's
         # address) — classify_category has to work from title+CPV alone,
-        # and county genuinely can't be reported rather than guessed.
-        category = classify_category(ca_name, title, cpv or "")
+        # and county genuinely can't be reported rather than guessed. `cpv`
+        # goes through the real cpv_code param (a CPV-division lookup), not
+        # the free-text description — an 8-digit code can never match a
+        # Romanian keyword, so passing it as text silently classified
+        # nothing.
+        category = classify_category(ca_name, title, cpv_code=cpv)
 
         return RawInstitutionalSignal(
             source_id=f"SEAP-DA-{notice_id}",
@@ -263,6 +267,7 @@ class DirectAcquisitionScraper(_BaseDirectAcqScraper):
                 "contracting_authority_cui": ca_cui,
                 "state": (item.get("sysDirectAcquisitionState") or {}).get("text"),
                 "live_fetch_verified": True,
+                "procedure_type": "cumparare_directa",
             },
         )
 
@@ -330,7 +335,12 @@ class DaAwardNoticeScraper(_BaseDirectAcqScraper):
 
         _, ca_name = split_cui_and_name(item.get("contractingAuthority"))
         cpv = item.get("cpvCode")
-        category = classify_category(ca_name, title, item.get("cpvCategory") or "")
+        # cpvCategory is this endpoint's own free-text label (kept as
+        # description for the keyword fallback); cpv itself is the real
+        # 8-digit code and goes through cpv_code for the more reliable
+        # division-based lookup, same reasoning as DirectAcquisitionScraper
+        # above.
+        category = classify_category(ca_name, title, item.get("cpvCategory") or "", cpv_code=cpv)
 
         return RawInstitutionalSignal(
             source_id=f"SEAP-CAN-DA-{notice_id}",
@@ -350,6 +360,11 @@ class DaAwardNoticeScraper(_BaseDirectAcqScraper):
                 "notice_id": notice_id,
                 "notice_type": self.NOTICE_TYPE,
                 "live_fetch_verified": True,
+                # The award itself is still for a direct-purchase procedure
+                # — "awarded" is the procurement_stage, not the procedure
+                # type, and the two are tracked separately.
+                "procedure_type": "cumparare_directa",
+                "procurement_stage": "awarded",
             },
         )
 
