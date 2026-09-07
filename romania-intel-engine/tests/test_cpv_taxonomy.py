@@ -211,10 +211,13 @@ class TestProcedureTypeInference:
         # Same discipline as _infer_stage's `declared in STAGE_PROFILES`
         # check — a typo'd or made-up value must not silently reach
         # persistence as if it were a real, closed-vocabulary fact.
-        signal = self._signal(metadata={"procedure_type": "licitatie_deschisa"})
+        # 'contract_de_concesiune' stands in for "not yet a real ingested
+        # type" — unlike 'licitatie_deschisa'/'procedura_simplificata',
+        # which notice_scraper.py's CN/SC scrapers now genuinely declare.
+        signal = self._signal(metadata={"procedure_type": "contract_de_concesiune"})
         result = IntelligenceRefineryEngine.refine_signal(signal)
         assert result["procedure_type"] is None
-        assert "licitatie_deschisa" not in PROCEDURE_TYPES
+        assert "contract_de_concesiune" not in PROCEDURE_TYPES
 
 
 class TestCanAwardNoticeDeclaresAwardedStage:

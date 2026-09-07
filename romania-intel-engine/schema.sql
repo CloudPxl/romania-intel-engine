@@ -262,7 +262,7 @@ CREATE INDEX IF NOT EXISTS idx_system_alerts_created ON system_alerts(created_at
 
 -- Richer SEAP notices, additive to `opportunities` rather than replacing
 -- it: every scraper still writes its lean signal above. Only sources rich
--- enough to fill these fields land here (today: DA and CAN).
+-- enough to fill these fields land here (today: DA, CAN, CN, SC).
 CREATE TABLE IF NOT EXISTS procurement_notices (
     notice_id TEXT NOT NULL,
     notice_type TEXT NOT NULL CHECK (notice_type IN ('CN', 'SC', 'DA', 'CAN', 'MC')),
@@ -282,6 +282,14 @@ CREATE TABLE IF NOT EXISTS procurement_notices (
     -- identity on it would insert a new row per revision.
     PRIMARY KEY (notice_id, notice_type)
 );
+
+-- The evaluation method stated at publication (e.g. "Pretul cel mai
+-- scazut"). Added alongside scrapers/matrix/notice_scraper.py's CN/SC
+-- scrapers; NULL for every DA/CAN/MC row and for CN/SC rows ingested
+-- before the per-notice linkage endpoint for this field is found — see
+-- that module's docstring for exactly what live e-licitatie.ro endpoint
+-- was and wasn't verified to carry it.
+ALTER TABLE procurement_notices ADD COLUMN IF NOT EXISTS award_criterion TEXT;
 
 CREATE INDEX IF NOT EXISTS idx_procurement_notices_type ON procurement_notices(notice_type);
 CREATE INDEX IF NOT EXISTS idx_procurement_notices_fingerprint ON procurement_notices(fingerprint);

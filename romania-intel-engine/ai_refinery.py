@@ -101,6 +101,17 @@ STAGE_PROFILES = {
         "weight": -1.0,
         "action": "Informație competitivă: analizați câștigătorul și valoarea contractului pentru poziționarea pe proceduri similare viitoare.",
     },
+    "cancelled": {
+        "label": "Procedură anulată",
+        # Same reasoning and weight as "awarded" — a closed procedure that
+        # is not biddable — but its own label rather than reusing
+        # "awarded", which would tell a user a contract was signed when it
+        # was not. scrapers/matrix/notice_scraper.py declares this from
+        # e-licitatie.ro's sysProcedureState (id 3, "Anulata"), verified
+        # live against real CN/SC notices.
+        "weight": -1.0,
+        "action": "Procedură închisă fără atribuire — fără acțiune necesară.",
+    },
     "unknown": {
         "label": "Stadiu neconfirmat",
         "weight": 0.6,
@@ -118,16 +129,16 @@ PRE_TENDER_TERMS = ["indicatori", "studiu de fezabilitate", "avizare", "document
 FUNDING_TERMS = ["ghidul solicitantului", "apel", "finantare", "pnrr", "fonduri"]
 
 # The award-procedure type, as distinct from procurement_stage (where in the
-# funnel a notice currently sits). A closed, small vocabulary deliberately:
-# SEAP's Contract Notice / Simplified Contract Notice feeds (which is where
-# "licitatie_deschisa"/"procedura_simplificata" would come from) are not
-# ingested by any scraper today — see direct_acquisition_scraper.py's module
-# docstring — so only the two procedure types this codebase's live scrapers
-# can actually state with certainty are declared here. Same "schema
-# deliberately ready, only known values populate it" convention already
-# established for procurement_notices.py's notice_type accepting all five
-# SEAP categories while only two are ingested.
-PROCEDURE_TYPES = frozenset({"cumparare_directa", "consultare_piata"})
+# funnel a notice currently sits). A closed, small vocabulary deliberately —
+# only values a live scraper can state with certainty are declared here.
+# 'licitatie_deschisa'/'procedura_simplificata' come from
+# scrapers/matrix/notice_scraper.py's CN/SC scrapers, which read them
+# directly off e-licitatie.ro's own sysProcedureType.text ("Licitatie
+# deschisa"/"Procedura simplificata", ids 1/20 — verified live against
+# real notices), not inferred.
+PROCEDURE_TYPES = frozenset({
+    "cumparare_directa", "consultare_piata", "licitatie_deschisa", "procedura_simplificata",
+})
 
 
 def _parse_date(value: Any) -> Optional[date]:

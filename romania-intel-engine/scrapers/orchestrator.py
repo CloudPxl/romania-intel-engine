@@ -8,6 +8,7 @@ import db
 from scrapers import circuit_breaker
 from scrapers.matrix.elicitatie_scraper import ElicitatieLiveScraper
 from scrapers.matrix.direct_acquisition_scraper import DirectAcquisitionScraper, DaAwardNoticeScraper
+from scrapers.matrix.notice_scraper import ContractNoticeScraper, SimplifiedContractNoticeScraper
 from scrapers.matrix.infra_scrapers import (
     CniInfraScraper, CnairCfrScraper, UrbanismAcScraper, CountyHclScraper
 )
@@ -78,6 +79,18 @@ class OpportunityOrchestrator:
             # which SEAP notice types (CN/SC) are still unimplemented.
             self.scrapers.append(DirectAcquisitionScraper())
             self.scrapers.append(DaAwardNoticeScraper())
+        if os.getenv("ENABLE_LIVE_CONTRACT_NOTICES", "false").lower() == "true":
+            # Real, live SEAP Contract Notice (CN) + Simplified Contract
+            # Notice (SC) feeds — the full-tender coverage
+            # direct_acquisition_scraper.py's module docstring explicitly
+            # left as future work because its list endpoint could not be
+            # located at the time. See scrapers/matrix/notice_scraper.py's
+            # module docstring for the endpoint (found in a since-changed,
+            # more consolidated site bundle), what was verified live, and
+            # the one field (award_criterion) still not found. Same
+            # live-verified-before-shipping rollout gate as the flags above.
+            self.scrapers.append(ContractNoticeScraper())
+            self.scrapers.append(SimplifiedContractNoticeScraper())
         if os.getenv("ENABLE_LIVE_COUNTY_REGISTRY", "false").lower() == "true":
             # Polymorphic CMS-adapter coverage of county councils beyond
             # the 3 hand-integrated municipal sources above — see

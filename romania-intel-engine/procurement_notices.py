@@ -74,6 +74,15 @@ class ProcurementNotice(BaseModel):
     notice_type: NoticeType
     caen_codes: List[str] = Field(default_factory=list)
     cpv_code: Optional[str] = None
+    # The evaluation method stated at publication (e.g. "Pretul cel mai
+    # scazut" / "Cel mai bun raport calitate-pret") — a planned criterion,
+    # not an award outcome, which is why it lives here rather than on
+    # AwardDetails. Populated by scrapers/matrix/notice_scraper.py's CN/SC
+    # scrapers where found; None everywhere else, including CN/SC records
+    # ingested before e-licitatie.ro's per-notice linkage endpoint for it
+    # is located (see that module's docstring for exactly what was and
+    # wasn't verified).
+    award_criterion: Optional[str] = None
     contracting_authority: ContractingAuthority
     financial: FinancialInfo
     award_details: Optional[AwardDetails] = None
@@ -95,15 +104,20 @@ class ProcurementNotice(BaseModel):
         return hashlib.sha256(basis.encode("utf-8")).hexdigest()
 
 
-_CUI_PREFIX_RE = re.compile(r"^(?:RO\s*)?(\d{2,10})\s+(.+)$")
+_CUI_PREFIX_RE = re.compile(r"^(?:RO\s*)?(\d{2,10})\s*(?:-\s*)?(.+)$")
 
 
 def split_cui_and_name(raw: Optional[str]) -> "tuple[Optional[str], str]":
     """e-licitatie renders both suppliers and contracting authorities as one
-    string, e.g. 'RO 6865630 DELTA PLUS TRADING S.R.L.' or
-    '4317975 Unitatea Militara 01714' — CUI first, optionally RO-prefixed,
-    then the legal name. Falls back to treating the whole string as the
-    name when it doesn't match (safer than dropping the record)."""
+    string, but not with one consistent separator: DA/CAN's
+    `contractingAuthority` field reads 'RO 6865630 DELTA PLUS TRADING
+    S.R.L.' or '4317975 Unitatea Militara 01714' (a plain space), while
+    notice_scraper.py's `contractingAuthorityNameAndFN` reads
+    '4374873 - SPITALUL DE URGENTA PETROSANI' (a hyphen) — both verified
+    live. The optional `-\\s*` was added for the second form; before it,
+    the regex still matched but left a stray leading "- " on every parsed
+    name from that source. Falls back to treating the whole string as the
+    name when nothing matches (safer than dropping the record)."""
     if not raw:
         return None, ""
     raw = raw.strip()
@@ -128,15 +142,16 @@ async def upsert_procurement_notice(notice: ProcurementNotice) -> bool:
             """
             INSERT INTO procurement_notices (
                 notice_id, notice_type, fingerprint, caen_codes, cpv_code,
-                contracting_authority, financial, award_details, timeline,
-                raw_attachments, source_url, last_seen_at
-            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, now())
+                award_criterion, contracting_authority, financial,
+                award_details, timeline, raw_attachments, source_url, last_seen_at
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, now())
             ON CONFLICT (notice_id, notice_type) DO UPDATE SET
                 fingerprint = EXCLUDED.fingerprint,
                 financial = EXCLUDED.financial,
                 award_details = EXCLUDED.award_details,
                 timeline = EXCLUDED.timeline,
                 cpv_code = EXCLUDED.cpv_code,
+                award_criterion = EXCLUDED.award_criterion,
                 last_seen_at = now()
             RETURNING (xmax = 0) AS inserted
             """,
@@ -145,6 +160,7 @@ async def upsert_procurement_notice(notice: ProcurementNotice) -> bool:
             fp,
             notice.caen_codes,
             notice.cpv_code,
+            notice.award_criterion,
             _to_jsonb(notice.contracting_authority.model_dump()),
             _to_jsonb(notice.financial.model_dump()),
             _to_jsonb(notice.award_details.model_dump()) if notice.award_details else None,
