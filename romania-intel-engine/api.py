@@ -51,6 +51,14 @@ orchestrator = OpportunityOrchestrator()
 
 TICK_SECRET = os.getenv("TICK_SECRET", "")
 
+# Strong references to fire-and-forget background tasks. asyncio holds only a
+# weak reference to a running task, so one whose sole reference is a local
+# inside the coroutine that spawned it can be garbage collected mid-flight —
+# the work simply stops, with no exception raised anywhere. Every
+# asyncio.create_task in this module whose result nobody awaits is parked here
+# and discarded on completion.
+_BACKGROUND_TASKS: set = set()
+
 # How long without a completed tick before ingestion counts as stale.
 #
 # The heartbeat asks GitHub Actions for a tick every 5 minutes, but
@@ -124,10 +132,17 @@ async def lifespan(app: FastAPI):
     scheduler.add_job(background_scraping_job, "interval", hours=6)
     scheduler.start()
     document_tasks.start_workers()
-    asyncio.create_task(background_scraping_job())
+    _startup_tick = asyncio.create_task(background_scraping_job())
+    _BACKGROUND_TASKS.add(_startup_tick)
+    _startup_tick.add_done_callback(_BACKGROUND_TASKS.discard)
     logger.info("[SYSTEM] RO-INTEL Enterprise API active.")
     yield
     scheduler.shutdown()
+    # Cancels the document consumers, signals every in-flight OCR thread to
+    # stop at its next page boundary, and releases the document thread pool.
+    # Without this a redeploy leaves rendering threads running against a
+    # process that is going away.
+    await document_tasks.stop_workers()
 
 app = FastAPI(title="RO-INTEL Enterprise Procurement Engine", version="2.4.1", lifespan=lifespan)
 
@@ -612,6 +627,12 @@ async def system_status():
         # public. A number that climbs and never falls means the purge
         # below stopped running.
         "response_cache": global_cache.stats(),
+        # Queue depths and the resident-byte budget for the document worker.
+        # Counts and totals only — no doc ids or filenames, since this route
+        # is public. `resident_bytes` pinned at the limit while `in_flight`
+        # stays flat is the signature of a wedged OCR thread; before the
+        # per-document token existed there was no way to see that at all.
+        "document_workers": document_tasks.get_runner().stats(),
         **(
             {"detail": "no tick recorded because persistence is unavailable — check DATABASE_URL"}
             if last is None and not database["reachable"]
@@ -1161,10 +1182,28 @@ async def upload_caiet_async(
     file_bytes = await file.read()
     if not file_bytes:
         raise HTTPException(status_code=400, detail="Fisierul incarcat este gol.")
+    # Rejected here rather than accepted and failed asynchronously: the worker
+    # applies the same ceiling, but a 413 answers the caller in the request
+    # they are already waiting on, instead of handing back a doc_id whose only
+    # future is a failed row they have to poll for.
+    if len(file_bytes) > document_tasks.MAX_DOCUMENT_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail=(
+                f"Documentul depășește limita de "
+                f"{document_tasks.MAX_DOCUMENT_BYTES // (1024 * 1024)} MB "
+                f"({len(file_bytes) / (1024 * 1024):.1f} MB). "
+                "Încărcați doar secțiunile relevante ale caietului de sarcini."
+            ),
+        )
     doc_id = str(uuid.uuid4())
     filename = file.filename or "document.pdf"
     await document_extractions.create_queued_extraction(doc_id, notice_id, filename)
-    asyncio.create_task(document_tasks.enqueue_document(doc_id, notice_id, filename, file_bytes))
+    dispatch = asyncio.create_task(
+        document_tasks.enqueue_document(doc_id, notice_id, filename, file_bytes)
+    )
+    _BACKGROUND_TASKS.add(dispatch)
+    dispatch.add_done_callback(_BACKGROUND_TASKS.discard)
     return {"doc_id": doc_id, "status": "queued"}
 
 @app.get("/api/v1/addons/document-extractions/{doc_id}")

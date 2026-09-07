@@ -12,7 +12,7 @@ reported rather than assumed.
 import io
 import logging
 import shutil
-from typing import Any, Dict, List, Literal
+from typing import Any, Dict, List, Literal, Optional
 
 import pdfplumber
 
@@ -75,9 +75,26 @@ class PopplerUnavailableError(RuntimeError):
     """
 
 
-def render_pdf_to_images(pdf_bytes: bytes, output_dir: str, dpi: int = 300, max_pages: int = 150) -> List[str]:
+def render_pdf_to_images(
+    pdf_bytes: bytes,
+    output_dir: str,
+    dpi: int = 300,
+    max_pages: int = 150,
+    first_page: int = 1,
+    last_page: Optional[int] = None,
+) -> List[str]:
     """Renders a scanned PDF's pages to high-DPI PNG files inside
     `output_dir` and returns their paths in page order.
+
+    `first_page`/`last_page` are 1-based and inclusive, matching poppler's own
+    convention. workers/document_tasks.py drives this one batch of pages at a
+    time rather than in a single whole-document call, for two reasons that are
+    both about bounding this stage: rendering a 150-page scan at 300dpi
+    produces 150 full-resolution rasters on disk at once, and — because
+    asyncio cannot interrupt an executor thread — a single call spanning the
+    whole document is a multi-minute stretch during which a per-document
+    timeout has nothing to act on. `last_page` defaults to `max_pages` so a
+    caller that doesn't batch keeps the previous whole-document behaviour.
 
     The caller is expected to supply `output_dir` from a
     tempfile.TemporaryDirectory() context manager so every rendered image is
@@ -103,7 +120,13 @@ def render_pdf_to_images(pdf_bytes: bytes, output_dir: str, dpi: int = 300, max_
             output_folder=output_dir,
             fmt="png",
             paths_only=True,
-            last_page=max_pages,
+            first_page=first_page,
+            # An explicit last_page wins outright rather than being clamped by
+            # max_pages: a batching caller has already applied its own
+            # document-wide cap when computing the batch, and re-clamping here
+            # would silently produce an empty or inverted range for any batch
+            # that starts past this function's own default.
+            last_page=last_page if last_page is not None else max_pages,
         )
     except PDFInfoNotInstalledError as e:
         # Defensive: the shutil.which() check above should already have
