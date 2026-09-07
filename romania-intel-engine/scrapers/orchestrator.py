@@ -21,6 +21,10 @@ from scrapers.matrix.digital_scrapers import AdrNordVestScraper, OradeaAchizitii
 from scrapers.matrix.municipal_scrapers import (
     PmbAchizitiiScraper, TimisoaraHclScraper, ConstantaAchizitiiScraper
 )
+from scrapers.matrix.municipal_batch1 import (
+    BrasovMunicipalScraper, CraiovaMunicipalScraper,
+    GalatiMunicipalScraper, PloiestiMunicipalScraper,
+)
 from scrapers.matrix.municipal_matrix import CountyRegistryScraper
 from scrapers.ted_scraper import TedRomaniaScraper
 from ai_refinery import IntelligenceRefineryEngine
@@ -64,6 +68,17 @@ class OpportunityOrchestrator:
             # above). Each is a general municipal feed classified per
             # notice, same as OradeaAchizitiiScraper.
             PmbAchizitiiScraper(), TimisoaraHclScraper(), ConstantaAchizitiiScraper(),
+            # Batch 1 of the regional expansion beyond those five hubs.
+            # Each was verified live before being added here and each runs
+            # a different architecture — see municipal_batch1.py's module
+            # docstring for the per-portal reconnaissance. Unlike the SEAP
+            # feeds these are NOT behind a rollout flag: they are plain
+            # municipal HTML/REST sources with the same failure profile as
+            # the three municipal scrapers directly above them, which are
+            # also unflagged, and they inherit the same circuit breaker and
+            # per-source poll interval as every other entry in this list.
+            BrasovMunicipalScraper(), CraiovaMunicipalScraper(),
+            PloiestiMunicipalScraper(), GalatiMunicipalScraper(),
         ]
         if os.getenv("ENABLE_LIVE_ELICITATIE", "false").lower() == "true":
             # Real, live SICAP/e-licitatie data — added alongside (not yet
