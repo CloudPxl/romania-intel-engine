@@ -1069,6 +1069,24 @@ async def get_last_successful_tick() -> Optional[datetime]:
     return row["completed_at"] if row else None
 
 
+async def get_max_last_seen_at() -> Optional[datetime]:
+    """The newest last_seen_at across the entire table — whether real data
+    is actually advancing, as distinct from get_last_successful_tick()
+    above, which only says a tick's own bookkeeping round-tripped cleanly.
+
+    The distinction is load-bearing, not cosmetic: an empty tick (nothing
+    due, nothing to persist) records errors=0 and satisfies the tick-health
+    check above forever, even across days where not one row was written —
+    every scraper degrading to an honest zero (a real DOM/API change, not
+    an exception) would look identical to a healthy, quiet system on that
+    signal alone. This answers the question the tick-completion metric
+    cannot: is the market data itself still moving."""
+    async with with_connection() as conn:
+        if conn is None:
+            return None
+        return await conn.fetchval("SELECT max(last_seen_at) FROM opportunities")
+
+
 # ---------------------------------------------------------------------------
 # Deal pipeline persistence (pipeline_schema.sql). workflow_engine.py falls
 # back to its in-memory dict whenever a function here returns the "not

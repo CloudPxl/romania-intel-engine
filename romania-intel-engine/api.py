@@ -23,7 +23,7 @@ from workers import document_tasks
 from text_utils import normalize_cui, term_pattern
 from workflow_engine import ConcurrentWorkflowEngine
 from billing import StripeBillingEngine
-from scrapers.orchestrator import OpportunityOrchestrator, TICK_DEADLINE_SECONDS
+from scrapers.orchestrator import OpportunityOrchestrator, TICK_DEADLINE_SECONDS, DATA_STALE_AFTER_HOURS
 from cache_engine import global_cache, newsletter_store
 from notifier import LeadAlertDispatcher
 from security import (
@@ -628,10 +628,28 @@ async def system_status():
     # unconfigured DATABASE_URL presented as "ingestion is stale" with no
     # hint that the real problem was one layer down. Report which it is.
     database = await db.connectivity()
+
+    # A second, independent freshness signal from opportunities.last_seen_at
+    # itself — see orchestrator.py's matching per-tick watchdog and
+    # db.get_max_last_seen_at's docstring for why is_stale above cannot
+    # catch this: it only proves a tick's own bookkeeping succeeded, not
+    # that any real data moved. An empty or all-honest-zero tick satisfies
+    # is_stale forever while this can still correctly report staleness.
+    try:
+        newest_data = await db.get_max_last_seen_at()
+    except Exception as e:
+        logger.error(f"[Status] Could not read data freshness: {e}")
+        newest_data = None
+    data_age_hours = (
+        (datetime.now(timezone.utc) - newest_data).total_seconds() / 3600 if newest_data else None
+    )
+
     return {
         "last_tick_completed_at": last.isoformat() if last else None,
         "minutes_since_last_tick": minutes_since,
         "is_stale": minutes_since is None or minutes_since > STALENESS_THRESHOLD_MINUTES,
+        "data_last_seen_at": newest_data.isoformat() if newest_data else None,
+        "data_is_stale": data_age_hours is None or data_age_hours > DATA_STALE_AFTER_HOURS,
         "database": database,
         # Outcome of the boot-time additive DDL. A non-empty `failures` here
         # is the precise signature of the outage this guard was added for:
@@ -681,6 +699,20 @@ async def system_sources():
         logger.error(f"[SystemSources] Could not read source_run_log: {e}")
         return {"sources": [], "undelivered_admin_alerts": [], "degraded": True, "detail": "database unavailable"}
 
+    # source_run_log rows are never deleted when a scraper is retired or
+    # renamed — a live audit found 18 rows for scrapers that predate the
+    # current live-scraper matrix entirely (e.g. "SicapDefense",
+    # "PnrrHealth"; see CLAUDE.md on the old fixture-era 5-per-domain grid),
+    # none of which will ever run or update again. Left in, they'd sit in
+    # this list looking identical to a real source that is simply idle,
+    # which is exactly the wrong thing to see while triage-reading this
+    # endpoint during an actual incident. Filtered here, not deleted from
+    # the table — this is a monitoring view, and the underlying history
+    # stays available to anyone querying source_run_log directly.
+    registered = {s.name for s in OpportunityOrchestrator().scrapers}
+    retired = [r for r in rows if r["source_name"] not in registered]
+    rows = [r for r in rows if r["source_name"] in registered]
+
     def _health(row: Dict[str, Any]) -> str:
         if row["circuit_state"] == "open":
             return "broken"
@@ -715,6 +747,11 @@ async def system_sources():
         "undelivered_admin_alerts": [
             {"created_at": a["created_at"].isoformat(), "message": a["message"]} for a in alerts
         ],
+        # Visible rather than silently dropped, so this filtering is itself
+        # observable — a number that climbs over time is the signal that
+        # scrapers keep getting retired without their row ever being
+        # cleaned up, same spirit as response_cache.entries on /system/status.
+        "retired_source_rows_hidden": len(retired),
     }
 
 def _row_to_lead(row: Dict[str, Any]) -> Dict[str, Any]:

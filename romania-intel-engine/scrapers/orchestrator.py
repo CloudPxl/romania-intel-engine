@@ -2,6 +2,7 @@ import asyncio
 import logging
 import os
 import time
+from datetime import datetime, timezone
 from typing import Dict, Any
 
 import db
@@ -38,7 +39,41 @@ logger = logging.getLogger("OpportunityOrchestrator")
 # cancelled mid-flight. Render's free tier runs at 0.1 CPU, where PDF
 # parsing and several hundred DB round-trips are genuinely slow, so this
 # is treated as a routine condition rather than an error.
-TICK_DEADLINE_SECONDS = float(os.getenv("TICK_DEADLINE_SECONDS", "200"))
+#
+# 200 -> 260: a live production audit found 7 real, working scrapers
+# (ElicitatieLive, the four SEAP notice types, CountyRegistryMatrix,
+# TedRomania) with ZERO rows in source_run_log despite the app having been
+# up and ticking every 5 minutes for over an hour — never even a failed
+# attempt logged, which is only possible if their task is cancelled by the
+# deadline before as_completed ever yields it (a cancelled, never-yielded
+# task never reaches circuit_breaker.record_result). Locally, with a real
+# CPU, all 26 scrapers running together finished in 81-111s; on Render's
+# documented 0.1 CPU that same concurrent, partly CPU-bound batch (JSON
+# parsing hundreds of items, HTML parsing across 35 counties) plausibly
+# takes multiple times longer, meaning the slower of the 26 could lose the
+# deadline race on literally every tick, forever, while all 26 stayed
+# individually correct in isolation. 260s leaves 40s of margin under the
+# 300s heartbeat cadence (.github/workflows/heartbeat.yml) so a tick still
+# finishes, and the lock in api.py still turns an overlapping heartbeat
+# call into a no-op, before the next one fires.
+TICK_DEADLINE_SECONDS = float(os.getenv("TICK_DEADLINE_SECONDS", "260"))
+
+# Fleet-wide data-freshness watchdog, distinct from db.get_last_successful_tick
+# (which only proves a tick's own bookkeeping round-tripped, not that any
+# real data moved — see get_max_last_seen_at's docstring). Checked once per
+# tick rather than on its own timer: the heartbeat already ticks every 5
+# minutes (.github/workflows/heartbeat.yml), so piggybacking here costs
+# nothing extra and needs no separate scheduler entry.
+DATA_STALE_AFTER_HOURS = float(os.getenv("DATA_STALE_AFTER_HOURS", "12"))
+# In-process latch so the alert fires once per stale episode, not every 5
+# minutes for the whole duration of an outage — mirrors
+# source_run_log.stale_alert_fired_at's per-source version, but this is a
+# single fleet-wide condition with no natural row of its own to store a
+# timestamp on, so a module-level flag is the proportionate amount of
+# state. A restart clears it, which just means one possible duplicate
+# alert right after a deploy — acceptable, since silence is the failure
+# mode this exists to prevent, not the reverse.
+_data_stale_alert_fired = False
 
 class OpportunityOrchestrator:
     def __init__(self):
@@ -253,7 +288,20 @@ class OpportunityOrchestrator:
 
             logger.info(f"⚡ [TICK] Running {len(due)}/{len(self.scrapers)} due scraper engines...")
 
-            tasks = [asyncio.create_task(self._run_one_scraper(s)) for s in due]
+            # scraper.name isn't recoverable from a bare Task once it's
+            # cancelled below, so it has to be captured here — the
+            # TimeoutError branch is the whole reason this exists: naming
+            # exactly which due sources never got a turn. Before this, the
+            # log only said "N/M sources processed", which cannot tell a
+            # source that is occasionally slow from one that loses the
+            # deadline race on literally every tick, forever, and never
+            # produces a single row anywhere.
+            task_names = {}
+            tasks = []
+            for s in due:
+                t = asyncio.create_task(self._run_one_scraper(s))
+                task_names[t] = s.name
+                tasks.append(t)
             try:
                 for coro in asyncio.as_completed(tasks, timeout=max(1.0, remaining())):
                     scraper, signals, error = await coro
@@ -314,9 +362,19 @@ class OpportunityOrchestrator:
                         break
             except asyncio.TimeoutError:
                 truncated = True
+                # A task cancelled here never reaches circuit_breaker's
+                # record_result — the only trace it leaves anywhere is this
+                # log line. Named explicitly rather than just counted, so a
+                # source that consistently loses this race (never appearing
+                # even once in source_run_log or /api/v1/system/sources
+                # despite the app ticking every 5 minutes for hours) is
+                # visible on sight instead of indistinguishable from one
+                # that occasionally runs a little long.
+                skipped = sorted(task_names[t] for t in tasks if not t.done())
                 logger.warning(
                     f"[Tick] Soft deadline of {deadline_seconds:.0f}s reached; "
-                    f"{completed_sources}/{len(due)} sources processed. Remainder stays due."
+                    f"{completed_sources}/{len(due)} sources processed. "
+                    f"Never got a turn this tick: {', '.join(skipped) or '(none)'}."
                 )
             finally:
                 for task in tasks:
@@ -340,6 +398,44 @@ class OpportunityOrchestrator:
                     await LeadAlertDispatcher.dispatch_admin_alert(message)
                 except Exception as e:
                     logger.error(f"[Tick] Could not dispatch persistence-failure alert: {e}")
+
+            # A second, independent freshness check: is real data actually
+            # advancing, not just "did this tick's own bookkeeping
+            # succeed". An empty tick (nothing due) or a tick where every
+            # scraper degrades to an honest zero-signal result (a real
+            # source change, not an exception — circuit breakers never
+            # open for that) both record errors=0 and would otherwise
+            # leave is_stale=false indefinitely while opportunities.
+            # last_seen_at stops moving entirely.
+            global _data_stale_alert_fired
+            try:
+                newest = await db.get_max_last_seen_at()
+            except Exception as e:
+                logger.error(f"[Tick] Could not check data freshness: {e}")
+                newest = None
+            if newest is not None:
+                age_hours = (datetime.now(timezone.utc) - newest).total_seconds() / 3600
+                if age_hours > DATA_STALE_AFTER_HOURS:
+                    if not _data_stale_alert_fired:
+                        _data_stale_alert_fired = True
+                        stale_message = (
+                            f"[RO-INTEL] DATA STALE: no opportunity has advanced last_seen_at in "
+                            f"{age_hours:.1f}h (threshold {DATA_STALE_AFTER_HOURS:.0f}h). Ticks are "
+                            f"completing but real ingestion may have silently stopped — check "
+                            f"/api/v1/system/sources for sources stuck at circuit_state=open or a "
+                            f"rising consecutive_zero_result_runs across the board."
+                        )
+                        logger.error(stale_message)
+                        try:
+                            await LeadAlertDispatcher.dispatch_admin_alert(stale_message)
+                        except Exception as e:
+                            logger.error(f"[Tick] Could not dispatch data-staleness alert: {e}")
+                elif _data_stale_alert_fired:
+                    # Recovered — re-arm so a second, later episode can
+                    # alert again instead of staying permanently silenced
+                    # by the first one.
+                    _data_stale_alert_fired = False
+                    logger.info("[Tick] Data freshness recovered; staleness watchdog re-armed.")
 
             logger.info(
                 f"✅ [TICK] Complete. sources_run={completed_sources}/{len(due)} "
