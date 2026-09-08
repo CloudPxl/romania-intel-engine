@@ -5,6 +5,19 @@ from scrapers.base_scraper import BaseScraper
 from scrapers.matrix.cni_common import HEALTH_CATEGORIES, CniRegisterScraper
 from scrapers.models import RawInstitutionalSignal
 from ..money import parse_ro_number
+# Module scope, not function-local. _parse_pdf_offloaded() below is a
+# module-level function that dereferences extract_table_rows /
+# extract_first_page_text through module globals, so importing them inside
+# its *callers* (as this file used to) bound them in the wrong namespace —
+# every call raised `NameError: name 'extract_table_rows' is not defined`,
+# which meant UrbanismAcScraper and CountyHclScraper had not produced a
+# single signal since the offload refactor. pdf_table_extractor is a leaf
+# module (io/logging/pdfplumber only), so there is no import cycle to avoid.
+from scrapers.pdf_table_extractor import (
+    extract_first_page_text,
+    extract_table_rows,
+    normalize_cell,
+)
 
 # SICAP market consultations are now covered live by
 # scrapers/matrix/elicitatie_scraper.py:ElicitatieLiveScraper — the old
@@ -116,7 +129,6 @@ class UrbanismAcScraper(BaseScraper):
             return ""
 
     async def fetch_market_consultations(self) -> List[RawInstitutionalSignal]:
-        from scrapers.pdf_table_extractor import extract_table_rows, extract_first_page_text, normalize_cell
 
         listing_html = await self.fetch_url(self.LISTING_PAGE_URL)
         if not listing_html:
@@ -198,7 +210,6 @@ class CountyHclScraper(BaseScraper):
             return ""
 
     async def fetch_market_consultations(self) -> List[RawInstitutionalSignal]:
-        from scrapers.pdf_table_extractor import extract_table_rows, normalize_cell
 
         listing_html = await self.fetch_url(self.REGISTER_PAGE_URL)
         if not listing_html:

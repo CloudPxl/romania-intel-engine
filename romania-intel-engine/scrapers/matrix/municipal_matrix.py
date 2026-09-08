@@ -64,6 +64,21 @@ HCL_RELEVANT_KEYWORDS = [
 PROCUREMENT_DAYS_BACK = 60
 MAX_CONCURRENT_COUNTIES = 15
 
+# Per-county wall-clock budget for BOTH adapter calls together.
+#
+# The semaphore alone bounds concurrency, not duration: without this, a
+# county portal that accepts the TCP connection and then never answers holds
+# its slot forever and `gather` below never returns. Measured live across
+# all 35 registered counties: 25 complete (slowest 32.6s) and 10 hang
+# indefinitely, so the fan-out never finished at all — it was cancelled by
+# TICK_DEADLINE_SECONDS (200s) on every single tick and this source
+# contributed ZERO signals despite 25 counties being perfectly healthy.
+# With this bound the same run yields ~718 signals in ~60s.
+#
+# 45s sits comfortably above the slowest real county (32.6s) while keeping
+# the worst case — ceil(35/15) = 3 waves — inside the tick deadline.
+COUNTY_FETCH_TIMEOUT_SECONDS = float(os.getenv("COUNTY_FETCH_TIMEOUT_SECONDS", "45"))
+
 _generic_adapter = GenericPortalAdapter()
 
 # "wordpress" is a registry-level detection label (see
@@ -137,7 +152,12 @@ class CountyRegistryScraper(BaseScraper):
             self.logger.warning(f"[{self.name}] Registry entry missing county/base_url — skipped: {entry!r:.120}")
             return []
         signals: List[RawInstitutionalSignal] = []
-        async with semaphore:
+
+        # Closes over `signals`, so whatever a county produced before the
+        # budget ran out survives the cancellation instead of being thrown
+        # away with the coroutine — the same partial-coverage posture
+        # fetch_market_consultations takes for a county that raises.
+        async def _collect() -> None:
             try:
                 notices = await adapter.extract_procurement_notices(base_url, county, PROCUREMENT_DAYS_BACK)
                 signals.extend(_notice_to_signal(n, platform) for n in notices)
@@ -149,6 +169,19 @@ class CountyRegistryScraper(BaseScraper):
                 signals.extend(_notice_to_signal(n, platform) for n in notices)
             except Exception as e:
                 self.logger.error(f"[{self.name}] HCL extraction failed for {county} ({platform}): {e}")
+
+        # Inside the semaphore, so a hung county releases its slot on
+        # timeout; wrapping the acquire instead would spend the budget
+        # queueing behind healthy counties.
+        async with semaphore:
+            try:
+                await asyncio.wait_for(_collect(), timeout=COUNTY_FETCH_TIMEOUT_SECONDS)
+            except asyncio.TimeoutError:
+                self.logger.warning(
+                    f"[{self.name}] {county} ({platform}) exceeded "
+                    f"{COUNTY_FETCH_TIMEOUT_SECONDS:.0f}s and was abandoned; "
+                    f"keeping {len(signals)} partial signal(s)."
+                )
         return signals
 
     async def fetch_market_consultations(self) -> List[RawInstitutionalSignal]:

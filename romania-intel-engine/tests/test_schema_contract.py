@@ -48,12 +48,13 @@ def _base_table_columns() -> set:
     return columns
 
 
-def _boot_ddl_columns() -> set:
-    """Columns db.ensure_schema() guarantees on every start-up."""
+def _boot_ddl_columns(table: str = "opportunities") -> set:
+    """Columns db.ensure_schema() guarantees on `table` at every start-up."""
     return {
-        m.group(1)
+        m.group(2)
         for stmt in db._REQUIRED_DDL
-        if (m := re.search(r"ADD COLUMN IF NOT EXISTS (\w+)", stmt))
+        if (m := re.match(r"ALTER TABLE (\w+) ADD COLUMN IF NOT EXISTS (\w+)", stmt))
+        and m.group(1) == table
     }
 
 
@@ -112,21 +113,48 @@ class TestBootDdlStaysSafeToRunUnconditionally:
         for stmt in db._REQUIRED_DDL:
             assert "IF NOT EXISTS" in stmt, f"not idempotent: {stmt}"
 
-    def test_nothing_destructive(self):
-        forbidden = ("DROP", "TRUNCATE", "DELETE", "UPDATE", "RENAME", "ALTER COLUMN")
+    def test_only_recognisably_safe_statement_shapes_are_included(self):
+        """An allowlist, not merely the absence of a scary keyword."""
         for stmt in db._REQUIRED_DDL:
-            upper = stmt.upper()
-            for word in forbidden:
-                assert word not in upper, f"destructive statement in boot DDL: {stmt}"
+            assert (
+                stmt.upper().startswith(
+                    ("CREATE TABLE IF NOT EXISTS ", "CREATE INDEX IF NOT EXISTS ",
+                     "CREATE EXTENSION IF NOT EXISTS ")
+                )
+                or re.match(r"^ALTER TABLE \w+ ADD COLUMN IF NOT EXISTS ", stmt, re.I)
+            ), f"unrecognised statement shape in boot DDL: {stmt[:100]}"
 
-    def test_only_touches_the_opportunities_table(self):
+    def test_the_destructive_half_of_schema_sql_is_never_picked_up(self):
+        """schema.sql also drops two generations of dead tables, defines RLS
+        policies and runs a backfill UPDATE. None may run unattended on
+        every boot."""
+        assert "DROP TABLE" in SCHEMA_SQL, "fixture assumption broke: no DROPs in schema.sql"
+        assert "CREATE POLICY" in SCHEMA_SQL
         for stmt in db._REQUIRED_DDL:
-            assert "opportunities" in stmt, f"unexpected table in boot DDL: {stmt}"
+            assert not re.search(
+                r"\b(DROP|DELETE|TRUNCATE|UPDATE|INSERT|POLICY|GRANT|REVOKE|RENAME)\b",
+                stmt, re.I,
+            ), f"destructive statement leaked into boot DDL: {stmt[:100]}"
 
-    def test_schema_sql_still_declares_everything_the_boot_ddl_does(self):
-        """schema.sql stays the source of truth; the boot DDL is a subset of
-        it, never a second, diverging definition."""
-        for column in _boot_ddl_columns():
-            assert re.search(
-                rf"ALTER TABLE opportunities ADD COLUMN IF NOT EXISTS {column}\b", SCHEMA_SQL
-            ), f"{column} is applied at boot but absent from schema.sql"
+    def test_every_table_the_code_uses_is_created(self):
+        """A missing table is the same outage as a missing column — it is how
+        system_alerts and source_run_log's two columns went missing."""
+        created = {
+            m.group(1)
+            for stmt in db._REQUIRED_DDL
+            if (m := re.match(r"CREATE TABLE IF NOT EXISTS (\w+)", stmt))
+        }
+        for table in (
+            "opportunities", "source_run_log", "system_ticks", "system_alerts",
+            "procurement_notices", "seap_ingest_state", "document_extractions",
+        ):
+            assert table in created, f"{table} is used by the code but never created at boot"
+
+    def test_the_guard_is_derived_from_schema_sql_not_a_second_copy(self):
+        """Every statement must actually come from schema.sql, so the two
+        can never disagree about a column's type or an index's shape."""
+        normalised = " ".join(
+            "\n".join(l.split("--", 1)[0] for l in SCHEMA_SQL.splitlines()).split()
+        )
+        for stmt in db._REQUIRED_DDL:
+            assert stmt in normalised, f"boot DDL statement is not in schema.sql: {stmt[:100]}"

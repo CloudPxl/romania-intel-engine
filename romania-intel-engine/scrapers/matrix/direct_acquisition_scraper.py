@@ -116,6 +116,36 @@ async def _post_json(client: httpx.AsyncClient, url: str, body: Dict[str, Any]) 
     return response.json()
 
 
+@retry(
+    stop=stop_after_attempt(4),
+    wait=wait_exponential_jitter(initial=1, max=12),
+    retry=retry_if_exception_type((httpx.TransportError, httpx.HTTPStatusError, asyncio.TimeoutError)),
+    reraise=True,
+)
+async def _get_priming(client: httpx.AsyncClient, url: str) -> httpx.Response:
+    """Same retry policy as `_post_json`, for the session-cookie GET every
+    scraper in this e-licitatie family issues before its real request.
+
+    Verified live: e-licitatie.ro's bot mitigation (documented in
+    notice_scraper.py and this module's own docstring) silently drops a
+    connection for 20-45s under rapid repeated requests before recovering.
+    That GET used to be a bare `client.get(url)` with no retry at all — a
+    single unlucky hit during the mitigation window raised ConnectTimeout/
+    ReadTimeout straight into fetch_market_consultations's outer
+    `except Exception: ... raise`, which killed the ENTIRE scraper for
+    that tick (zero signals, all pages skipped) even though the pagination
+    calls right after it, wrapped in `_post_json`, would retry and likely
+    succeed. Reproduced live: 2 of 3 consecutive ContractNoticeScraper runs
+    returned 200 signals in ~8s; the third raised ConnectTimeout on this
+    exact call and returned 0. Four attempts with jittered backoff up to
+    12s comfortably spans the documented recovery window across retries."""
+    response = await client.get(url, headers={"User-Agent": _random_ua()})
+    if 400 <= response.status_code < 500:
+        raise NonRetryableHTTPError(f"{response.status_code} for {url}")
+    response.raise_for_status()
+    return response
+
+
 def _iso_date(value: Optional[str]) -> Optional[str]:
     """e-licitatie dates arrive as e.g. '2019-04-08T14:17:43+03:00'; the
     rest of the app only ever wants the date part."""
@@ -155,7 +185,8 @@ class _BaseDirectAcqScraper(BaseScraper):
                 headers=headers,
                 limits=httpx.Limits(max_connections=10, max_keepalive_connections=5),
             ) as client:
-                await client.get(LISTING_PAGE_URL)  # primes the session cookie the API expects
+                # Retrying, not a bare GET — see _get_priming's docstring.
+                await _get_priming(client, LISTING_PAGE_URL)
 
                 for page in range(self.max_pages):
                     await asyncio.sleep(self.rate_limit_delay)

@@ -104,7 +104,12 @@ from procurement_notices import (
 )
 from scrapers.base_scraper import BaseScraper
 from scrapers.matrix.category_classifier import classify_category
-from scrapers.matrix.direct_acquisition_scraper import NonRetryableHTTPError, _post_json, _random_ua
+from scrapers.matrix.direct_acquisition_scraper import (
+    NonRetryableHTTPError,
+    _get_priming,
+    _post_json,
+    _random_ua,
+)
 from scrapers.models import RawInstitutionalSignal
 
 logger = logging.getLogger("NoticeScraper")
@@ -212,7 +217,11 @@ class _BaseNoticeScraper(BaseScraper):
                 headers=headers,
                 limits=httpx.Limits(max_connections=10, max_keepalive_connections=5),
             ) as client:
-                await client.get(LISTING_PAGE_URL)  # primes the session cookie the API expects
+                # Retrying, not a bare GET — see _get_priming's docstring in
+                # direct_acquisition_scraper.py. Reproduced live: this exact
+                # call raised ConnectTimeout during e-licitatie's bot
+                # mitigation and killed ContractNoticeScraper's whole tick.
+                await _get_priming(client, LISTING_PAGE_URL)
 
                 for page in range(self.max_pages):
                     await asyncio.sleep(self.rate_limit_delay)

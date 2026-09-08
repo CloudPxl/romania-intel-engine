@@ -135,7 +135,20 @@ async def lifespan(app: FastAPI):
     # when it hadn't been, every upsert AND every authenticated read raised
     # UndefinedColumnError. Awaited, not backgrounded, so the first tick and
     # the first request both find the columns already there.
-    await db.ensure_schema()
+    #
+    # Bounded independently of db.py's own connect timeout: this runs
+    # before the app answers even /health, so a hang here — for any reason,
+    # not just a slow DB — must not be able to stall boot indefinitely.
+    # ensure_schema() already never raises, so the timeout is the only
+    # thing standing between a stuck database and a Render deploy that
+    # never comes up.
+    try:
+        await asyncio.wait_for(db.ensure_schema(), timeout=30.0)
+    except asyncio.TimeoutError:
+        logger.error(
+            "[SYSTEM] Schema guard did not complete within 30s — booting anyway. "
+            "Check /api/v1/system/status -> schema_guard once the app is up."
+        )
     scheduler.add_job(background_scraping_job, "interval", hours=6)
     scheduler.start()
     document_tasks.start_workers()

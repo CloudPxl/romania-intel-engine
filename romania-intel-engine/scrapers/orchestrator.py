@@ -207,6 +207,16 @@ class OpportunityOrchestrator:
         errors = 0
         completed_sources = 0
         truncated = False
+        # Persistence is counted separately from `errors` because the two
+        # answer different questions. A scraper that fetched fine still
+        # records success on its circuit breaker even when every row it
+        # produced then failed to save — which is exactly how a total write
+        # outage (an UndefinedColumnError on every upsert) ran for ~19 hours
+        # with every source logged healthy and /system/status reporting
+        # is_stale:false. Ratio, not count, is what distinguishes "one bad
+        # row" from "the write path is gone".
+        persist_attempts = 0
+        persist_failures = 0
         due: List[BaseScraper] = []
 
         # Everything from here on is guarded so that db.finish_tick ALWAYS
@@ -278,10 +288,12 @@ class OpportunityOrchestrator:
                             break
 
                         refined = IntelligenceRefineryEngine.refine_signal(sig)
+                        persist_attempts += 1
                         try:
                             is_new = await db.upsert_opportunity(refined)
                         except Exception as e:
                             errors += 1
+                            persist_failures += 1
                             logger.error(f"[Tick] Failed to persist opportunity {refined.get('source_id')}: {e}")
                             continue
                         if not is_new:
@@ -312,9 +324,27 @@ class OpportunityOrchestrator:
                         task.cancel()
                 await asyncio.gather(*tasks, return_exceptions=True)
 
+            # Every attempted write failed. The scrapers are fine — they all
+            # recorded success — so nothing else in the system will ever
+            # report this: not the circuit breakers, not source_run_log, and
+            # not is_stale once the due sources fall out of their poll
+            # windows and the following ticks go quietly to errors=0.
+            if persist_attempts and persist_failures == persist_attempts:
+                message = (
+                    f"[RO-INTEL] PERSISTENCE DOWN: all {persist_attempts} writes failed this tick "
+                    f"across {completed_sources} healthy source(s). Scraping works; nothing is being "
+                    f"saved. Check /api/v1/system/status -> schema_guard and the DB connection."
+                )
+                logger.error(message)
+                try:
+                    await LeadAlertDispatcher.dispatch_admin_alert(message)
+                except Exception as e:
+                    logger.error(f"[Tick] Could not dispatch persistence-failure alert: {e}")
+
             logger.info(
                 f"✅ [TICK] Complete. sources_run={completed_sources}/{len(due)} "
-                f"new_opportunities={new_count} errors={errors} truncated={truncated}"
+                f"new_opportunities={new_count} errors={errors} truncated={truncated} "
+                f"persisted={persist_attempts - persist_failures}/{persist_attempts}"
             )
             return {
                 "sources_run": completed_sources,
@@ -322,6 +352,8 @@ class OpportunityOrchestrator:
                 "new_opportunities": new_count,
                 "errors": errors,
                 "truncated": truncated,
+                "persist_attempts": persist_attempts,
+                "persist_failures": persist_failures,
                 "duration_seconds": round(time.monotonic() - started, 1),
             }
         finally:

@@ -48,6 +48,17 @@ _pool_retry_after = 0.0
 POOL_MAX_INACTIVE_SECONDS = 180.0
 POOL_ACQUIRE_TIMEOUT = 15.0
 COMMAND_TIMEOUT = 30.0
+# asyncpg.create_pool()'s own `timeout` defaults to 60s per connection
+# attempt if not overridden — measured live against a blackholed address
+# (a host that accepts no TCP handshake and sends no RST/ICMP, e.g. a
+# paused/misconfigured project): get_pool() took exactly 60.0s to give up.
+# ensure_schema() now runs inside lifespan() before the app accepts any
+# request, including /health, so that 60s was 60s the whole process
+# couldn't answer anything. 10s is generous for a real database (Supabase's
+# own connections resolve in well under a second) while failing a
+# genuinely unreachable one fast enough that boot isn't the thing that eats
+# the delay — get_pool()'s existing cooldown-and-retry handles the rest.
+POOL_CONNECT_TIMEOUT = 10.0
 
 # Raised when a pooled connection turns out to be dead. Recreating the pool
 # and retrying once clears it.
@@ -96,6 +107,7 @@ async def get_pool() -> Optional[asyncpg.Pool]:
             "max_size": 20,
             "max_inactive_connection_lifetime": POOL_MAX_INACTIVE_SECONDS,
             "command_timeout": COMMAND_TIMEOUT,
+            "timeout": POOL_CONNECT_TIMEOUT,
         }
         if _is_transaction_pooler(DATABASE_URL):
             # Supabase's transaction pooler multiplexes one server-side
@@ -189,19 +201,68 @@ async def is_available() -> bool:
 # re-run on every boot is a no-op and a partial failure cannot corrupt data.
 # Keep it that way — this list is not a general migration runner, and a
 # statement that is not safe to run unconditionally does not belong in it.
-_REQUIRED_DDL: tuple = (
-    "ALTER TABLE opportunities ADD COLUMN IF NOT EXISTS search_blob TEXT",
-    "ALTER TABLE opportunities ADD COLUMN IF NOT EXISTS cpv_codes_all TEXT[] DEFAULT '{}'",
-    "ALTER TABLE opportunities ADD COLUMN IF NOT EXISTS cpv_division TEXT",
-    "ALTER TABLE opportunities ADD COLUMN IF NOT EXISTS cpv_group TEXT",
-    "ALTER TABLE opportunities ADD COLUMN IF NOT EXISTS cpv_class TEXT",
-    "ALTER TABLE opportunities ADD COLUMN IF NOT EXISTS procedure_type TEXT",
-    "ALTER TABLE opportunities ADD COLUMN IF NOT EXISTS authority_cui TEXT",
-    "ALTER TABLE opportunities ADD COLUMN IF NOT EXISTS award_criterion TEXT",
-    "CREATE INDEX IF NOT EXISTS idx_opportunities_authority_cui ON opportunities(authority_cui)",
-    "CREATE INDEX IF NOT EXISTS idx_opportunities_cpv_division ON opportunities(cpv_division)",
-    "CREATE INDEX IF NOT EXISTS idx_opportunities_cpv_codes_all ON opportunities USING gin (cpv_codes_all)",
+# Derived from schema.sql rather than hand-copied, so the two can never
+# drift: a column added to the file is applied on the next boot without
+# anyone remembering to also add it here.
+#
+# Only the strictly additive, idempotent subset is taken. schema.sql also
+# contains 21 DROPs (its destructive dead-table cleanup), 5 RLS policies and
+# a data backfill UPDATE — none of which may run unattended on every start.
+# The filter is an allowlist (three statement shapes) AND a denylist, so a
+# statement has to be recognisably safe to be included, not merely not
+# recognisably dangerous.
+_ALTER_ADD_COLUMN_RE = re.compile(
+    r"^ALTER TABLE \w+ ADD COLUMN IF NOT EXISTS ", re.IGNORECASE
 )
+_SAFE_DDL_PREFIXES = (
+    "CREATE TABLE IF NOT EXISTS ",
+    "CREATE INDEX IF NOT EXISTS ",
+    # pg_trgm has to exist before idx_opportunities_search_blob_trgm can be
+    # built, and it is itself idempotent and additive.
+    "CREATE EXTENSION IF NOT EXISTS ",
+)
+# Whole words, not substrings: a plain `"UPDATE" in stmt` also matches the
+# column name `updated_at`, which silently excluded the whole
+# seap_ingest_state table from the guard.
+_FORBIDDEN_IN_DDL = re.compile(
+    r"\b(DROP|DELETE|TRUNCATE|UPDATE|INSERT|POLICY|GRANT|REVOKE|RENAME)\b"
+    r"|ROW LEVEL SECURITY|ALTER COLUMN",
+    re.IGNORECASE,
+)
+
+
+def _load_required_ddl() -> tuple:
+    """Parse schema.sql into the additive statements safe to re-run on boot."""
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "schema.sql")
+    try:
+        with open(path, encoding="utf-8") as fh:
+            raw = fh.read()
+    except OSError as e:
+        logger.error(f"[DB] Could not read schema.sql for the schema guard: {e}")
+        return ()
+
+    # Strip line comments before splitting: schema.sql's prose mentions
+    # DROP and other keywords the denylist below would otherwise trip on.
+    stripped = "\n".join(line.split("--", 1)[0] for line in raw.splitlines())
+
+    statements = []
+    for chunk in stripped.split(";"):
+        stmt = " ".join(chunk.split())
+        if not stmt:
+            continue
+        upper = stmt.upper()
+        is_allowed = upper.startswith(_SAFE_DDL_PREFIXES) or _ALTER_ADD_COLUMN_RE.match(stmt)
+        if not is_allowed:
+            continue
+        if _FORBIDDEN_IN_DDL.search(stmt):
+            continue
+        statements.append(stmt)
+    return tuple(statements)
+
+
+# File order is preserved deliberately: a table is created before the
+# indexes and ADD COLUMNs that reference it.
+_REQUIRED_DDL: tuple = _load_required_ddl()
 
 # Surfaced on /api/v1/system/status so a refused or partial apply is
 # visible without reading Render's logs — the thing that would have turned

@@ -7,6 +7,14 @@ import httpx
 from scrapers.base_scraper import BaseScraper, USER_AGENT
 from scrapers.models import RawInstitutionalSignal
 from scrapers.document_enricher import extract_caen_codes_from_documents
+# Shared retry/backoff for e-licitatie.ro's bot mitigation (documented in
+# notice_scraper.py and direct_acquisition_scraper.py's module docstrings:
+# TLS handshake succeeds, then no HTTP response for 20-45s, recovering in
+# ~15-20s) rather than a third hand-rolled copy. Reproduced live against
+# this exact scraper: a bare, unretried `client.get(LISTING_PAGE_URL)`
+# raised ConnectTimeout and returned 0 signals for a source that otherwise
+# runs clean every 10 minutes.
+from scrapers.matrix.direct_acquisition_scraper import _get_priming, _post_json
 
 logger = logging.getLogger("ElicitatieLiveScraper")
 
@@ -49,14 +57,14 @@ class ElicitatieLiveScraper(BaseScraper):
         signals: List[RawInstitutionalSignal] = []
         try:
             async with httpx.AsyncClient(timeout=20.0, follow_redirects=True, headers=headers) as client:
-                await client.get(LISTING_PAGE_URL)  # picks up the session cookie the API requires
+                # Retrying, not bare — see the import comment above.
+                await _get_priming(client, LISTING_PAGE_URL)
 
                 start = (datetime.now(timezone.utc) - timedelta(days=self.lookback_days)).strftime("%Y-%m-%dT%H:%M:%S.000Z")
-                list_resp = await client.post(LIST_API_URL, json={
+                data = await _post_json(client, LIST_API_URL, {
                     "pageSize": self.page_size, "publicationDateStart": start, "pageIndex": 0,
                 })
-                list_resp.raise_for_status()
-                items = list_resp.json().get("items", [])
+                items = (data or {}).get("items", [])
 
                 for item in items:
                     signal = await self._build_signal(client, item)
