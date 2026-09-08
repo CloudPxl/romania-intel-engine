@@ -129,6 +129,13 @@ async def background_scraping_job():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # Before anything reads or writes `opportunities`. The ingestion tick
+    # dispatched below upserts columns (authority_cui, procedure_type, the
+    # cpv_* set) that only exist if schema.sql was applied by hand — and
+    # when it hadn't been, every upsert AND every authenticated read raised
+    # UndefinedColumnError. Awaited, not backgrounded, so the first tick and
+    # the first request both find the columns already there.
+    await db.ensure_schema()
     scheduler.add_job(background_scraping_job, "interval", hours=6)
     scheduler.start()
     document_tasks.start_workers()
@@ -613,6 +620,12 @@ async def system_status():
         "minutes_since_last_tick": minutes_since,
         "is_stale": minutes_since is None or minutes_since > STALENESS_THRESHOLD_MINUTES,
         "database": database,
+        # Outcome of the boot-time additive DDL. A non-empty `failures` here
+        # is the precise signature of the outage this guard was added for:
+        # the code names a column the database does not have, so every
+        # authenticated read and every ingestion upsert 500s while the
+        # public routes keep answering normally.
+        "schema_guard": db.last_schema_result(),
         # Distinct callers currently inside the rate-limit window. A count
         # only — never the addresses themselves, since this route is public.
         # Worth surfacing because a value pinned at 1 while several people

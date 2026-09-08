@@ -165,6 +165,97 @@ async def is_available() -> bool:
     return await get_pool() is not None
 
 
+# ----------------------------------------------------------- schema guard
+
+# Every column named below is dereferenced BY NAME in shipped code — written
+# by upsert_opportunity or filtered by get_ranked_opportunities. schema.sql
+# stays the full source of truth for the database (tables, RLS, seeds, and
+# its destructive cleanup section) and is still applied by hand; this is the
+# narrow subset the running process cannot function without.
+#
+# It exists because the alternative failed in production. The promoted
+# authority_cui/award_criterion columns shipped in a deploy while schema.sql
+# was never run against Supabase, so `WHERE authority_cui = $6` raised
+# UndefinedColumnError on every authenticated read (/me/feed and
+# /me/market-trends both 500ing) AND on every ingestion upsert, which meant
+# no new opportunity could be persisted either. The whole signed-in product
+# was down while the public routes — which never name these columns — kept
+# answering, so the outage looked like a frontend bug for days. A .sql file
+# a human has to remember to run is not a deployment mechanism; anything the
+# code dereferences by name has to travel with the code.
+#
+# Strictly additive and idempotent: ADD COLUMN / CREATE INDEX with IF NOT
+# EXISTS only. Nothing here drops, renames, backfills or rewrites, so a
+# re-run on every boot is a no-op and a partial failure cannot corrupt data.
+# Keep it that way — this list is not a general migration runner, and a
+# statement that is not safe to run unconditionally does not belong in it.
+_REQUIRED_DDL: tuple = (
+    "ALTER TABLE opportunities ADD COLUMN IF NOT EXISTS search_blob TEXT",
+    "ALTER TABLE opportunities ADD COLUMN IF NOT EXISTS cpv_codes_all TEXT[] DEFAULT '{}'",
+    "ALTER TABLE opportunities ADD COLUMN IF NOT EXISTS cpv_division TEXT",
+    "ALTER TABLE opportunities ADD COLUMN IF NOT EXISTS cpv_group TEXT",
+    "ALTER TABLE opportunities ADD COLUMN IF NOT EXISTS cpv_class TEXT",
+    "ALTER TABLE opportunities ADD COLUMN IF NOT EXISTS procedure_type TEXT",
+    "ALTER TABLE opportunities ADD COLUMN IF NOT EXISTS authority_cui TEXT",
+    "ALTER TABLE opportunities ADD COLUMN IF NOT EXISTS award_criterion TEXT",
+    "CREATE INDEX IF NOT EXISTS idx_opportunities_authority_cui ON opportunities(authority_cui)",
+    "CREATE INDEX IF NOT EXISTS idx_opportunities_cpv_division ON opportunities(cpv_division)",
+    "CREATE INDEX IF NOT EXISTS idx_opportunities_cpv_codes_all ON opportunities USING gin (cpv_codes_all)",
+)
+
+# Surfaced on /api/v1/system/status so a refused or partial apply is
+# visible without reading Render's logs — the thing that would have turned
+# this outage from days into minutes.
+_last_schema_result: Dict[str, Any] = {"ran": False}
+
+
+async def ensure_schema() -> Dict[str, Any]:
+    """Apply the additive DDL that shipped code depends on.
+
+    Never raises: a database that refuses DDL must not stop the API from
+    booting (the public routes and the file-cache fallback still work). But
+    it must never look like success either, so every failure is logged with
+    its exact error and recorded for the status endpoint.
+    """
+    global _last_schema_result
+
+    async with with_connection() as conn:
+        if conn is None:
+            _last_schema_result = {
+                "ran": False,
+                "detail": "no database configured; schema guard skipped",
+            }
+            return _last_schema_result
+
+        applied, failures = 0, []
+        for statement in _REQUIRED_DDL:
+            try:
+                await conn.execute(statement)
+                applied += 1
+            except Exception as e:
+                # Keep going: one refused index must not prevent the column
+                # ALTERs that the read and write paths actually depend on.
+                failures.append({"statement": statement, "error": _redact(f"{type(e).__name__}: {e}")})
+
+    if failures:
+        for f in failures:
+            logger.error(f"[DB] Schema guard could not apply `{f['statement']}`: {f['error']}")
+        logger.error(
+            f"[DB] {len(failures)}/{len(_REQUIRED_DDL)} required DDL statements failed. "
+            "Routes that name those columns will 500 until schema.sql is applied by hand."
+        )
+    else:
+        logger.info(f"[DB] Schema guard OK ({applied}/{len(_REQUIRED_DDL)} statements verified).")
+
+    _last_schema_result = {"ran": True, "applied": applied, "failures": failures}
+    return _last_schema_result
+
+
+def last_schema_result() -> Dict[str, Any]:
+    """The most recent ensure_schema() outcome, for /api/v1/system/status."""
+    return _last_schema_result
+
+
 def _is_transaction_pooler(url: str) -> bool:
     """Supabase exposes the transaction pooler on port 6543, and its pooler
     hosts are *.pooler.supabase.com. Detected rather than configured so the
