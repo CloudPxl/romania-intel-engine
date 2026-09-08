@@ -1181,6 +1181,33 @@ async def get_recent_system_alerts(limit: int = 20) -> List[Dict[str, Any]]:
     return [dict(r) for r in rows]
 
 
+async def get_source_last_run_map() -> Optional[Dict[str, Any]]:
+    """Every source's last_run_at in one round trip, for the tick scheduler.
+
+    Distinct from is_source_due (kept, and still the right call for a
+    one-off question) in both cost and answer. Cost: run_tick asked
+    is_source_due once per scraper, so the scheduling decision alone was 26
+    sequential round trips against the Supabase pooler before any scraping
+    started. Answer: a bool cannot express HOW overdue a source is, and
+    orchestrator._due_with_priority needs exactly that to stop the
+    heavy daily sources being deferred behind the short-interval ones
+    forever.
+
+    Returns None — not {} — when no database is configured, so the caller
+    can tell "nothing has ever run" from "cannot know", and degrade open
+    (treat everything as due) the way is_source_due already does.
+    """
+    async with with_connection() as conn:
+        if conn is None:
+            return None
+        try:
+            rows = await conn.fetch("SELECT source_name, last_run_at FROM source_run_log")
+        except asyncpg.exceptions.UndefinedTableError:
+            logger.warning("[DB] source_run_log not found — run schema.sql.")
+            return {}
+    return {r["source_name"]: r["last_run_at"] for r in rows if r["last_run_at"] is not None}
+
+
 async def get_source_health() -> List[Dict[str, Any]]:
     """Per-source ingestion health — the row-level detail behind
     /api/v1/system/status's single fleet-wide is_stale number."""

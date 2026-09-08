@@ -3,7 +3,7 @@ import logging
 import os
 import time
 from datetime import datetime, timezone
-from typing import Dict, Any
+from typing import Any, Dict, List, Optional, Tuple
 
 import db
 from scrapers import circuit_breaker
@@ -85,16 +85,140 @@ TICK_DEADLINE_SECONDS = float(os.getenv("TICK_DEADLINE_SECONDS", "260"))
 # tuning a weight is a one-line, one-file change.
 SCRAPER_EXECUTION_WEIGHT: Dict[str, int] = {
     "CountyRegistryMatrix": 5,   # fans out across up to 35 counties per tick
-    "ElicitatieLive": 5,         # issues a detail-page fetch per listed item
     "GalatiMunicipal": 3,        # parses a single ~5MB archive document
     "UrbanismAC": 3,             # pdfplumber table extraction (offloaded, still real CPU)
     "CountyHcl": 3,              # same PDF extraction path as UrbanismAC
+    # 5 -> 2. Read against the source rather than by analogy: it fetches ONE
+    # list page (page_size=20) and one detail GET per item — ~21 bounded
+    # requests, ~20s wall clock, no PDF parsing and no fan-out. It was
+    # weighted the same as CountyRegistryMatrix, which does 35 counties x 2
+    # adapter calls at a measured 65-100s; the two are not in the same class.
+    #
+    # Miscalibrating it this way had a much larger effect than one wrong
+    # number suggests, because weight interacts with poll interval: at
+    # weight 5 on a 10-minute interval, ElicitatieLive alone demanded 720 of
+    # the fleet's 1091.8 daily weight-units — 66% of the entire budget for
+    # one source — and, sorting first on the shortest interval, took 5 of
+    # every 6 available units whenever it was due. That is what actually
+    # starved CountyRegistryMatrix and the other weight-3 sources, more than
+    # the size of MAX_TICK_WEIGHT did.
+    "ElicitatieLive": 2,
 }
+# Deliberately still 6, after measuring rather than assuming.
+#
+# Raising this to 8-10 looked like the obvious fix for the heavy daily
+# sources appearing to starve, and it is the wrong one. Replaying a full
+# simulated day (288 ticks at the 5-minute heartbeat) against a real
+# Postgres, with all 26 sources registered and their real intervals, every
+# source already reaches ~100% of its scheduled rate at 6 —
+# CountyRegistryMatrix 1/1 per day, ElicitatieLive 143/144, the 15-minute
+# SEAP feeds 96/96 — with nothing starved. The sources' intervals are
+# staggered enough that the budget is rarely the binding constraint.
+#
+# The reason not to raise it anyway: this cap exists to bound how many
+# scrapers race TICK_DEADLINE_SECONDS concurrently on Render's 0.1 CPU, and
+# losing that race is the failure that leaves no trace anywhere (see the
+# TICK_DEADLINE_SECONDS comment). A higher cap admits more work into that
+# race, so raising it without evidence of a throughput shortfall spends
+# real safety margin to buy headroom the measurement says is not needed.
+#
+# What actually protects the heavy sources is _due_with_priority()'s
+# ordering below, which was verified against the same simulation: at a
+# constrained budget of 3, the previous interval-only ordering starved all
+# four weight-3+ daily sources to ZERO runs in a full day, while the
+# overdue-ratio ordering still gave each of them their full allowance.
 MAX_TICK_WEIGHT = int(os.getenv("MAX_TICK_WEIGHT", "6"))
+
+
+def _feature_enabled(env_var: str) -> bool:
+    """Rollout gates for the five live source families, now defaulting ON.
+
+    They defaulted to "false" while each was being verified against its real
+    upstream, and render.yaml sets all five to "true" — but render.yaml's
+    `env` block only reaches the running process for a service Render is
+    syncing as a Blueprint. This one is not: a live audit of
+    /api/v1/system/sources found exactly 19 of 26 sources present, the
+    missing 7 being precisely the ones behind these five flags, with no
+    source_run_log row at all — not a success, not even an error row, which
+    a registered-but-failing source does leave (CountyHcl's
+    "name 'extract_table_rows' is not defined" was sitting right there in
+    the same response). They had never been constructed, so SEAP contract
+    notices, direct acquisitions, market consultations, the 41-county
+    registry and TED were all silently absent from production ingestion
+    while every dashboard reported the pipeline healthy.
+
+    Defaulting ON makes the deployed behaviour match the documented and
+    intended one without depending on how the service was provisioned.
+    Setting any of these to "false" still disables it, so the kill switch
+    each was added for is intact.
+    """
+    return os.getenv(env_var, "true").strip().lower() in ("true", "1", "yes", "on")
 
 
 def _scraper_weight(scraper) -> int:
     return SCRAPER_EXECUTION_WEIGHT.get(scraper.name, 1)
+
+
+def _overdue_ratio(scraper, last_run: Optional[datetime], now: datetime) -> float:
+    """How far past its own schedule this source is, as a multiple of its
+    poll interval. 1.0 = exactly due, 2.0 = a full interval late, inf =
+    never run at all.
+
+    A ratio, deliberately, not raw elapsed minutes: the two disagree in
+    exactly the case that matters. Sorting by raw age would put a 24-hour
+    source that ran 20 hours ago ahead of a 15-minute source that ran 20
+    minutes ago, even though the first is not due yet and the second is
+    late — which would starve the fast sources instead of the slow ones,
+    trading one bias for its mirror image. A ratio is scale-free, so
+    "late" means the same thing to a 10-minute feed and a daily PDF.
+    """
+    if last_run is None:
+        return float("inf")
+    elapsed_minutes = (now - last_run).total_seconds() / 60.0
+    return elapsed_minutes / max(1.0, float(scraper.poll_interval_minutes))
+
+
+def _due_with_priority(scrapers: list, last_runs: Optional[Dict[str, datetime]], now: datetime) -> list:
+    """The due subset of `scrapers`, most-overdue-first.
+
+    Replaces a plain `due.sort(key=poll_interval_minutes)`, which was a
+    permanent ordering rather than a priority: a 15-minute source sorts
+    ahead of a 1440-minute source on every tick forever, so once enough
+    short-interval sources existed to fill MAX_TICK_WEIGHT, the heavy daily
+    ones could be deferred indefinitely without anything anywhere recording
+    that it was happening. Deferral is silent by design (see
+    _admit_within_weight_budget), which is precisely what makes unbounded
+    deferral dangerous.
+
+    Ordering by overdue-ratio is self-correcting instead: a deferred
+    source's ratio keeps climbing every tick it does not run, so it
+    overtakes the frequently-scheduled sources on its own, without a
+    deferral counter to persist or a starvation timeout to tune. A source
+    that has never run scores inf and therefore goes first — which is also
+    what gets a newly-enabled scraper its first row promptly instead of
+    behind the whole backlog.
+
+    `last_runs` is None when no database is configured, in which case every
+    source is treated as due — the same degrade-open behaviour
+    db.is_source_due has always had for that case.
+    """
+    ranked = []
+    for scraper in scrapers:
+        last_run = None if last_runs is None else last_runs.get(scraper.name)
+        ratio = float("inf") if last_runs is None else _overdue_ratio(scraper, last_run, now)
+        if ratio < 1.0:
+            continue
+        ranked.append((ratio, scraper))
+    # Most overdue first, shortest interval breaking ties. The tie-break is
+    # load-bearing rather than cosmetic: on a cold start every source scores
+    # inf, and relying on the sort's stability alone would fall back to the
+    # order sources happen to be declared in __init__ — which puts the
+    # conditionally-appended SEAP/TED feeds last, exactly the sources whose
+    # 15-minute interval means they should lead. Sorted as one composite key
+    # (not reverse=True, which would also reverse the tie-break and defeat
+    # its purpose).
+    ranked.sort(key=lambda pair: (-pair[0], pair[1].poll_interval_minutes))
+    return [scraper for _, scraper in ranked]
 
 
 def _admit_within_weight_budget(due: list, max_weight: int) -> tuple:
@@ -182,12 +306,12 @@ class OpportunityOrchestrator:
             BrasovMunicipalScraper(), CraiovaMunicipalScraper(),
             PloiestiMunicipalScraper(), GalatiMunicipalScraper(),
         ]
-        if os.getenv("ENABLE_LIVE_ELICITATIE", "false").lower() == "true":
+        if _feature_enabled("ENABLE_LIVE_ELICITATIE"):
             # Real, live SICAP/e-licitatie data — added alongside (not yet
             # replacing) the fixture Sicap*Scraper classes above during
             # rollout; verified against the production API before shipping.
             self.scrapers.append(ElicitatieLiveScraper())
-        if os.getenv("ENABLE_LIVE_DIRECT_ACQUISITION", "false").lower() == "true":
+        if _feature_enabled("ENABLE_LIVE_DIRECT_ACQUISITION"):
             # Real, live SEAP direct-purchase (DA) + direct-purchase award
             # (CAN) feeds — same live-verified-before-shipping rollout
             # pattern as ElicitatieLiveScraper above. See
@@ -196,7 +320,7 @@ class OpportunityOrchestrator:
             # which SEAP notice types (CN/SC) are still unimplemented.
             self.scrapers.append(DirectAcquisitionScraper())
             self.scrapers.append(DaAwardNoticeScraper())
-        if os.getenv("ENABLE_LIVE_CONTRACT_NOTICES", "false").lower() == "true":
+        if _feature_enabled("ENABLE_LIVE_CONTRACT_NOTICES"):
             # Real, live SEAP Contract Notice (CN) + Simplified Contract
             # Notice (SC) feeds — the full-tender coverage
             # direct_acquisition_scraper.py's module docstring explicitly
@@ -208,7 +332,7 @@ class OpportunityOrchestrator:
             # live-verified-before-shipping rollout gate as the flags above.
             self.scrapers.append(ContractNoticeScraper())
             self.scrapers.append(SimplifiedContractNoticeScraper())
-        if os.getenv("ENABLE_LIVE_COUNTY_REGISTRY", "false").lower() == "true":
+        if _feature_enabled("ENABLE_LIVE_COUNTY_REGISTRY"):
             # Polymorphic CMS-adapter coverage of county councils beyond
             # the 3 hand-integrated municipal sources above — see
             # scrapers/matrix/municipal_matrix.py and
@@ -217,7 +341,7 @@ class OpportunityOrchestrator:
             # to run. Same live-verified-before-shipping rollout gate as
             # the two flags above.
             self.scrapers.append(CountyRegistryScraper())
-        if os.getenv("ENABLE_LIVE_TED", "false").lower() == "true":
+        if _feature_enabled("ENABLE_LIVE_TED"):
             # Real, live TED/OJEU (EU Official Journal) cross-border
             # infra/defence/health/energy notices naming Romania as buyer
             # country — see scrapers/ted_scraper.py's module docstring for
@@ -340,18 +464,24 @@ class OpportunityOrchestrator:
             # anywhere. A local has no aliasing hazard, and one SELECT against
             # a run that already takes minutes costs nothing.
             profiles = await db.get_onboarded_profiles()
-            due = []
+
+            # One query for every source's last_run_at, rather than the
+            # per-scraper db.is_source_due call this replaces — that was 26
+            # sequential round trips spent deciding what to run, before any
+            # scraping had started.
+            last_runs = await db.get_source_last_run_map()
+            eligible = []
             for scraper in self.scrapers:
                 if await circuit_breaker.is_open(scraper.name):
                     logger.warning(f"[Tick] Skipping {scraper.name} — circuit open.")
                     continue
-                if await db.is_source_due(scraper.name, scraper.poll_interval_minutes):
-                    due.append(scraper)
+                eligible.append(scraper)
 
-            # Most time-sensitive sources first. On a cold database every source
-            # is due at once, and without ordering a daily 69-page PDF parse
-            # could consume the budget ahead of the 10-minute tender feed.
-            due.sort(key=lambda s: s.poll_interval_minutes)
+            # Most OVERDUE first, not shortest-interval first — see
+            # _due_with_priority. Sorting by interval was a fixed ordering
+            # rather than a priority, so a heavy daily source could sit
+            # behind the 15-minute feeds on every tick indefinitely.
+            due = _due_with_priority(eligible, last_runs, datetime.now(timezone.utc))
 
             # Bounds how much of `due` actually executes this tick — see
             # SCRAPER_EXECUTION_WEIGHT's comment above for why sort order

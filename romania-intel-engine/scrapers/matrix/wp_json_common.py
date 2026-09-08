@@ -27,6 +27,17 @@ from text_utils import matching_terms
 
 logger = logging.getLogger("WordPressScraper")
 
+
+class SourceUnreachableError(Exception):
+    """The feed could not be read — transport failure or a payload that is
+    no longer the WordPress REST shape.
+
+    Deliberately distinct from "the feed was read and had nothing in it",
+    which is a legitimate, common state for a funding-calls feed and must
+    stay a successful run with 0 records. See fetch_posts below.
+    """
+
+
 _TAG_RE = re.compile(r"<[^>]+>")
 
 # Funding calls state their submission window in prose inside the post
@@ -83,19 +94,44 @@ class WordPressCategoryScraper(BaseScraper):
     FALLBACK_URL: str = ""
 
     async def fetch_posts(self) -> List[Dict[str, Any]]:
+        """Posts from the configured categories.
+
+        Raises rather than returning [] when the feed could not be read at
+        all, so that an empty return means one specific thing: the feed was
+        fetched and parsed, and genuinely contained nothing.
+
+        The three failure branches below all used to return [], which the
+        orchestrator cannot distinguish from a real empty result — it
+        records the run as a SUCCESS with 0 records. A live audit found
+        exactly what that costs: ProgramEnergie and ProgramSanatate had 31
+        consecutive zero-result runs against a host that does not accept
+        connections at all, and /api/v1/system/sources reported both with
+        `last_error: null`, `consecutive_failures: 0`, `circuit_state:
+        closed` — healthy, merely quiet. Three things follow from that, all
+        wrong: the circuit breaker never opens, so a dead host is polled at
+        full rate forever; the row reads as healthy during triage; and the
+        zero-streak alert that does eventually fire blames the parser
+        ("verificați dacă structura paginii sursă s-a schimbat") when the
+        real cause is that nothing was ever fetched.
+
+        Raising puts each case where it belongs: a real error row carrying
+        the reason, three consecutive ones opening the circuit and backing
+        off. It does not fabricate data or hide a failure — it is the same
+        honest-degradation contract the rest of the matrix follows, applied
+        to a case that was silently exempt from it.
+        """
         url = f"{self.API_URL}?categories={self.CATEGORIES}&per_page={self.PER_PAGE}"
         body = await self.fetch_url(url, timeout=30.0)
         if not body:
-            return []
+            # fetch_url already logged the specific transport reason.
+            raise SourceUnreachableError(f"{self.name}: no response body from {url}")
         try:
             # lstrip the BOM rather than relying on the caller's decoding.
             posts = json.loads(body.lstrip("﻿"))
-        except json.JSONDecodeError:
-            self.logger.error(f"[{self.name}] non-JSON response from {url}")
-            return []
+        except json.JSONDecodeError as e:
+            raise SourceUnreachableError(f"{self.name}: non-JSON response from {url}") from e
         if not isinstance(posts, list):
-            self.logger.error(f"[{self.name}] unexpected payload shape from {url}")
-            return []
+            raise SourceUnreachableError(f"{self.name}: unexpected payload shape from {url}")
         return posts
 
     def build_signal(self, post: Dict[str, Any]) -> Optional[RawInstitutionalSignal]:
