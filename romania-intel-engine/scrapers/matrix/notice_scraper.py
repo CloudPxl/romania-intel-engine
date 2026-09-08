@@ -373,7 +373,16 @@ class ContractNoticeScraper(_BaseNoticeScraper):
     SUB_CATEGORY = "Anunț de Participare"
 
     def __init__(self):
-        super().__init__("SeapContractNotice")
+        # 90 -> 15: a live, competitive full-tender feed — a bidder who
+        # sees a new Contract Notice an hour later than a competitor has
+        # genuinely lost preparation time on a real procurement deadline,
+        # unlike an HCL or PAAP register where nothing changes for weeks.
+        # Safe to run this often now that MAX_TICK_WEIGHT bounds how much
+        # concurrent load a tick can admit regardless of how many sources
+        # are simultaneously due — this scraper is a light, few-page fetch
+        # (weight 1, unlisted in SCRAPER_EXECUTION_WEIGHT), so raising its
+        # frequency does not raise peak per-tick cost.
+        super().__init__("SeapContractNotice", poll_interval_minutes=15)
 
     def _build_signal(self, item: Dict[str, Any]) -> Optional[RawInstitutionalSignal]:
         return self._build_signal_common(item)
@@ -393,7 +402,8 @@ class SimplifiedContractNoticeScraper(_BaseNoticeScraper):
     SUB_CATEGORY = "Anunț de Participare Simplificat"
 
     def __init__(self):
-        super().__init__("SeapSimplifiedContractNotice")
+        # Same reasoning as ContractNoticeScraper above.
+        super().__init__("SeapSimplifiedContractNotice", poll_interval_minutes=15)
 
     def _build_signal(self, item: Dict[str, Any]) -> Optional[RawInstitutionalSignal]:
         return self._build_signal_common(item)

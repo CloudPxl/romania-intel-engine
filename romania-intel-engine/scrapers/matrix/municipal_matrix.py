@@ -133,7 +133,19 @@ class CountyRegistryScraper(BaseScraper):
     registered adapter."""
 
     def __init__(self):
-        super().__init__("CountyRegistryMatrix", poll_interval_minutes=720)
+        # 720 -> 1440 (12h -> 24h): the single heaviest scraper in the
+        # matrix by measured wall-clock cost (a live audit clocked 65-100s
+        # to fan out across up to 35 counties) and, per-county, largely
+        # extracting HCL decisions and PAAP-adjacent notices — content that
+        # genuinely does not change within a 12h window (a county council
+        # meets at most a few times a month). Kept at the low end of a
+        # 24-72h "institutional strategy document" band rather than the
+        # top, since it also carries live procurement notices per county
+        # alongside HCLs, not purely archival content. Also the reason it
+        # carries an elevated SCRAPER_EXECUTION_WEIGHT in orchestrator.py —
+        # halving its polling frequency and bounding its concurrent
+        # admission are complementary, not redundant.
+        super().__init__("CountyRegistryMatrix", poll_interval_minutes=1440)
 
     async def _fetch_county(self, semaphore: asyncio.Semaphore, entry: Dict[str, Any]) -> List[RawInstitutionalSignal]:
         platform = entry.get("platform")

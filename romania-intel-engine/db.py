@@ -401,7 +401,22 @@ async def upsert_opportunity(record: Dict[str, Any]) -> bool:
     async with with_connection() as conn:
         if conn is None:
             return True  # no persistence configured — treat every signal as new
-        query = """
+        # ON CONFLICT clause shared verbatim with upsert_opportunities_batch
+        # via _OPPORTUNITY_UPDATE_SET (defined below this function) — every
+        # column except source_id (the conflict key) and first_seen_at
+        # (never read anywhere in this codebase — confirmed by grep — and
+        # must stay the true first-seen timestamp) refreshes unconditionally
+        # on every re-scrape. These 15 used to freeze at whatever was
+        # scraped on first sighting, so a source correcting a typo'd title,
+        # county or entity name on a later poll was silently ignored
+        # forever. A partial list would be an arbitrary asymmetry, and a
+        # "keep old value if new one is blank" guard would put search_blob
+        # (always recomputed from the *current* raw fields) out of sync
+        # with whatever field it's supposed to index. Sharing this string
+        # (not just the same intent, independently typed twice) is what
+        # keeps the single-row and batch write paths from silently
+        # diverging on which columns "latest scrape wins" actually covers.
+        query = f"""
             INSERT INTO opportunities (
                 source_id, source_type, category, sub_category, county, locality,
                 entity_name, project_title, estimated_value_ron, caen_codes, cpv_code,
@@ -417,47 +432,7 @@ async def upsert_opportunity(record: Dict[str, Any]) -> bool:
                 $27, $28, now()
             )
             ON CONFLICT (source_id) DO UPDATE SET
-                -- Every column except source_id (the conflict key) and
-                -- first_seen_at (never read anywhere in this codebase —
-                -- confirmed by grep — and must stay the true first-seen
-                -- timestamp) refreshes unconditionally on every re-scrape.
-                -- These 15 used to freeze at whatever was scraped on first
-                -- sighting, so a source correcting a typo'd title, county
-                -- or entity name on a later poll was silently ignored
-                -- forever. "Latest scrape wins" is already the policy for
-                -- the other 6 columns below; a partial list here would be
-                -- an arbitrary asymmetry, and a "keep old value if new one
-                -- is blank" guard would put search_blob (always recomputed
-                -- from the *current* raw fields) out of sync with whatever
-                -- field it's supposed to index.
-                source_type = EXCLUDED.source_type,
-                category = EXCLUDED.category,
-                sub_category = EXCLUDED.sub_category,
-                county = EXCLUDED.county,
-                locality = EXCLUDED.locality,
-                entity_name = EXCLUDED.entity_name,
-                project_title = EXCLUDED.project_title,
-                caen_codes = EXCLUDED.caen_codes,
-                cpv_code = EXCLUDED.cpv_code,
-                published_date = EXCLUDED.published_date,
-                executive_summary = EXCLUDED.executive_summary,
-                sales_pitch_angle = EXCLUDED.sales_pitch_angle,
-                funding_source = EXCLUDED.funding_source,
-                source_url = EXCLUDED.source_url,
-                document_url = EXCLUDED.document_url,
-                estimated_value_ron = EXCLUDED.estimated_value_ron,
-                action_deadline = EXCLUDED.action_deadline,
-                opportunity_score = EXCLUDED.opportunity_score,
-                metadata = EXCLUDED.metadata,
-                search_blob = EXCLUDED.search_blob,
-                cpv_codes_all = EXCLUDED.cpv_codes_all,
-                cpv_division = EXCLUDED.cpv_division,
-                cpv_group = EXCLUDED.cpv_group,
-                cpv_class = EXCLUDED.cpv_class,
-                procedure_type = EXCLUDED.procedure_type,
-                authority_cui = EXCLUDED.authority_cui,
-                award_criterion = EXCLUDED.award_criterion,
-                last_seen_at = now()
+                {_OPPORTUNITY_UPDATE_SET}
             RETURNING (xmax = 0) AS inserted
         """
         # `executive_summary` is where the descriptive text actually lives.
@@ -507,6 +482,193 @@ async def upsert_opportunity(record: Dict[str, Any]) -> bool:
             record.get("award_criterion"),
         )
     return bool(row["inserted"]) if row else True
+
+
+def _prepare_opportunity_row(record: Dict[str, Any]) -> Dict[str, Any]:
+    """The exact per-record field derivation upsert_opportunity performs
+    inline, factored out so the single-row and batch write paths cannot
+    silently diverge on how a value is normalised — CUI folding, the CPV
+    hierarchy, and the search blob text.
+
+    Returns a JSON-ready dict: dates as ISO strings (not `date` objects —
+    Postgres's own text-input parser reads 'YYYY-MM-DD' directly when
+    jsonb_to_recordset coerces into a `date`-typed column, and `date`
+    objects are not JSON-serialisable without a custom encoder anyway),
+    everything else as its natural Python type."""
+    summary = record.get("executive_summary")
+    cpv = _cpv_hierarchy_fields(record.get("cpv_code"))
+    authority_cui = normalize_cui(record.get("authority_cui"))
+    record = {**record, "authority_cui": authority_cui}
+    published_date = _parse_date(record.get("published_date"))
+    action_deadline = _parse_date(record.get("action_deadline"))
+    return {
+        "source_id": record.get("source_id"),
+        "source_type": record.get("source_type"),
+        "category": record.get("category"),
+        "sub_category": record.get("sub_category"),
+        "county": record.get("county"),
+        "locality": record.get("locality"),
+        "entity_name": record.get("entity_name"),
+        "project_title": record.get("project_title"),
+        "estimated_value_ron": float(record.get("estimated_value_ron") or record.get("financial_value_ron") or 0),
+        "caen_codes": record.get("caen_codes") or [],
+        "cpv_code": record.get("cpv_code"),
+        "published_date": published_date.isoformat() if published_date else None,
+        "action_deadline": action_deadline.isoformat() if action_deadline else None,
+        "executive_summary": summary,
+        "sales_pitch_angle": record.get("sales_pitch_angle"),
+        "funding_source": record.get("funding_source"),
+        "opportunity_score": record.get("opportunity_score"),
+        "source_url": record.get("source_url"),
+        "document_url": record.get("document_url"),
+        "metadata": record.get("metadata") or {},
+        "search_blob": build_search_blob(record),
+        "cpv_codes_all": cpv["codes_all"],
+        "cpv_division": cpv["division"],
+        "cpv_group": cpv["group"],
+        "cpv_class": cpv["class_"],
+        "procedure_type": record.get("procedure_type"),
+        "authority_cui": authority_cui,
+        "award_criterion": record.get("award_criterion"),
+    }
+
+
+# Shared verbatim between upsert_opportunity and upsert_opportunities_batch
+# so the two write paths can never disagree about which columns refresh on
+# a re-scrape. See upsert_opportunity's inline comment for why this is all
+# 24 non-key columns unconditionally, not a partial "keep old value if new
+# one is blank" list.
+_OPPORTUNITY_UPDATE_SET = """
+    source_type = EXCLUDED.source_type,
+    category = EXCLUDED.category,
+    sub_category = EXCLUDED.sub_category,
+    county = EXCLUDED.county,
+    locality = EXCLUDED.locality,
+    entity_name = EXCLUDED.entity_name,
+    project_title = EXCLUDED.project_title,
+    caen_codes = EXCLUDED.caen_codes,
+    cpv_code = EXCLUDED.cpv_code,
+    published_date = EXCLUDED.published_date,
+    executive_summary = EXCLUDED.executive_summary,
+    sales_pitch_angle = EXCLUDED.sales_pitch_angle,
+    funding_source = EXCLUDED.funding_source,
+    source_url = EXCLUDED.source_url,
+    document_url = EXCLUDED.document_url,
+    estimated_value_ron = EXCLUDED.estimated_value_ron,
+    action_deadline = EXCLUDED.action_deadline,
+    opportunity_score = EXCLUDED.opportunity_score,
+    metadata = EXCLUDED.metadata,
+    search_blob = EXCLUDED.search_blob,
+    cpv_codes_all = EXCLUDED.cpv_codes_all,
+    cpv_division = EXCLUDED.cpv_division,
+    cpv_group = EXCLUDED.cpv_group,
+    cpv_class = EXCLUDED.cpv_class,
+    procedure_type = EXCLUDED.procedure_type,
+    authority_cui = EXCLUDED.authority_cui,
+    award_criterion = EXCLUDED.award_criterion,
+    last_seen_at = now()
+"""
+
+
+async def upsert_opportunities_batch(records: List[Dict[str, Any]]) -> Dict[str, bool]:
+    """Batch equivalent of upsert_opportunity: one network round trip for
+    the whole tick's worth of signals from one scraper, instead of one
+    round trip per signal.
+
+    Exists because a live audit of CountyRegistryMatrix (759 signals in a
+    single tick) found orchestrator.py persisting each one with its own
+    `await db.upsert_opportunity(...)` — 759 sequential awaits, each a real
+    round trip to Supabase. At Supabase's typical 50-100ms latency from
+    Render, that is 35-70 seconds of serial waiting inside one tick's
+    260-second budget, spent entirely on network round trips rather than
+    actual database work.
+
+    Built on `jsonb_to_recordset` rather than `unnest()` over parallel
+    arrays: this table's columns are a genuine type mix (TEXT, NUMERIC,
+    two TEXT[] columns, JSONB, DATE), and unnest() over several arrays of
+    different element types and dimensionality is exactly the kind of
+    thing that silently binds wrong in asyncpg without very careful
+    per-column casts. One JSONB parameter sidesteps that: each record's
+    field types are declared once, in the `AS x(...)` column list, and
+    Postgres's own JSON-to-SQL coercion handles the array- and
+    object-typed columns the same way it would a hand-written literal.
+
+    Returns {source_id: is_new} for every record actually written — the
+    same True/False-per-record signal upsert_opportunity returns, since
+    the caller gates per-user matching/alerting on it and a batch call
+    must not lose that resolution just because it processes many records
+    in one statement. Records with no source_id are silently dropped, same
+    as upsert_opportunity would fail to persist them (source_id is the
+    table's primary key)."""
+    if not records:
+        return {}
+
+    async with with_connection() as conn:
+        if conn is None:
+            # No persistence configured — every signal in the batch is
+            # treated as new, matching upsert_opportunity's own fallback.
+            return {r["source_id"]: True for r in records if r.get("source_id")}
+
+        prepared = [_prepare_opportunity_row(r) for r in records]
+        prepared = [p for p in prepared if p["source_id"]]
+        if not prepared:
+            return {}
+
+        # A single multi-row INSERT ... ON CONFLICT cannot update the same
+        # conflict-key row twice — Postgres raises CardinalityViolationError
+        # ("ON CONFLICT DO UPDATE command cannot affect row a second time")
+        # and the WHOLE batch is rolled back, losing every other record in
+        # it too. The serial upsert_opportunity loop this replaces never hit
+        # this: each call was its own statement, so a scraper that legally
+        # emits the same source_id twice in one tick (overlapping pages
+        # from an unstable sort, e.g.) simply overwrote it twice in a row —
+        # "last one wins" was always the outcome, just paid for with an
+        # extra round trip. Deduplicating to the last occurrence here keeps
+        # that exact outcome instead of trading a silent-duplicate bug for a
+        # crashed-whole-batch one.
+        deduped: Dict[str, Dict[str, Any]] = {}
+        for p in prepared:
+            deduped[p["source_id"]] = p
+        prepared = list(deduped.values())
+
+        import json
+        payload = json.dumps(prepared, ensure_ascii=False, default=str)
+
+        query = f"""
+            INSERT INTO opportunities (
+                source_id, source_type, category, sub_category, county, locality,
+                entity_name, project_title, estimated_value_ron, caen_codes, cpv_code,
+                published_date, action_deadline, executive_summary,
+                sales_pitch_angle, funding_source, opportunity_score, source_url,
+                document_url, metadata, search_blob,
+                cpv_codes_all, cpv_division, cpv_group, cpv_class, procedure_type,
+                authority_cui, award_criterion, last_seen_at
+            )
+            SELECT
+                source_id, source_type, category, sub_category, county, locality,
+                entity_name, project_title, estimated_value_ron, caen_codes, cpv_code,
+                published_date, action_deadline, executive_summary,
+                sales_pitch_angle, funding_source, opportunity_score, source_url,
+                document_url, metadata, search_blob,
+                cpv_codes_all, cpv_division, cpv_group, cpv_class, procedure_type,
+                authority_cui, award_criterion, now()
+            FROM jsonb_to_recordset($1::jsonb) AS x(
+                source_id text, source_type text, category text, sub_category text,
+                county text, locality text, entity_name text, project_title text,
+                estimated_value_ron numeric, caen_codes text[], cpv_code text,
+                published_date date, action_deadline date, executive_summary text,
+                sales_pitch_angle text, funding_source text, opportunity_score numeric,
+                source_url text, document_url text, metadata jsonb, search_blob text,
+                cpv_codes_all text[], cpv_division text, cpv_group text, cpv_class text,
+                procedure_type text, authority_cui text, award_criterion text
+            )
+            ON CONFLICT (source_id) DO UPDATE SET
+                {_OPPORTUNITY_UPDATE_SET}
+            RETURNING source_id, (xmax = 0) AS inserted
+        """
+        rows = await conn.fetch(query, payload)
+
+    return {r["source_id"]: bool(r["inserted"]) for r in rows}
 
 
 def _cpv_hierarchy_fields(cpv_code: Optional[str]) -> Dict[str, Any]:

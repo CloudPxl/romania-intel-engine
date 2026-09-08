@@ -58,6 +58,73 @@ logger = logging.getLogger("OpportunityOrchestrator")
 # call into a no-op, before the next one fires.
 TICK_DEADLINE_SECONDS = float(os.getenv("TICK_DEADLINE_SECONDS", "260"))
 
+# Per-tick execution-weight budget. due.sort() below orders scrapers by
+# poll_interval so time-sensitive sources are considered first, but that
+# ordering alone does not bound how much CPU-bound work actually runs
+# concurrently in one tick — every due scraper's task starts at once via
+# asyncio.create_task, so "sorted first" was never the same as "protected
+# from contention". A live audit found exactly that: on Render's 0.1 CPU,
+# a full batch of ~20+ concurrently-due scrapers made the genuinely heavy
+# ones (CountyRegistryMatrix fanning out across 35 counties,
+# ElicitatieLive's per-item detail fetches) lose the tick deadline race on
+# literally every attempt, with zero trace left anywhere (see the
+# TICK_DEADLINE_SECONDS comment above). Raising the deadline bought margin;
+# this bounds the actual concurrent load so fewer heavy sources are even
+# attempted together in the first place.
+#
+# Weight per source, not per call: a value that reflects real measured
+# cost, not a guess. 1 = light (a single or few-page REST/JSON call,
+# under ~15s in live measurement). 3 = moderate (multi-page pagination or
+# a bounded PDF/HTML parse). 5 = heavy (a multi-county fan-out or a
+# scraper that issues a per-item follow-up request for every result — the
+# two concretely responsible for the starvation above). Unlisted sources
+# default to 1 in _scraper_weight() below; only sources with real,
+# measured cost above that baseline are called out here; a name lookup by
+# `scraper.name`, kept as one dict in the module that owns tick admission
+# rather than a constructor kwarg threaded through 20+ scraper classes, so
+# tuning a weight is a one-line, one-file change.
+SCRAPER_EXECUTION_WEIGHT: Dict[str, int] = {
+    "CountyRegistryMatrix": 5,   # fans out across up to 35 counties per tick
+    "ElicitatieLive": 5,         # issues a detail-page fetch per listed item
+    "GalatiMunicipal": 3,        # parses a single ~5MB archive document
+    "UrbanismAC": 3,             # pdfplumber table extraction (offloaded, still real CPU)
+    "CountyHcl": 3,              # same PDF extraction path as UrbanismAC
+}
+MAX_TICK_WEIGHT = int(os.getenv("MAX_TICK_WEIGHT", "6"))
+
+
+def _scraper_weight(scraper) -> int:
+    return SCRAPER_EXECUTION_WEIGHT.get(scraper.name, 1)
+
+
+def _admit_within_weight_budget(due: list, max_weight: int) -> tuple:
+    """First-fit greedy admission over an already-priority-sorted `due`
+    list: walk it in order, admitting whatever still fits the remaining
+    budget and skipping (deferring) whatever does not, rather than
+    stopping at the first source that overflows — a later, lighter source
+    further down the list can still fit even after a heavy one didn't.
+
+    Always admits at least one source regardless of its own weight: a due
+    source heavier than max_weight itself must still run eventually, or a
+    budget lower than any single source's weight would defer it forever.
+    Deferred sources are not marked as run in any way — they simply stay
+    due (db.is_source_due never learns of this tick), so they are picked
+    up on a later heartbeat exactly like one that lost the deadline race.
+
+    Returns (admitted, deferred) — both plain lists, order preserved.
+    """
+    admitted, deferred = [], []
+    weight_used = 0
+    for scraper in due:
+        weight = _scraper_weight(scraper)
+        if not admitted or weight_used + weight <= max_weight:
+            admitted.append(scraper)
+            weight_used += weight
+        else:
+            deferred.append(scraper)
+    return admitted, deferred
+
+
 # Fleet-wide data-freshness watchdog, distinct from db.get_last_successful_tick
 # (which only proves a tick's own bookkeeping round-tripped, not that any
 # real data moved — see get_max_last_seen_at's docstring). Checked once per
@@ -286,7 +353,20 @@ class OpportunityOrchestrator:
             # could consume the budget ahead of the 10-minute tender feed.
             due.sort(key=lambda s: s.poll_interval_minutes)
 
-            logger.info(f"⚡ [TICK] Running {len(due)}/{len(self.scrapers)} due scraper engines...")
+            # Bounds how much of `due` actually executes this tick — see
+            # SCRAPER_EXECUTION_WEIGHT's comment above for why sort order
+            # alone does not protect against concurrent-load spikes.
+            # Deferred sources stay due and are picked up on a later
+            # heartbeat; this only changes WHEN they run, never whether.
+            all_due_count = len(due)
+            due, deferred_by_weight = _admit_within_weight_budget(due, MAX_TICK_WEIGHT)
+            if deferred_by_weight:
+                logger.info(
+                    f"[Tick] Weight budget ({MAX_TICK_WEIGHT}) reached; deferred to a later tick: "
+                    f"{', '.join(s.name for s in deferred_by_weight)}."
+                )
+
+            logger.info(f"⚡ [TICK] Running {len(due)}/{all_due_count} due scraper engines...")
 
             # scraper.name isn't recoverable from a bare Task once it's
             # cancelled below, so it has to be captured here — the
@@ -326,25 +406,42 @@ class OpportunityOrchestrator:
                         logger.error(f"[Tick] circuit_breaker record failed for {scraper.name}: {e}")
                     completed_sources += 1
 
-                    for sig in signals:
-                        if remaining() <= 0:
-                            # A single source can return hundreds of signals;
-                            # persisting them is itself unbounded work, so the
-                            # deadline is enforced inside this loop too.
-                            truncated = True
-                            logger.warning(f"[Tick] Deadline reached while persisting {scraper.name}.")
-                            break
+                    if remaining() <= 0:
+                        # A single source can return hundreds of signals;
+                        # persisting them used to be unbounded serial work
+                        # (one round trip per record), which is exactly why
+                        # this check existed mid-loop. Batched below, a
+                        # whole scraper's signals persist in one round trip,
+                        # so the meaningful place left to spend the
+                        # remaining budget check is once, before starting
+                        # that batch — not per record inside it.
+                        truncated = True
+                        logger.warning(f"[Tick] Deadline reached before persisting {scraper.name}.")
+                        break
 
-                        refined = IntelligenceRefineryEngine.refine_signal(sig)
-                        persist_attempts += 1
-                        try:
-                            is_new = await db.upsert_opportunity(refined)
-                        except Exception as e:
-                            errors += 1
-                            persist_failures += 1
-                            logger.error(f"[Tick] Failed to persist opportunity {refined.get('source_id')}: {e}")
-                            continue
-                        if not is_new:
+                    # Refinement stays per-signal (pure CPU, unchanged); only
+                    # the database write is batched. db.upsert_opportunities_batch
+                    # replaces what used to be `len(signals)` sequential
+                    # `await db.upsert_opportunity(...)` calls — a live audit
+                    # found CountyRegistryMatrix alone producing 759 signals
+                    # in one tick, meaning 759 serial round trips to Supabase
+                    # (50-100ms each from Render) were spent on network
+                    # latency rather than actual database work. One batch
+                    # call cuts that to a single round trip regardless of
+                    # how many signals a source returns.
+                    refined_signals = [IntelligenceRefineryEngine.refine_signal(sig) for sig in signals]
+                    persist_attempts += len(refined_signals)
+                    try:
+                        is_new_by_id = await db.upsert_opportunities_batch(refined_signals)
+                    except Exception as e:
+                        errors += len(refined_signals)
+                        persist_failures += len(refined_signals)
+                        logger.error(f"[Tick] Batch persist failed for {scraper.name} ({len(refined_signals)} signals): {e}")
+                        continue
+
+                    for refined in refined_signals:
+                        source_id = refined.get("source_id")
+                        if not is_new_by_id.get(source_id):
                             continue
                         new_count += 1
                         for profile in profiles:
@@ -357,9 +454,6 @@ class OpportunityOrchestrator:
                                     # abort ingestion of the remaining signals.
                                     errors += 1
                                     logger.error(f"[Tick] Alert dispatch failed for {profile.get('id')}: {e}")
-
-                    if truncated:
-                        break
             except asyncio.TimeoutError:
                 truncated = True
                 # A task cancelled here never reaches circuit_breaker's
@@ -439,12 +533,22 @@ class OpportunityOrchestrator:
 
             logger.info(
                 f"✅ [TICK] Complete. sources_run={completed_sources}/{len(due)} "
+                f"(admitted; {len(deferred_by_weight)} deferred by weight budget) "
                 f"new_opportunities={new_count} errors={errors} truncated={truncated} "
                 f"persisted={persist_attempts - persist_failures}/{persist_attempts}"
             )
             return {
                 "sources_run": completed_sources,
-                "sources_due": len(due),
+                # The true count of sources whose poll interval had elapsed
+                # this tick — NOT narrowed by the weight quota below, so
+                # sources_due - sources_run still means what it always has
+                # ("how many that needed attention did not get it"),
+                # whether the cause was a genuine failure, the tick
+                # deadline, or a deliberate weight-budget deferral (each
+                # independently visible via errors/truncated/
+                # sources_deferred_by_weight_budget).
+                "sources_due": all_due_count,
+                "sources_deferred_by_weight_budget": len(deferred_by_weight),
                 "new_opportunities": new_count,
                 "errors": errors,
                 "truncated": truncated,

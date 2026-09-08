@@ -96,7 +96,13 @@ class OradeaAchizitiiScraper(BaseScraper):
     _VALUE_RE = re.compile(r"(\d[\d\s.,]*)\s*RON")
 
     def __init__(self):
-        super().__init__("OradeaAchizitii", rate_limit_delay=1.0, poll_interval_minutes=180)
+        # 180 -> 300 (3h -> 5h): a general municipal procurement feed, the
+        # user's own "major municipal procurement portal" medium-velocity
+        # band (4-6h) — not a live competitive-bid feed like the SEAP
+        # notice scrapers above, so there is no stated freshness cost to
+        # polling it less often, only fewer redundant requests against the
+        # same portal.
+        super().__init__("OradeaAchizitii", rate_limit_delay=1.0, poll_interval_minutes=300)
 
     @staticmethod
     def _to_iso(dotted: str) -> str:

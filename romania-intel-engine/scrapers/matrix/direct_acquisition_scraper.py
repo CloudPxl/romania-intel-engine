@@ -256,7 +256,15 @@ class DirectAcquisitionScraper(_BaseDirectAcqScraper):
     NOTICE_TYPE = "DA"
 
     def __init__(self):
-        super().__init__("SeapDirectAcquisition", poll_interval_minutes=60)
+        # 60 -> 15: same competitive-freshness reasoning as
+        # notice_scraper.py's ContractNoticeScraper/
+        # SimplifiedContractNoticeScraper — a live, biddable notice, not a
+        # closed record. Deliberately NOT applied to SeapDaAwardNotice
+        # below (the award-notice counterpart, kept at 120): once a
+        # direct-acquisition contract is awarded the procedure is closed,
+        # so polling that feed more often buys no competitive advantage,
+        # only more requests against the same rate-limited host.
+        super().__init__("SeapDirectAcquisition", poll_interval_minutes=15)
 
     def _build_signal(self, item: Dict[str, Any]) -> Optional[RawInstitutionalSignal]:
         title = (item.get("directAcquisitionName") or "").strip()

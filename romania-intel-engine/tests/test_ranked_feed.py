@@ -423,8 +423,12 @@ class TestPromotedProcurementColumns:
         assert "award_criterion" in insert_cols
         # A column absent from the ON CONFLICT arm freezes at whatever was
         # scraped on first sighting — the exact defect the 15 descriptive
-        # columns above it were fixed for.
-        conflict = source.split("DO UPDATE SET")[1].split("RETURNING")[0]
+        # columns above it were fixed for. The ON CONFLICT clause itself now
+        # lives in db._OPPORTUNITY_UPDATE_SET (shared with the batch write
+        # path added alongside a performance pass — see
+        # tests/test_upsert_opportunity.py), not inline in this function's
+        # own source, so that is what this checks.
+        conflict = db._OPPORTUNITY_UPDATE_SET
         assert "authority_cui = EXCLUDED.authority_cui" in conflict
         assert "award_criterion = EXCLUDED.award_criterion" in conflict
 
