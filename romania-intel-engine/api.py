@@ -40,7 +40,7 @@ from addons.win_probability import WinProbabilityEngine
 from addons import price_strategy
 from addons.competitor_tracker import CompetitorTrackerEngine
 from ai_copilot import ProcurementAICopilot
-from routers import eligibility, drafting, analysis, legal
+from routers import eligibility, drafting, analysis, legal, support
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 logger = logging.getLogger("RO-INTEL-API")
@@ -179,6 +179,7 @@ app.include_router(drafting.router)
 app.include_router(analysis.router)
 app.include_router(analysis.me_router)
 app.include_router(legal.router)
+app.include_router(support.router)
 
 
 def _cors_headers(request: Request) -> Dict[str, str]:
