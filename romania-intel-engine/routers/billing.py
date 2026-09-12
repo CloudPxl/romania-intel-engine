@@ -13,6 +13,7 @@ refuses every request rather than trusting the body, because a webhook
 that accepts unsigned JSON is an endpoint that lets anyone on the internet
 mark any account as paid.
 """
+import json
 import logging
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional
@@ -93,6 +94,44 @@ def _epoch_to_dt(value: Any) -> Optional[datetime]:
         return None
 
 
+def _stripe_id(value: Any) -> Optional[str]:
+    """The id of a related object, whether Stripe sent it unexpanded or not.
+
+    A field like `subscription` or `customer` is normally the bare id
+    string, but becomes a full object the moment anything expands it — an
+    `expand` parameter, a dashboard-configured webhook payload, or a future
+    API version. Reading only the string form silently drops the id and the
+    profile ends up with a NULL subscription id it will never recover.
+    """
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    if isinstance(value, dict):
+        inner = value.get("id")
+        if isinstance(inner, str) and inner.strip():
+            return inner.strip()
+    return None
+
+
+def _period_end(obj: Dict[str, Any]) -> Optional[datetime]:
+    """When the paid period ends, across both Subscription shapes.
+
+    Stripe removed the top-level `current_period_end` from Subscription in
+    API version 2025-03-31.basil and moved it onto each subscription item.
+    Reading only the old location returns None against any current account
+    — verified against a real 2025-03-31.basil payload, which wrote a NULL
+    period end while every other field landed correctly. Both are read, and
+    the latest item wins when a subscription carries several.
+    """
+    direct = _epoch_to_dt(obj.get("current_period_end"))
+    if direct:
+        return direct
+    items = (obj.get("items") or {}).get("data") or []
+    ends = [
+        dt for dt in (_epoch_to_dt((it or {}).get("current_period_end")) for it in items) if dt
+    ]
+    return max(ends) if ends else None
+
+
 async def _resolve_user_id(obj: Dict[str, Any]) -> Optional[str]:
     """Find the local user behind a Stripe object.
 
@@ -104,11 +143,15 @@ async def _resolve_user_id(obj: Dict[str, Any]) -> Optional[str]:
     forever.
     """
     meta = obj.get("metadata") or {}
-    user_id = meta.get("user_id") or obj.get("client_reference_id")
-    if user_id:
-        return user_id
-    customer_id = obj.get("customer")
-    if isinstance(customer_id, str) and customer_id:
+    # Both are written at checkout as `user_id or ""`, so an anonymous or
+    # dashboard-created session yields an empty string rather than a
+    # missing key — truthiness alone is not enough, since a blank value
+    # must fall through to the customer lookup rather than be used as an id.
+    for candidate in (meta.get("user_id"), obj.get("client_reference_id")):
+        if isinstance(candidate, str) and candidate.strip():
+            return candidate.strip()
+    customer_id = _stripe_id(obj.get("customer"))
+    if customer_id:
         return await db.get_user_id_by_stripe_customer(customer_id)
     return None
 
@@ -133,16 +176,46 @@ async def stripe_webhook(request: Request):
     raw_body = await request.body()
     signature = request.headers.get("stripe-signature", "")
     try:
-        event = stripe.Webhook.construct_event(
+        stripe.Webhook.construct_event(
             payload=raw_body, sig_header=signature, secret=billing.STRIPE_WEBHOOK_SECRET
         )
     except Exception as e:
         logger.warning(f"[Billing] Rejected webhook with bad signature: {e}")
         raise HTTPException(status_code=400, detail="Semnătură invalidă.")
 
-    event_type = event.get("type", "")
-    obj = (event.get("data") or {}).get("object") or {}
-    handled = await _handle_stripe_event(event_type, obj)
+    # construct_event is called for its verification side effect only; its
+    # return value is deliberately discarded. stripe-python v8+ dropped the
+    # dict base class from StripeObject, so `event.get("type")` raises
+    # AttributeError ("'get' is a dict method, but a Event is not a dict")
+    # on the first line after a *successful* signature check — every real
+    # webhook 500ed while every bad-signature test still passed. Parsing
+    # the same bytes whose signature was just verified gives plain nested
+    # dicts and keeps this route independent of the SDK's object model,
+    # which is the thing that changed underneath it.
+    try:
+        payload = json.loads(raw_body)
+    except ValueError:
+        logger.warning("[Billing] Webhook body passed signature check but is not JSON.")
+        raise HTTPException(status_code=400, detail="Corp de cerere invalid.")
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="Corp de cerere invalid.")
+
+    event_type = payload.get("type") or ""
+    obj = (payload.get("data") or {}).get("object") or {}
+    if not isinstance(obj, dict):
+        obj = {}
+
+    try:
+        handled = await _handle_stripe_event(event_type, obj)
+    except Exception:
+        # Full traceback, because everything below this line is a write to
+        # subscription state and a swallowed error means a paid user who
+        # never becomes active.
+        logger.exception("[Billing] Webhook processing failed")
+        # 500 on purpose. Stripe retries a non-2xx with backoff for days,
+        # which is exactly the right behaviour for a transient database
+        # failure; acking with 200 would drop the payment permanently.
+        raise HTTPException(status_code=500, detail="Eroare la procesarea evenimentului.")
 
     # 200 even for an event type we do not act on: a non-2xx makes Stripe
     # retry with backoff for days, and "understood, nothing to do" is not a
@@ -162,9 +235,9 @@ async def _handle_stripe_event(event_type: str, obj: Dict[str, Any]) -> bool:
         await db.update_subscription_state(
             user_id=user_id,
             status="active",
-            subscription_id=obj.get("subscription") if isinstance(obj.get("subscription"), str) else None,
+            subscription_id=_stripe_id(obj.get("subscription")),
             plan_id=meta.get("plan_id"),
-            customer_id=obj.get("customer") if isinstance(obj.get("customer"), str) else None,
+            customer_id=_stripe_id(obj.get("customer")),
         )
         logger.info(f"[Billing] Subscription activated for user {user_id}.")
         return True
@@ -180,10 +253,10 @@ async def _handle_stripe_event(event_type: str, obj: Dict[str, Any]) -> bool:
             # 'unpaid' are meaningfully different from 'canceled' and
             # collapsing them here would lose that.
             status=obj.get("status") or "active",
-            subscription_id=obj.get("id"),
+            subscription_id=_stripe_id(obj.get("id")),
             plan_id=meta.get("plan_id"),
-            current_period_end=_epoch_to_dt(obj.get("current_period_end")),
-            customer_id=obj.get("customer") if isinstance(obj.get("customer"), str) else None,
+            current_period_end=_period_end(obj),
+            customer_id=_stripe_id(obj.get("customer")),
         )
         return True
 
@@ -195,8 +268,8 @@ async def _handle_stripe_event(event_type: str, obj: Dict[str, Any]) -> bool:
         await db.update_subscription_state(
             user_id=user_id,
             status="canceled",
-            subscription_id=obj.get("id"),
-            current_period_end=_epoch_to_dt(obj.get("current_period_end")),
+            subscription_id=_stripe_id(obj.get("id")),
+            current_period_end=_period_end(obj),
         )
         logger.info(f"[Billing] Subscription cancelled for user {user_id}.")
         return True

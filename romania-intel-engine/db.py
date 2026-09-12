@@ -2144,7 +2144,8 @@ async def set_stripe_customer_id(user_id: str, customer_id: str) -> None:
             return
         try:
             await conn.execute(
-                "UPDATE user_profiles SET stripe_customer_id = $2, updated_at = now() WHERE id = $1",
+                "UPDATE user_profiles SET stripe_customer_id = $2::text, "
+                "updated_at = now() WHERE id = $1::uuid",
                 user_id, customer_id,
             )
         except asyncpg.exceptions.UndefinedColumnError:
@@ -2165,6 +2166,13 @@ async def update_subscription_state(
     cancellation carries no plan) cannot blank out what an earlier, richer
     one recorded. `status` is always written — it is the whole point of the
     call and the one field every event does carry.
+
+    Parameters are explicitly cast. Postgres does infer them here (verified
+    against a real server, including with statement_cache_size=0 as the
+    Supabase transaction pooler forces), so this is not load-bearing today
+    — it states the intended type at the call site and makes a bad user_id
+    fail as a clear cast error rather than depending on inference from the
+    surrounding columns.
     """
     async with with_connection() as conn:
         if conn is None:
@@ -2173,13 +2181,14 @@ async def update_subscription_state(
             result = await conn.execute(
                 """
                 UPDATE user_profiles SET
-                    subscription_status = $2,
-                    stripe_subscription_id = COALESCE($3, stripe_subscription_id),
-                    subscription_plan_id = COALESCE($4, subscription_plan_id),
-                    subscription_current_period_end = COALESCE($5, subscription_current_period_end),
-                    stripe_customer_id = COALESCE($6, stripe_customer_id),
+                    subscription_status = $2::text,
+                    stripe_subscription_id = COALESCE($3::text, stripe_subscription_id),
+                    subscription_plan_id = COALESCE($4::text, subscription_plan_id),
+                    subscription_current_period_end =
+                        COALESCE($5::timestamptz, subscription_current_period_end),
+                    stripe_customer_id = COALESCE($6::text, stripe_customer_id),
                     updated_at = now()
-                WHERE id = $1
+                WHERE id = $1::uuid
                 """,
                 user_id, status, subscription_id, plan_id, current_period_end, customer_id,
             )
@@ -2202,7 +2211,7 @@ async def get_user_id_by_stripe_customer(customer_id: str) -> Optional[str]:
             return None
         try:
             row = await conn.fetchrow(
-                "SELECT id FROM user_profiles WHERE stripe_customer_id = $1", customer_id
+                "SELECT id FROM user_profiles WHERE stripe_customer_id = $1::text", customer_id
             )
         except asyncpg.exceptions.UndefinedColumnError:
             return None

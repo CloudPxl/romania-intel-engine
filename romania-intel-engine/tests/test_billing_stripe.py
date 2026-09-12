@@ -238,3 +238,154 @@ class TestWebhookSecurity:
                 json={"type": "checkout.session.completed", "data": {"object": {}}},
             )
         assert resp.status_code == 400
+
+
+def _sign(body: bytes, secret: str) -> dict:
+    """A genuine Stripe signature header over these exact bytes."""
+    import hashlib
+    import hmac
+    import time
+
+    ts = int(time.time())
+    mac = hmac.new(secret.encode(), f"{ts}.".encode() + body, hashlib.sha256).hexdigest()
+    return {"stripe-signature": f"t={ts},v1={mac}", "content-type": "application/json"}
+
+
+class TestWebhookRouteWithAValidSignature:
+    """The gap that let a total webhook outage ship.
+
+    Every event test above calls _handle_stripe_event with a plain dict,
+    and the two security tests above only exercise the *rejection* paths.
+    Nothing ever drove a **valid** signature through the route — so nobody
+    noticed that stripe-python v8+ removed the dict base class from
+    StripeObject, making `event.get("type")` raise AttributeError on the
+    first line after a successful verification. Signature checks passed,
+    every real payment 500ed, and no test failed.
+
+    These drive the HTTP route end to end with a real signature.
+    """
+
+    SECRET = "whsec_test_route"
+
+    def _post(self, monkeypatch, event: dict):
+        import json
+
+        from fastapi.testclient import TestClient
+
+        import api
+
+        monkeypatch.setattr(billing, "STRIPE_WEBHOOK_SECRET", self.SECRET)
+        body = json.dumps(event).encode()
+        with TestClient(api.app) as client:
+            return client.post(
+                "/api/v1/billing/webhook", content=body, headers=_sign(body, self.SECRET)
+            )
+
+    def test_a_validly_signed_event_is_processed_not_500(self, monkeypatch):
+        fake = _RecordingDb()
+        monkeypatch.setattr(billing_router, "db", fake)
+        resp = self._post(monkeypatch, {
+            "id": "evt_1", "object": "event", "type": "checkout.session.completed",
+            "data": {"object": {
+                "id": "cs_1", "customer": "cus_1", "subscription": "sub_1",
+                "metadata": {"user_id": "u-1", "plan_id": "plan_acces_complet"},
+            }},
+        })
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["handled"] is True
+        assert fake.updates[0]["status"] == "active"
+
+    def test_an_event_type_we_ignore_is_acked_not_retried(self, monkeypatch):
+        fake = _RecordingDb()
+        monkeypatch.setattr(billing_router, "db", fake)
+        resp = self._post(monkeypatch, {
+            "id": "evt_2", "object": "event", "type": "invoice.created",
+            "data": {"object": {"id": "in_1"}},
+        })
+        assert resp.status_code == 200
+        assert resp.json()["handled"] is False
+
+    def test_a_processing_failure_returns_500_so_stripe_retries(self, monkeypatch):
+        """A transient database failure must not be acked with 200 — that
+        drops the payment permanently. Stripe retries a non-2xx for days."""
+        class _Exploding:
+            async def update_subscription_state(self, **kw):
+                raise RuntimeError("database is down")
+
+            async def get_user_id_by_stripe_customer(self, cid):
+                return None
+
+        monkeypatch.setattr(billing_router, "db", _Exploding())
+        resp = self._post(monkeypatch, {
+            "id": "evt_3", "object": "event", "type": "checkout.session.completed",
+            "data": {"object": {"metadata": {"user_id": "u-1"}}},
+        })
+        assert resp.status_code == 500
+
+    def test_a_body_that_is_not_a_json_object_is_rejected(self, monkeypatch):
+        resp = self._post(monkeypatch, ["not", "an", "object"])
+        assert resp.status_code == 400
+
+
+class TestPayloadShapeTolerance:
+    @pytest.mark.asyncio
+    async def test_an_expanded_subscription_object_still_yields_its_id(self, monkeypatch):
+        """`subscription` is normally a bare id but becomes a full object
+        as soon as anything expands it. Reading only the string form stored
+        NULL and the profile never recovered the id."""
+        fake = _RecordingDb()
+        monkeypatch.setattr(billing_router, "db", fake)
+        await billing_router._handle_stripe_event(
+            "checkout.session.completed",
+            {"metadata": {"user_id": "u-1"},
+             "subscription": {"id": "sub_9", "object": "subscription"},
+             "customer": {"id": "cus_9", "object": "customer"}},
+        )
+        assert fake.updates[0]["subscription_id"] == "sub_9"
+        assert fake.updates[0]["customer_id"] == "cus_9"
+
+    @pytest.mark.asyncio
+    async def test_period_end_is_read_from_items_on_current_api_versions(self, monkeypatch):
+        """Stripe moved current_period_end off Subscription and onto each
+        subscription item in API 2025-03-31.basil. Reading only the old
+        top-level field wrote NULL for every current account."""
+        fake = _RecordingDb()
+        monkeypatch.setattr(billing_router, "db", fake)
+        await billing_router._handle_stripe_event(
+            "customer.subscription.created",
+            {"metadata": {"user_id": "u-1"}, "id": "sub_1", "status": "active",
+             "items": {"object": "list", "data": [{"id": "si_1", "current_period_end": 1790000000}]}},
+        )
+        assert fake.updates[0]["current_period_end"] is not None
+
+    @pytest.mark.asyncio
+    async def test_the_legacy_top_level_period_end_still_wins_when_present(self, monkeypatch):
+        fake = _RecordingDb()
+        monkeypatch.setattr(billing_router, "db", fake)
+        await billing_router._handle_stripe_event(
+            "customer.subscription.updated",
+            {"metadata": {"user_id": "u-1"}, "id": "sub_1", "current_period_end": 1800000000,
+             "items": {"data": [{"current_period_end": 1790000000}]}},
+        )
+        assert int(fake.updates[0]["current_period_end"].timestamp()) == 1800000000
+
+    @pytest.mark.asyncio
+    async def test_a_missing_period_end_is_none_not_an_exception(self, monkeypatch):
+        fake = _RecordingDb()
+        monkeypatch.setattr(billing_router, "db", fake)
+        await billing_router._handle_stripe_event(
+            "customer.subscription.updated", {"metadata": {"user_id": "u-1"}, "id": "sub_1"})
+        assert fake.updates[0]["current_period_end"] is None
+
+    @pytest.mark.asyncio
+    async def test_a_blank_user_id_falls_through_to_the_customer_lookup(self, monkeypatch):
+        """create_checkout_session writes `user_id or ""`, so an anonymous
+        session carries an empty string, not a missing key. Using it as an
+        id would write to a profile that cannot exist."""
+        fake = _RecordingDb(user_for_customer="u-77")
+        monkeypatch.setattr(billing_router, "db", fake)
+        await billing_router._handle_stripe_event(
+            "checkout.session.completed",
+            {"metadata": {"user_id": "  "}, "client_reference_id": "", "customer": "cus_7"},
+        )
+        assert fake.updates[0]["user_id"] == "u-77"
