@@ -30,6 +30,7 @@ from scrapers.matrix.municipal_matrix import CountyRegistryScraper
 from scrapers.ted_scraper import TedRomaniaScraper
 from ai_refinery import IntelligenceRefineryEngine
 from matching_engine import RelevanceEngine
+import push_notifications
 from notifier import LeadAlertDispatcher
 
 logger = logging.getLogger("OpportunityOrchestrator")
@@ -401,6 +402,47 @@ class OpportunityOrchestrator:
         except Exception as e:
             return scraper, None, e
 
+    @staticmethod
+    async def _maybe_push(
+        refined: Dict[str, Any],
+        profile: Dict[str, Any],
+        match: Dict[str, Any],
+        push_subs_by_user: Dict[str, list],
+    ) -> int:
+        """Send one Web Push notification if the policy says to. Returns the
+        number of devices reached (0 when the policy declines, which is the
+        common case and not an error).
+
+        The policy itself lives in push_notifications.decide_push — a pure
+        function — so what gets notified is testable without a tick, a
+        database or a push service.
+        """
+        if not push_subs_by_user:
+            return 0
+        user_id = profile.get("id")
+        subs = push_subs_by_user.get(str(user_id) if user_id else "")
+        if not subs:
+            return 0
+
+        reason = push_notifications.decide_push(refined, profile, match)
+        if reason is None:
+            return 0
+
+        source_id = refined.get("source_id") or ""
+        # Deduped per (user, opportunity) across BOTH rules: a tender that
+        # first arrives via the radar and is later re-evaluated as a
+        # criteria match must not notify the same person twice.
+        if await db.has_push_been_dispatched(user_id, source_id):
+            return 0
+
+        delivered = await push_notifications.dispatch_to_user(user_id, subs, refined, reason)
+        if delivered:
+            # Recorded only on real delivery, so a total push-service outage
+            # leaves the notification eligible for the next tick instead of
+            # marking it sent. Same contract as the email/Telegram log.
+            await db.record_push_dispatch(user_id, source_id, reason)
+        return delivered
+
     async def run_tick(self, deadline_seconds: float = TICK_DEADLINE_SECONDS) -> Dict[str, Any]:
         """Streaming, per-signal pipeline for the free-tier scheduling
         cutover (/api/v1/system/tick): only scrapers whose own
@@ -443,6 +485,8 @@ class OpportunityOrchestrator:
         # row" from "the write path is gone".
         persist_attempts = 0
         persist_failures = 0
+        pushed = 0
+        push_subs_by_user: Dict[str, list] = {}
         due: List[BaseScraper] = []
 
         # Everything from here on is guarded so that db.finish_tick ALWAYS
@@ -464,6 +508,14 @@ class OpportunityOrchestrator:
             # anywhere. A local has no aliasing hazard, and one SELECT against
             # a run that already takes minutes costs nothing.
             profiles = await db.get_onboarded_profiles()
+
+            # Loaded once per tick and passed down, the same reason profiles
+            # are: the alternative is a query per (profile, new signal) pair,
+            # which on a tick ingesting several hundred signals is thousands
+            # of round trips. Skipped entirely when push is unconfigured, so
+            # a deployment without VAPID keys pays nothing for this.
+            if push_notifications.is_configured():
+                push_subs_by_user = await db.get_push_subscriptions_by_user()
 
             # One query for every source's last_run_at, rather than the
             # per-scraper db.is_source_due call this replaces — that was 26
@@ -584,6 +636,18 @@ class OpportunityOrchestrator:
                                     # abort ingestion of the remaining signals.
                                     errors += 1
                                     logger.error(f"[Tick] Alert dispatch failed for {profile.get('id')}: {e}")
+                            # Push is evaluated for EVERY profile, not only
+                            # matches: the radar rule exists precisely to
+                            # surface a high-scoring tender that the user's
+                            # own filters did not catch, so gating it behind
+                            # is_match would delete the feature.
+                            try:
+                                pushed += await self._maybe_push(
+                                    refined, profile, match, push_subs_by_user
+                                )
+                            except Exception as e:
+                                errors += 1
+                                logger.error(f"[Tick] Push dispatch failed for {profile.get('id')}: {e}")
             except asyncio.TimeoutError:
                 truncated = True
                 # A task cancelled here never reaches circuit_breaker's
@@ -679,6 +743,7 @@ class OpportunityOrchestrator:
                 # sources_deferred_by_weight_budget).
                 "sources_due": all_due_count,
                 "sources_deferred_by_weight_budget": len(deferred_by_weight),
+                "push_notifications_sent": pushed,
                 "new_opportunities": new_count,
                 "errors": errors,
                 "truncated": truncated,

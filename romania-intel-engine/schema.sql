@@ -403,6 +403,41 @@ CREATE TABLE user_profiles (
 -- new signals; this keeps that scan off the full table.
 CREATE INDEX idx_user_profiles_onboarded ON user_profiles(onboarded_at) WHERE onboarded_at IS NOT NULL;
 
+-- Added as ALTER ... ADD COLUMN IF NOT EXISTS rather than inline in the
+-- CREATE TABLE above for one reason: user_profiles already exists in
+-- production with rows in it, and the CREATE is a plain CREATE TABLE (no
+-- IF NOT EXISTS — see the rename note on saved_deals), so editing it
+-- changes nothing on a live database. Only the ALTER form is picked up by
+-- db.py's boot schema guard.
+
+-- Web Push preferences. The presence of a push_subscriptions row is what
+-- makes push possible at all; these two decide what gets sent over it.
+-- Defaults are ON so a user who registers a device gets the behaviour they
+-- just opted into, without a second settings trip.
+ALTER TABLE user_profiles ADD COLUMN IF NOT EXISTS push_enabled BOOLEAN NOT NULL DEFAULT true;
+-- The "high-yield market radar": tenders scoring >= PUSH_RADAR_MIN_SCORE
+-- that fall OUTSIDE the user's declared domains/counties. Separately
+-- switchable because it is the one notification class the user did not
+-- explicitly ask for, and the honest thing is to let them decline it
+-- without also losing alerts on their own criteria.
+ALTER TABLE user_profiles ADD COLUMN IF NOT EXISTS push_radar_enabled BOOLEAN NOT NULL DEFAULT true;
+
+-- Stripe subscription state. Mirrored onto the profile from the webhook so
+-- an entitlement check is a column read on a row the request already
+-- loads, not a live API call to Stripe on every request.
+--
+-- subscription_status is Stripe's own vocabulary rather than a local
+-- enum, so a value that appears in the dashboard is the same string that
+-- appears here; 'inactive' is the local default for "never subscribed".
+ALTER TABLE user_profiles ADD COLUMN IF NOT EXISTS stripe_customer_id TEXT;
+ALTER TABLE user_profiles ADD COLUMN IF NOT EXISTS stripe_subscription_id TEXT;
+ALTER TABLE user_profiles ADD COLUMN IF NOT EXISTS subscription_status TEXT NOT NULL DEFAULT 'inactive';
+ALTER TABLE user_profiles ADD COLUMN IF NOT EXISTS subscription_plan_id TEXT;
+ALTER TABLE user_profiles ADD COLUMN IF NOT EXISTS subscription_current_period_end TIMESTAMPTZ;
+
+CREATE INDEX IF NOT EXISTS idx_user_profiles_stripe_customer ON user_profiles(stripe_customer_id)
+    WHERE stripe_customer_id IS NOT NULL;
+
 
 -- ====================================================================
 -- 3. USER-OWNED DATA — all cascade from the profile.
@@ -465,6 +500,71 @@ CREATE TABLE alert_dispatch_log (
     dispatched_at TIMESTAMPTZ DEFAULT now(),
     UNIQUE (user_id, source_id, channel)
 );
+
+
+-- Web Push (VAPID) device registrations. One row per browser/device, so
+-- one person legitimately has several — desktop Chrome, an installed iOS
+-- PWA, a phone browser — and each gets its own endpoint and key pair.
+--
+-- CREATE TABLE IF NOT EXISTS, like everything below, because db.py's boot
+-- schema guard only auto-applies additive DDL (see _SAFE_DDL_PREFIXES);
+-- anything else needs a hand-run in the Supabase SQL editor and will
+-- therefore silently not exist in production until someone remembers.
+--
+-- endpoint is the identity: the push service issues it, it is already
+-- unique per device+origin, and re-subscribing the same browser returns
+-- the same value — so UPSERT on it is what keeps a re-registration from
+-- accumulating duplicate rows that would each get their own copy of every
+-- notification.
+CREATE TABLE IF NOT EXISTS push_subscriptions (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id UUID NOT NULL REFERENCES user_profiles(id) ON DELETE CASCADE,
+    endpoint TEXT NOT NULL UNIQUE,
+    -- The browser's public key and auth secret, base64url as delivered by
+    -- PushSubscription.toJSON(). Opaque to us; handed straight to pywebpush.
+    p256dh TEXT NOT NULL,
+    auth TEXT NOT NULL,
+    user_agent TEXT,
+    created_at TIMESTAMPTZ DEFAULT now(),
+    last_success_at TIMESTAMPTZ,
+    -- A push service answers 404/410 for a subscription the user has
+    -- revoked or that expired with the browser profile. Those are pruned on
+    -- sight rather than counted; this counts the soft failures (timeouts,
+    -- 5xx) so a permanently broken endpoint can be retired without
+    -- discarding one that is merely offline.
+    failure_count INT NOT NULL DEFAULT 0
+);
+
+CREATE INDEX IF NOT EXISTS idx_push_subscriptions_user ON push_subscriptions(user_id);
+
+
+-- Push de-duplication, deliberately its own table rather than a third
+-- `channel` value in alert_dispatch_log above.
+--
+-- That table's channel column carries CHECK (channel IN ('email',
+-- 'telegram')). Widening a CHECK means DROP CONSTRAINT + ADD CONSTRAINT,
+-- which the boot guard's allowlist cannot apply and its denylist
+-- explicitly forbids — so on the live database inserting 'push' would
+-- raise CheckViolationError on every notification until someone ran the
+-- migration by hand. A new additive table self-heals on the next deploy.
+--
+-- Keyed per (user, opportunity), not per device: a person who has both a
+-- laptop and a phone registered wants one notification about a tender, and
+-- fanning out to their devices is a delivery detail, not a second alert.
+CREATE TABLE IF NOT EXISTS push_dispatch_log (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id UUID NOT NULL REFERENCES user_profiles(id) ON DELETE CASCADE,
+    source_id TEXT NOT NULL,
+    -- 'criteria' (matched the user's own filters) or 'radar' (scored >=
+    -- PUSH_RADAR_MIN_SCORE outside them). Kept so the two rules can be
+    -- told apart when tuning, and so turning the radar off later does not
+    -- make past radar sends look like criteria sends.
+    reason TEXT NOT NULL DEFAULT 'criteria',
+    dispatched_at TIMESTAMPTZ DEFAULT now(),
+    UNIQUE (user_id, source_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_push_dispatch_log_user ON push_dispatch_log(user_id, dispatched_at DESC);
 
 
 -- ====================================================================

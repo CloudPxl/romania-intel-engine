@@ -24,6 +24,8 @@ import inspect
 import re
 from pathlib import Path
 
+import pytest
+
 import db
 
 SCHEMA_SQL = (Path(__file__).resolve().parent.parent / "schema.sql").read_text()
@@ -127,14 +129,35 @@ class TestBootDdlStaysSafeToRunUnconditionally:
     def test_the_destructive_half_of_schema_sql_is_never_picked_up(self):
         """schema.sql also drops two generations of dead tables, defines RLS
         policies and runs a backfill UPDATE. None may run unattended on
-        every boot."""
+        every boot.
+
+        The one deliberate exemption is a foreign key's `ON DELETE CASCADE`
+        / `ON UPDATE ...` clause, which is a column constraint inside a
+        CREATE TABLE rather than a DML statement. Treating it as destructive
+        silently excluded every table that declares one — see
+        TestForeignKeyActionsDoNotTripTheDenylist below for the defect that
+        caused. The verb check itself is unchanged; only the FK clause is
+        blanked first, exactly as db._load_required_ddl does.
+        """
         assert "DROP TABLE" in SCHEMA_SQL, "fixture assumption broke: no DROPs in schema.sql"
         assert "CREATE POLICY" in SCHEMA_SQL
         for stmt in db._REQUIRED_DDL:
             assert not re.search(
                 r"\b(DROP|DELETE|TRUNCATE|UPDATE|INSERT|POLICY|GRANT|REVOKE|RENAME)\b",
-                stmt, re.I,
+                db._without_fk_actions(stmt), re.I,
             ), f"destructive statement leaked into boot DDL: {stmt[:100]}"
+
+    def test_the_fk_exemption_only_covers_the_clause_itself(self):
+        """Guards the exemption above from becoming a hole: a CREATE TABLE
+        that also carried a real DML verb must still be excluded."""
+        assert re.search(
+            r"\bDELETE\b",
+            db._without_fk_actions(
+                "CREATE TABLE IF NOT EXISTS t (id INT REFERENCES u(id) ON DELETE CASCADE); "
+                "DELETE FROM t"
+            ),
+            re.I,
+        )
 
     def test_every_table_the_code_uses_is_created(self):
         """A missing table is the same outage as a missing column — it is how
@@ -158,3 +181,55 @@ class TestBootDdlStaysSafeToRunUnconditionally:
         )
         for stmt in db._REQUIRED_DDL:
             assert stmt in normalised, f"boot DDL statement is not in schema.sql: {stmt[:100]}"
+
+
+class TestForeignKeyActionsDoNotTripTheDenylist:
+    """`ON DELETE CASCADE` inside a CREATE TABLE is a column constraint, not
+    a DELETE statement — but _FORBIDDEN_IN_DDL matches the bare word, so
+    every table declaring one was silently dropped from the boot guard.
+
+    That shipped as a real defect: push_subscriptions and push_dispatch_log
+    were written as CREATE TABLE IF NOT EXISTS precisely so they would
+    self-heal on deploy, and were excluded on this false positive — a Web
+    Push feature whose tables never get created in production, whose only
+    symptom is that no notification is ever sent.
+    """
+
+    def test_the_push_tables_are_picked_up_by_the_guard(self):
+        ddl = db._load_required_ddl()
+        for table in ("push_subscriptions", "push_dispatch_log"):
+            assert any(
+                s.upper().startswith(f"CREATE TABLE IF NOT EXISTS {table.upper()}") for s in ddl
+            ), f"{table} is not in the boot guard's statement list"
+
+    def test_a_cascade_clause_alone_no_longer_excludes_a_statement(self):
+        stmt = (
+            "CREATE TABLE IF NOT EXISTS t (id UUID PRIMARY KEY, "
+            "user_id UUID REFERENCES user_profiles(id) ON DELETE CASCADE)"
+        )
+        assert not db._FORBIDDEN_IN_DDL.search(db._without_fk_actions(stmt))
+
+    @pytest.mark.parametrize("stmt", [
+        "DELETE FROM opportunities WHERE 1=1",
+        "DROP TABLE user_profiles",
+        "TRUNCATE opportunities",
+        "ALTER TABLE x ALTER COLUMN y TYPE TEXT",
+        "UPDATE user_profiles SET email = 'x'",
+        "GRANT ALL ON opportunities TO PUBLIC",
+        "CREATE TABLE IF NOT EXISTS t (id INT); DELETE FROM t",
+    ])
+    def test_genuinely_destructive_statements_are_still_blocked(self, stmt):
+        """The narrowing must not become a hole: stripping FK actions only
+        blanks `ON DELETE <action>`, never a DML verb."""
+        assert db._FORBIDDEN_IN_DDL.search(db._without_fk_actions(stmt)), \
+            f"denylist no longer blocks: {stmt}"
+
+    def test_every_guarded_statement_is_still_additive(self):
+        """The allowlist is the real boundary — re-assert it holds over the
+        whole file after the change."""
+        for stmt in db._load_required_ddl():
+            upper = stmt.upper()
+            assert (
+                upper.startswith(db._SAFE_DDL_PREFIXES)
+                or db._ALTER_ADD_COLUMN_RE.match(stmt)
+            ), f"non-additive statement reached the guard: {stmt[:80]}"

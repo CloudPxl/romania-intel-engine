@@ -231,6 +231,36 @@ _FORBIDDEN_IN_DDL = re.compile(
 )
 
 
+_FK_ACTION_RE = re.compile(
+    r"\bON\s+(?:DELETE|UPDATE)\s+"
+    r"(?:CASCADE|RESTRICT|NO\s+ACTION|SET\s+NULL|SET\s+DEFAULT)",
+    re.IGNORECASE,
+)
+
+
+def _without_fk_actions(stmt: str) -> str:
+    """Blanks foreign-key referential actions before the denylist runs.
+
+    `ON DELETE CASCADE` inside a CREATE TABLE is a column constraint, not a
+    DELETE statement, but _FORBIDDEN_IN_DDL matches the bare word — so every
+    table declaring one was silently dropped from the guard. That is not
+    hypothetical: push_subscriptions and push_dispatch_log were written as
+    CREATE TABLE IF NOT EXISTS specifically so they would self-heal on
+    deploy, and were excluded on exactly this false positive, which would
+    have shipped a Web Push feature whose tables never got created in
+    production and whose only symptom is that no notification is ever sent.
+
+    Narrow on purpose. The allowlist above has already established that the
+    statement STARTS with CREATE TABLE/INDEX/EXTENSION IF NOT EXISTS or
+    ALTER TABLE ... ADD COLUMN IF NOT EXISTS, so it cannot itself be a DML
+    statement; this only stops one clause inside such a statement from
+    reading as one. A real `DELETE FROM`, `DROP TABLE` or `ALTER COLUMN`
+    still trips the denylist unchanged — tests/test_schema_contract.py pins
+    that.
+    """
+    return _FK_ACTION_RE.sub(" ", stmt)
+
+
 def _load_required_ddl() -> tuple:
     """Parse schema.sql into the additive statements safe to re-run on boot."""
     path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "schema.sql")
@@ -254,7 +284,7 @@ def _load_required_ddl() -> tuple:
         is_allowed = upper.startswith(_SAFE_DDL_PREFIXES) or _ALTER_ADD_COLUMN_RE.match(stmt)
         if not is_allowed:
             continue
-        if _FORBIDDEN_IN_DDL.search(stmt):
+        if _FORBIDDEN_IN_DDL.search(_without_fk_actions(stmt)):
             continue
         statements.append(stmt)
     return tuple(statements)
@@ -1517,11 +1547,41 @@ def _parse_timestamp(value: Any) -> Optional[datetime]:
 # The columns every profile read returns. Kept in one place because four
 # separate queries below select them and drifting between those is how a
 # KeyError reaches a route handler.
-_PROFILE_COLUMNS = (
+_PROFILE_BASE_COLUMNS = (
     "id, email, display_name, domain, target_counties, keywords, "
     "exclude_keywords, min_value_ron, company_name, cui, alert_email, "
     "telegram_chat_id, min_alert_score, onboarded_at"
 )
+
+# Columns added after this table was first deployed. Selected separately so
+# a database that has not yet had the boot guard apply them degrades to
+# "push off, no subscription" instead of failing the SELECT — which would
+# take down profile loading, and with it the whole ingestion tick's
+# matching and every /api/v1/me request, over a feature that is additive.
+# _select_profile_columns() below downgrades once per process, not per call.
+_PROFILE_EXTENDED_COLUMNS = (
+    "push_enabled, push_radar_enabled, subscription_status, "
+    "subscription_plan_id, subscription_current_period_end, stripe_customer_id"
+)
+_PROFILE_COLUMNS = f"{_PROFILE_BASE_COLUMNS}, {_PROFILE_EXTENDED_COLUMNS}"
+
+_profile_columns_downgraded = False
+
+
+def _select_profile_columns() -> str:
+    return _PROFILE_BASE_COLUMNS if _profile_columns_downgraded else _PROFILE_COLUMNS
+
+
+def _downgrade_profile_columns(where: str) -> str:
+    """Latch the reduced column list after the first UndefinedColumnError."""
+    global _profile_columns_downgraded
+    if not _profile_columns_downgraded:
+        _profile_columns_downgraded = True
+        logger.warning(
+            f"[DB] user_profiles is missing the push/subscription columns ({where}) — "
+            "falling back to the base column set. Apply schema.sql to enable them."
+        )
+    return _PROFILE_BASE_COLUMNS
 
 
 def _profile_row_to_dict(row: Any) -> Dict[str, Any]:
@@ -1556,7 +1616,12 @@ async def get_profile(user_id: str) -> Optional[Dict[str, Any]]:
             return None
         try:
             row = await conn.fetchrow(
-                f"SELECT {_PROFILE_COLUMNS} FROM user_profiles WHERE id = $1", user_id
+                f"SELECT {_select_profile_columns()} FROM user_profiles WHERE id = $1", user_id
+            )
+        except asyncpg.exceptions.UndefinedColumnError:
+            row = await conn.fetchrow(
+                f"SELECT {_downgrade_profile_columns('get_user_profile')} "
+                "FROM user_profiles WHERE id = $1", user_id
             )
         except asyncpg.exceptions.UndefinedTableError:
             logger.warning("[DB] user_profiles not found — run schema.sql.")
@@ -1580,8 +1645,13 @@ async def get_onboarded_profiles() -> List[Dict[str, Any]]:
             return []
         try:
             rows = await conn.fetch(
-                f"SELECT {_PROFILE_COLUMNS} FROM user_profiles "
+                f"SELECT {_select_profile_columns()} FROM user_profiles "
                 "WHERE onboarded_at IS NOT NULL ORDER BY created_at"
+            )
+        except asyncpg.exceptions.UndefinedColumnError:
+            rows = await conn.fetch(
+                f"SELECT {_downgrade_profile_columns('get_onboarded_profiles')} "
+                "FROM user_profiles WHERE onboarded_at IS NOT NULL ORDER BY created_at"
             )
         except asyncpg.exceptions.UndefinedTableError:
             logger.warning("[DB] user_profiles not found — run schema.sql.")
@@ -1895,3 +1965,272 @@ async def delete_own_account(user_id: str) -> bool:
             return False
     # asyncpg returns the command tag, e.g. "DELETE 1" / "DELETE 0".
     return result.rsplit(" ", 1)[-1] != "0"
+
+
+# ---------------------------------------------------------------- web push
+#
+# Same degrade-gracefully contract as the alert-dispatch helpers above:
+# every read answers "no" and every write is a no-op when the database is
+# absent or the table has not been created yet, so a missing migration
+# degrades push to "off" instead of raising through the ingestion tick.
+
+
+async def upsert_push_subscription(
+    user_id: str,
+    endpoint: str,
+    p256dh: str,
+    auth: str,
+    user_agent: Optional[str] = None,
+) -> bool:
+    """Register (or re-register) one browser for push.
+
+    ON CONFLICT (endpoint) rather than (user_id, endpoint): the push
+    service's endpoint is globally unique and stable per browser profile,
+    and the same physical browser can be re-subscribed by a *different*
+    user after a sign-out/sign-in. Keying on the pair would leave the old
+    user's row in place and keep sending them the new user's alerts.
+    """
+    async with with_connection() as conn:
+        if conn is None:
+            return False
+        try:
+            await conn.execute(
+                """
+                INSERT INTO push_subscriptions (user_id, endpoint, p256dh, auth, user_agent)
+                VALUES ($1, $2, $3, $4, $5)
+                ON CONFLICT (endpoint) DO UPDATE SET
+                    user_id = EXCLUDED.user_id,
+                    p256dh = EXCLUDED.p256dh,
+                    auth = EXCLUDED.auth,
+                    user_agent = EXCLUDED.user_agent,
+                    failure_count = 0
+                """,
+                user_id, endpoint, p256dh, auth, user_agent,
+            )
+        except asyncpg.exceptions.UndefinedTableError:
+            logger.warning("[DB] push_subscriptions not found — run schema.sql.")
+            return False
+    return True
+
+
+async def delete_push_subscription(endpoint: str, user_id: Optional[str] = None) -> bool:
+    """Unregister a device. `user_id` scopes the delete when the caller is a
+    request (so one signed-in user cannot unsubscribe another's device by
+    posting their endpoint); the dispatcher omits it when pruning an
+    endpoint the push service itself reported as gone."""
+    async with with_connection() as conn:
+        if conn is None:
+            return False
+        try:
+            if user_id:
+                result = await conn.execute(
+                    "DELETE FROM push_subscriptions WHERE endpoint = $1 AND user_id = $2",
+                    endpoint, user_id,
+                )
+            else:
+                result = await conn.execute(
+                    "DELETE FROM push_subscriptions WHERE endpoint = $1", endpoint
+                )
+        except asyncpg.exceptions.UndefinedTableError:
+            return False
+    return result.endswith("1")
+
+
+async def get_push_subscriptions(user_id: str) -> List[Dict[str, Any]]:
+    async with with_connection() as conn:
+        if conn is None:
+            return []
+        try:
+            rows = await conn.fetch(
+                "SELECT endpoint, p256dh, auth, user_agent, created_at "
+                "FROM push_subscriptions WHERE user_id = $1 ORDER BY created_at",
+                user_id,
+            )
+        except asyncpg.exceptions.UndefinedTableError:
+            return []
+    return [dict(r) for r in rows]
+
+
+async def get_push_subscriptions_by_user() -> Dict[str, List[Dict[str, Any]]]:
+    """Every registration, grouped by user, in one query.
+
+    The ingestion tick needs these for every profile it may notify. Loaded
+    once per tick and passed down, exactly like db.get_onboarded_profiles —
+    the alternative is one query per (profile, new signal) pair, which on a
+    tick that ingests several hundred signals is thousands of round trips.
+    """
+    async with with_connection() as conn:
+        if conn is None:
+            return {}
+        try:
+            rows = await conn.fetch(
+                "SELECT user_id, endpoint, p256dh, auth FROM push_subscriptions"
+            )
+        except asyncpg.exceptions.UndefinedTableError:
+            logger.warning("[DB] push_subscriptions not found — run schema.sql.")
+            return {}
+    grouped: Dict[str, List[Dict[str, Any]]] = {}
+    for row in rows:
+        grouped.setdefault(str(row["user_id"]), []).append({
+            "endpoint": row["endpoint"], "p256dh": row["p256dh"], "auth": row["auth"],
+        })
+    return grouped
+
+
+async def record_push_success(endpoint: str) -> None:
+    async with with_connection() as conn:
+        if conn is None:
+            return
+        try:
+            await conn.execute(
+                "UPDATE push_subscriptions SET last_success_at = now(), failure_count = 0 "
+                "WHERE endpoint = $1",
+                endpoint,
+            )
+        except asyncpg.exceptions.UndefinedTableError:
+            return
+
+
+async def record_push_failure(endpoint: str) -> None:
+    async with with_connection() as conn:
+        if conn is None:
+            return
+        try:
+            await conn.execute(
+                "UPDATE push_subscriptions SET failure_count = failure_count + 1 WHERE endpoint = $1",
+                endpoint,
+            )
+        except asyncpg.exceptions.UndefinedTableError:
+            return
+
+
+async def has_push_been_dispatched(user_id: str, source_id: str) -> bool:
+    """False with no database, same reasoning as has_alert_been_dispatched:
+    a duplicate notification is recoverable, a missed tender is not."""
+    async with with_connection() as conn:
+        if conn is None:
+            return False
+        try:
+            row = await conn.fetchrow(
+                "SELECT 1 FROM push_dispatch_log WHERE user_id = $1 AND source_id = $2",
+                user_id, source_id,
+            )
+        except asyncpg.exceptions.UndefinedTableError:
+            logger.warning("[DB] push_dispatch_log not found — run schema.sql.")
+            return False
+    return row is not None
+
+
+async def record_push_dispatch(user_id: str, source_id: str, reason: str = "criteria") -> None:
+    async with with_connection() as conn:
+        if conn is None:
+            return
+        try:
+            await conn.execute(
+                "INSERT INTO push_dispatch_log (user_id, source_id, reason) VALUES ($1, $2, $3) "
+                "ON CONFLICT (user_id, source_id) DO NOTHING",
+                user_id, source_id, reason,
+            )
+        except asyncpg.exceptions.UndefinedTableError:
+            return
+
+
+# ------------------------------------------------------ stripe / billing
+
+
+async def set_stripe_customer_id(user_id: str, customer_id: str) -> None:
+    async with with_connection() as conn:
+        if conn is None:
+            return
+        try:
+            await conn.execute(
+                "UPDATE user_profiles SET stripe_customer_id = $2, updated_at = now() WHERE id = $1",
+                user_id, customer_id,
+            )
+        except asyncpg.exceptions.UndefinedColumnError:
+            logger.warning("[DB] user_profiles.stripe_customer_id missing — run schema.sql.")
+
+
+async def update_subscription_state(
+    user_id: str,
+    status: str,
+    subscription_id: Optional[str] = None,
+    plan_id: Optional[str] = None,
+    current_period_end: Optional[datetime] = None,
+    customer_id: Optional[str] = None,
+) -> bool:
+    """Mirror Stripe's view of the subscription onto the profile.
+
+    COALESCE on every optional field so a later, sparser event (a
+    cancellation carries no plan) cannot blank out what an earlier, richer
+    one recorded. `status` is always written — it is the whole point of the
+    call and the one field every event does carry.
+    """
+    async with with_connection() as conn:
+        if conn is None:
+            return False
+        try:
+            result = await conn.execute(
+                """
+                UPDATE user_profiles SET
+                    subscription_status = $2,
+                    stripe_subscription_id = COALESCE($3, stripe_subscription_id),
+                    subscription_plan_id = COALESCE($4, subscription_plan_id),
+                    subscription_current_period_end = COALESCE($5, subscription_current_period_end),
+                    stripe_customer_id = COALESCE($6, stripe_customer_id),
+                    updated_at = now()
+                WHERE id = $1
+                """,
+                user_id, status, subscription_id, plan_id, current_period_end, customer_id,
+            )
+        except asyncpg.exceptions.UndefinedColumnError:
+            logger.warning("[DB] user_profiles subscription columns missing — run schema.sql.")
+            return False
+    return result.endswith("1")
+
+
+async def get_user_id_by_stripe_customer(customer_id: str) -> Optional[str]:
+    """Resolve a webhook's customer id back to a user.
+
+    The fallback path for events whose metadata did not survive (a
+    subscription updated from the Stripe dashboard by hand carries no
+    client_reference_id), so the webhook is not dependent on metadata it
+    does not control.
+    """
+    async with with_connection() as conn:
+        if conn is None:
+            return None
+        try:
+            row = await conn.fetchrow(
+                "SELECT id FROM user_profiles WHERE stripe_customer_id = $1", customer_id
+            )
+        except asyncpg.exceptions.UndefinedColumnError:
+            return None
+    return str(row["id"]) if row else None
+
+
+async def update_push_preferences(
+    user_id: str,
+    push_enabled: Optional[bool] = None,
+    push_radar_enabled: Optional[bool] = None,
+) -> bool:
+    """Partial update — COALESCE leaves an omitted preference untouched, so
+    the settings UI can send just the toggle the user actually flipped."""
+    async with with_connection() as conn:
+        if conn is None:
+            return False
+        try:
+            result = await conn.execute(
+                """
+                UPDATE user_profiles SET
+                    push_enabled = COALESCE($2, push_enabled),
+                    push_radar_enabled = COALESCE($3, push_radar_enabled),
+                    updated_at = now()
+                WHERE id = $1
+                """,
+                user_id, push_enabled, push_radar_enabled,
+            )
+        except asyncpg.exceptions.UndefinedColumnError:
+            logger.warning("[DB] user_profiles push columns missing — run schema.sql.")
+            return False
+    return result.endswith("1")

@@ -65,6 +65,36 @@ services:
         sync: false
       - key: TELEGRAM_ADMIN_CHAT_ID
         sync: false
+      # --- Email (Phase 2). Resend is the primary transport; the SMTP_*
+      # vars above remain the fallback. Both unset = alerts degrade to the
+      # durable system_alerts table rather than silently "succeeding".
+      - key: RESEND_API_KEY
+        sync: false
+      - key: RESEND_FROM_EMAIL
+        sync: false
+      # Where alert links and Stripe return URLs point. Must be the real
+      # frontend origin, not the API's.
+      - key: APP_BASE_URL
+        value: "https://ro-intel.xyz"
+
+      # --- Web Push (Phase 3). Generated once with openssl; see the block
+      # at the bottom of push_notifications.py. Unset = push is off, which
+      # the tick detects and skips at zero cost.
+      - key: VAPID_PUBLIC_KEY
+        sync: false
+      - key: VAPID_PRIVATE_KEY
+        sync: false
+      - key: VAPID_CLAIMS_EMAIL
+        sync: false
+
+      # --- Stripe (Phase 4). Test-mode keys work as-is; the webhook secret
+      # is REQUIRED for the webhook route to accept anything at all — it
+      # fails closed rather than trusting an unsigned body.
+      - key: STRIPE_SECRET_KEY
+        sync: false
+      - key: STRIPE_WEBHOOK_SECRET
+        sync: false
+
       - key: ENABLE_LIVE_ELICITATIE
         value: "true"
       # Real, live SEAP direct-purchase (DA) + direct-purchase-award (CAN)
