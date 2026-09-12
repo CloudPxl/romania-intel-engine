@@ -190,3 +190,57 @@ class TestVapidKeyForms:
         monkeypatch.setattr(push_notifications, "VAPID_PRIVATE_KEY",
                             "-----BEGIN EC PRIVATE KEY-----\nnot-a-key\n-----END EC PRIVATE KEY-----")
         assert push_notifications._vapid_private_key() == ""
+
+
+class TestKeyPairConsistency:
+    """A mismatched VAPID pair is the one misconfiguration that looks
+    entirely healthy server-side: is_configured() is True, the browser
+    subscribes, every send is attempted, and the push service rejects each
+    with a bare 401/403 far from the paste that caused it.
+
+    The pair below is real and was generated with the documented openssl
+    recipe. WRONG_PRIVATE is what the previously-documented
+    `... -outform DER | tail -c 32` produced from that same key — note it
+    is a literal suffix of the public key, because a SEC1 ECPrivateKey DER
+    ends with the public point, not the private scalar.
+    """
+
+    PUBLIC = ("BELyN8Or-yKPqVnLcv9T4zCoGhw-85mCVUcSsI4nlkLh35Xq42L3j0uB"
+              "nas9UsLn5P_w76PVeziLfTrriM0K2UU")
+    PRIVATE = "ZcDCq0V2AhLk1f4AUEHVSNkrFcOl8oNg4VCN19mTlFw"
+    WRONG_PRIVATE = "35Xq42L3j0uBnas9UsLn5P_w76PVeziLfTrriM0K2UU"
+
+    def test_a_real_pair_is_reported_consistent(self, monkeypatch):
+        monkeypatch.setattr(push_notifications, "VAPID_PUBLIC_KEY", self.PUBLIC)
+        monkeypatch.setattr(push_notifications, "VAPID_PRIVATE_KEY", self.PRIVATE)
+        assert push_notifications.keys_are_consistent() is True
+
+    def test_the_tail_minus_32_mistake_is_caught(self, monkeypatch):
+        monkeypatch.setattr(push_notifications, "VAPID_PUBLIC_KEY", self.PUBLIC)
+        monkeypatch.setattr(push_notifications, "VAPID_PRIVATE_KEY", self.WRONG_PRIVATE)
+        assert push_notifications.keys_are_consistent() is False
+
+    def test_the_wrong_key_really_is_a_suffix_of_the_public_key(self):
+        """Pins why the old recipe was wrong, not just that it was."""
+        assert self.PUBLIC.endswith(self.WRONG_PRIVATE)
+
+    def test_unset_keys_report_unknown_rather_than_inconsistent(self, monkeypatch):
+        """None must be distinguishable from False: callers gate on
+        `is False` so an unconfigured deployment is not reported as
+        misconfigured."""
+        monkeypatch.setattr(push_notifications, "VAPID_PUBLIC_KEY", "")
+        monkeypatch.setattr(push_notifications, "VAPID_PRIVATE_KEY", "")
+        assert push_notifications.keys_are_consistent() is None
+
+    def test_a_pem_private_key_is_compared_after_conversion(self, monkeypatch):
+        """The operator may paste the PEM; consistency must still resolve."""
+        monkeypatch.setattr(push_notifications, "VAPID_PRIVATE_KEY", TestVapidKeyForms.PEM)
+        monkeypatch.setattr(push_notifications, "VAPID_PUBLIC_KEY", self.PUBLIC)
+        # Different key entirely -> False, not None (i.e. it was evaluated).
+        assert push_notifications.keys_are_consistent() is False
+
+    def test_garbage_private_key_reports_unknown_not_a_false_mismatch(self, monkeypatch):
+        monkeypatch.setattr(push_notifications, "VAPID_PUBLIC_KEY", self.PUBLIC)
+        monkeypatch.setattr(push_notifications, "VAPID_PRIVATE_KEY",
+                            "-----BEGIN EC PRIVATE KEY-----\nnope\n-----END EC PRIVATE KEY-----")
+        assert push_notifications.keys_are_consistent() is None

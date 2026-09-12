@@ -84,6 +84,45 @@ def _vapid_private_key() -> str:
         return ""
 
 
+def keys_are_consistent() -> Optional[bool]:
+    """Does VAPID_PUBLIC_KEY actually belong to VAPID_PRIVATE_KEY?
+
+    None when it cannot be determined (keys unset, or cryptography
+    unavailable), True/False otherwise.
+
+    Worth a dedicated check because a mismatched pair is the one
+    misconfiguration that looks completely healthy from the server's side:
+    is_configured() is True, the browser subscribes fine, every send is
+    attempted, and the push service rejects each one with 401/403 far away
+    from the paste that caused it. The documented `tail -c 32` recipe for
+    extracting the raw scalar produced exactly this — a SEC1 DER ends with
+    the *public* point, so those 32 bytes are a well-formed scalar that has
+    nothing to do with the public key.
+    """
+    priv = _vapid_private_key()
+    if not priv or not VAPID_PUBLIC_KEY:
+        return None
+    try:
+        import base64
+
+        from cryptography.hazmat.primitives.asymmetric import ec
+        from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
+
+        scalar = int.from_bytes(
+            base64.urlsafe_b64decode(priv + "=" * (-len(priv) % 4)), "big"
+        )
+        derived = (
+            ec.derive_private_key(scalar, ec.SECP256R1())
+            .public_key()
+            .public_bytes(Encoding.X962, PublicFormat.UncompressedPoint)
+        )
+        expected = base64.urlsafe_b64encode(derived).decode().rstrip("=")
+        return expected == VAPID_PUBLIC_KEY.strip().rstrip("=")
+    except Exception as e:
+        logger.warning(f"[Push] Could not verify VAPID key pair consistency: {e}")
+        return None
+
+
 def decide_push(
     lead: Dict[str, Any],
     profile: Dict[str, Any],
@@ -267,7 +306,17 @@ async def dispatch_to_user(
 #                       _vapid_private_key() above converts the PEM form,
 #                       because py_vapid itself rejects it. The raw form is:
 #     openssl ec -in vapid_private.pem -outform DER \
-#       | tail -c 32 | base64 | tr '/+' '_-' | tr -d '=\n'
+#       | dd bs=1 skip=7 count=32 2>/dev/null \
+#       | base64 | tr -d '\n' | tr '/+' '_-' | tr -d '='
+#                       NOT `tail -c 32`: a SEC1 ECPrivateKey DER ends with
+#                       the *public* point, so the last 32 bytes are the
+#                       tail of the public key. That silently yields a
+#                       well-formed 32-byte scalar unrelated to the public
+#                       key, and every push is then rejected by the push
+#                       service with 401/403 — verified against a real
+#                       generated key, whose "tail" form came out as a
+#                       literal suffix of VAPID_PUBLIC_KEY. Offset 7 is the
+#                       fixed P-256 SEC1 header (30 77 02 01 01 04 20).
 #   VAPID_PUBLIC_KEY:   the base64url, uncompressed public point, which the
 #                       browser needs as applicationServerKey:
 #     openssl ec -in vapid_private.pem -pubout -outform DER \

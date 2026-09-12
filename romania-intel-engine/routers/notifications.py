@@ -133,6 +133,17 @@ async def send_test_notification(user: dict = Depends(require_auth)):
             status_code=503,
             detail="Notificările push nu sunt configurate pe server (lipsesc cheile VAPID).",
         )
+    if push_notifications.keys_are_consistent() is False:
+        # Checked before attempting a send: a mismatched pair fails at the
+        # push service with a bare 401/403 that names nothing, and this is
+        # the one place an operator is actively looking for an answer.
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "Cheile VAPID nu se potrivesc între ele: VAPID_PUBLIC_KEY nu corespunde "
+                "cheii private configurate. Regenerați perechea și actualizați ambele variabile."
+            ),
+        )
     subs = await db.get_push_subscriptions(user["user_id"])
     if not subs:
         raise HTTPException(
