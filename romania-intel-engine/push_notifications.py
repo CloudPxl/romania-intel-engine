@@ -54,6 +54,36 @@ def is_configured() -> bool:
     return bool(VAPID_PUBLIC_KEY and VAPID_PRIVATE_KEY)
 
 
+def _vapid_private_key() -> str:
+    """The private key in the one form py_vapid actually accepts.
+
+    py_vapid takes either a *path* to a PEM file or the raw 32-byte private
+    scalar as base64url — it does NOT accept the contents of a PEM as a
+    string, which is the obvious thing to paste into a Render env var and
+    exactly what the openssl recipe below produces. Doing so fails at send
+    time with "Could not deserialize key data", nowhere near the
+    configuration that caused it, and only for real pushes — every unit
+    test still passes.
+
+    So a PEM is detected and converted here. Both forms work, and the
+    operator can paste whichever they have.
+    """
+    raw = (VAPID_PRIVATE_KEY or "").strip()
+    if "BEGIN" not in raw:
+        return raw  # already base64url
+    try:
+        import base64
+
+        from cryptography.hazmat.primitives import serialization
+
+        key = serialization.load_pem_private_key(raw.encode(), password=None)
+        scalar = key.private_numbers().private_value.to_bytes(32, "big")
+        return base64.urlsafe_b64encode(scalar).decode().rstrip("=")
+    except Exception as e:
+        logger.error(f"[Push] VAPID_PRIVATE_KEY is not a usable EC private key: {e}")
+        return ""
+
+
 def decide_push(
     lead: Dict[str, Any],
     profile: Dict[str, Any],
@@ -171,7 +201,7 @@ async def send_to_subscription(subscription: Dict[str, Any], payload: Dict[str, 
                     "keys": {"p256dh": subscription["p256dh"], "auth": subscription["auth"]},
                 },
                 data=json.dumps(payload, ensure_ascii=False),
-                vapid_private_key=VAPID_PRIVATE_KEY,
+                vapid_private_key=_vapid_private_key(),
                 # The `sub` claim must be a mailto: or https: URI per RFC
                 # 8292; a bare address is rejected by some push services.
                 vapid_claims={"sub": f"mailto:{VAPID_CLAIMS_EMAIL}"},
@@ -232,9 +262,12 @@ async def dispatch_to_user(
 #   openssl ecparam -name prime256v1 -genkey -noout -out vapid_private.pem
 #   openssl ec -in vapid_private.pem -pubout -out vapid_public.pem
 #
-#   VAPID_PRIVATE_KEY:  the contents of vapid_private.pem (the whole PEM,
-#                       newlines included — Render's env editor accepts a
-#                       multi-line value).
+#   VAPID_PRIVATE_KEY:  EITHER the whole PEM (multi-line, as Render's env
+#                       editor accepts) or the raw scalar as base64url —
+#                       _vapid_private_key() above converts the PEM form,
+#                       because py_vapid itself rejects it. The raw form is:
+#     openssl ec -in vapid_private.pem -outform DER \
+#       | tail -c 32 | base64 | tr '/+' '_-' | tr -d '=\n'
 #   VAPID_PUBLIC_KEY:   the base64url, uncompressed public point, which the
 #                       browser needs as applicationServerKey:
 #     openssl ec -in vapid_private.pem -pubout -outform DER \

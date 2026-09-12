@@ -145,3 +145,48 @@ class TestConfiguration:
             "u-1", [{"endpoint": "e", "p256dh": "k", "auth": "a"}], {"project_title": "X"}, "criteria"
         )
         assert sent == 0
+
+
+class TestVapidKeyForms:
+    """py_vapid accepts a *path* to a PEM or the raw scalar as base64url —
+    never the contents of a PEM as a string, which is precisely what an
+    operator pastes into a Render env var after running the documented
+    openssl recipe.
+
+    Getting this wrong fails only on a real send, with "Could not
+    deserialize key data" raised far from the configuration that caused it,
+    while every unit test still passes. Caught by an end-to-end send against
+    a fabricated FCM endpoint; pinned here.
+    """
+
+    PEM = (
+        "-----BEGIN EC PRIVATE KEY-----\n"
+        "MHcCAQEEIAmJqXxrGhFtqHPtDWreiaHrI4WpO+xdZ3eiZpo9fCn4oAoGCCqGSM49\n"
+        "AwEHoUQDQgAEiQbEffX/9h1Ncoq9lCNrEM9btXq07VXxdfjietmFRpWHQzXioZzr\n"
+        "S8nYJuSKaXrcH3nb2X9zx+tioeBwGISOIQ==\n"
+        "-----END EC PRIVATE KEY-----\n"
+    )
+
+    def test_a_pem_is_converted_to_the_raw_base64url_scalar(self, monkeypatch):
+        monkeypatch.setattr(push_notifications, "VAPID_PRIVATE_KEY", self.PEM)
+        converted = push_notifications._vapid_private_key()
+        assert "BEGIN" not in converted
+        # A P-256 scalar is 32 bytes -> 43 base64url chars unpadded.
+        assert len(converted) == 43
+        assert "=" not in converted and "+" not in converted and "/" not in converted
+
+    def test_an_already_raw_key_passes_through_untouched(self, monkeypatch):
+        raw = "CYmpfGsaEW2oc-0Nat6JoesjhaU77F1nd6Jmmj18Kfg"
+        monkeypatch.setattr(push_notifications, "VAPID_PRIVATE_KEY", raw)
+        assert push_notifications._vapid_private_key() == raw
+
+    def test_surrounding_whitespace_does_not_break_detection(self, monkeypatch):
+        """Env editors routinely add a trailing newline."""
+        monkeypatch.setattr(push_notifications, "VAPID_PRIVATE_KEY", "\n  " + self.PEM + "  \n")
+        assert len(push_notifications._vapid_private_key()) == 43
+
+    def test_garbage_degrades_to_empty_rather_than_raising(self, monkeypatch):
+        """A malformed key must not raise up through the ingestion tick."""
+        monkeypatch.setattr(push_notifications, "VAPID_PRIVATE_KEY",
+                            "-----BEGIN EC PRIVATE KEY-----\nnot-a-key\n-----END EC PRIVATE KEY-----")
+        assert push_notifications._vapid_private_key() == ""

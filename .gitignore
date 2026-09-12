@@ -12,3 +12,6 @@ dist/
 build/
 # Snapshot archives produced by create_clean_zip.sh (and any ad-hoc export)
 *.zip
+
+# Playwright MCP scratch output (screenshots, snapshots, console logs)
+.playwright-mcp/
